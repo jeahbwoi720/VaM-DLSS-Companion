@@ -42,8 +42,8 @@ using VamDlssNr;
 
 [assembly: AssemblyTitle("VamDlssNrWorkScale")]
 [assembly: AssemblyDescription("Model resolution (working scale) for VaM DLSS Neural Rendering")]
-[assembly: AssemblyVersion("1.5.0.0")]
-[assembly: AssemblyFileVersion("1.5.0.0")]
+[assembly: AssemblyVersion("1.5.1.0")]
+[assembly: AssemblyFileVersion("1.5.1.0")]
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("VwsHostTest")]
 
 namespace VamDlssNrWorkScale
@@ -2841,14 +2841,15 @@ namespace VamDlssNrWorkScale
                     // The monitor's own window: this panel is where a monitor is set up.
                     if (M_toggle != null && CfgWindowMonitor != null && CfgMonitorWidth != null && CfgMonitorHeight != null && CfgMonitorFollow != null)
                     {
-                        M_toggle.Invoke(__instance, new object[] { 0f, "Focus window on the monitor", CfgWindowMonitor, false, null, false });
+                        // Short: a toggle row has room for about twenty characters of label.
+                        M_toggle.Invoke(__instance, new object[] { 0f, "Monitor window", CfgWindowMonitor, false, null, false });
                         M_slider.Invoke(__instance, new object[] { 0f, "Monitor window width", CfgMonitorWidth });
                         M_slider.Invoke(__instance, new object[] { 0f, "Monitor window height", CfgMonitorHeight });
-                        M_toggle.Invoke(__instance, new object[] { 0f, "Monitor window follows the person", CfgMonitorFollow, false, null, false });
+                        M_toggle.Invoke(__instance, new object[] { 0f, "Follow the person", CfgMonitorFollow, false, null, false });
 
                         if (CfgMonitorFit != null)
                         {
-                            M_toggle.Invoke(__instance, new object[] { 0f, "Monitor window fits the people", CfgMonitorFit, false, null, false });
+                            M_toggle.Invoke(__instance, new object[] { 0f, "Fit the people", CfgMonitorFit, false, null, false });
                         }
                     }
                 }
@@ -2928,7 +2929,7 @@ namespace VamDlssNrWorkScale
     public class WorkScalePlugin : BaseUnityPlugin
     {
         public const string Guid = "jeahbwoi720.vamdlssnr.workscale";
-        public const string Version = "1.5.0";
+        public const string Version = "1.5.1";
 
         // What every build's settings file is called after its owner prefix.
         private const string SettingsSuffix = ".vamdlssnr.workscale.cfg";
