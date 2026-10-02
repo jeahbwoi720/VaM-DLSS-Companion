@@ -18,7 +18,8 @@ if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found under $vsRoot" }
 $shaders = @(
     @{ Entry = 'VSMain';    Profile = 'vs_5_0'; Name = 'g_vwsVs';        File = 'vws_vs.h' },
     @{ Entry = 'PSDown';    Profile = 'ps_5_0'; Name = 'g_vwsPsDown';    File = 'vws_ps_down.h' },
-    @{ Entry = 'PSResolve'; Profile = 'ps_5_0'; Name = 'g_vwsPsResolve'; File = 'vws_ps_resolve.h' }
+    @{ Entry = 'PSResolve'; Profile = 'ps_5_0'; Name = 'g_vwsPsResolve'; File = 'vws_ps_resolve.h' },
+    @{ Entry = 'PSGuide';   Profile = 'ps_5_0'; Name = 'g_vwsPsGuide';   File = 'vws_ps_guide.h' }
 )
 
 foreach ($s in $shaders) {

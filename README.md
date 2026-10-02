@@ -73,6 +73,46 @@ everything else that decides the network's input size: with *Run before DLSS* on
 quality mode selected, it is a fraction of the DLSS render extent. Screenshot cameras (the
 screenshot key, thumbnails, SuperShot) use it too, which is where the saving is largest.
 
+- **Focus window** — 0.25 to 1.00, for a headset. 1.00 is the whole view. Below that, Neural
+  Rendering works only on a window around each eye's lens centre — where a headset is sharpest and
+  where one mostly looks — and does nothing to the rest: at 0.50 that is the middle half of the
+  width and height, a quarter of the pixels, so about a quarter of the network's time *with its full
+  detail where you look*. Model resolution still applies inside the window, and the two multiply.
+
+  What it costs is at the edge. Neural Rendering changes tone and shading as well as detail, so the
+  window is a change of look and not only of sharpness; its work fades out towards the edge (a
+  rounded square, `EdgeSoftness`) so that there is no border, but outside it the picture is VaM's
+  own. Whether that is a good trade is for your eyes in your headset.
+
+  **With eye tracking the window follows your gaze.** On a headset whose eye tracking reaches
+  SteamVR — PlayStation VR2 with [PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit), a
+  Bigscreen Beyond 2e, and so on — the window is aimed where each eye is looking rather than at the
+  lens centre. The gaze is asked of SteamVR itself (`GetEyeTrackedFoveationCenter`, the call other
+  foveated-rendering tools use), so there is nothing else to install. The window does not chase
+  every sample: it stays put while the gaze is within a few degrees of its centre (`GazeDeadZone`),
+  holds through a blink (`GazeHoldSeconds`), and goes back to the lens centre if the tracker stays
+  silent. When it moves, the network's motion vectors are told by how much, so its history moves
+  with it. Without eye tracking nothing changes, and the status line says why.
+
+  **The monitor has a window of its own** (off until *Focus window on the monitor* is set). A
+  screen is wide and a figure is tall, so it has a width and a height rather than one size — by
+  default an upright 45% × 90% of the screen, about two fifths of the pixels. And since nobody
+  tells a monitor where the eye is, it is aimed at what the eye is on: **the person in view**. The
+  window is centred on the figure when the figure fits it, and on head and chest when it does not;
+  with several people it takes the one nearest the middle and stays with them; it glides after
+  the figure rather than jumping, and goes back to the middle when nobody is in view.
+
+  It can also **fit the people in view** (*Monitor window fits the people*, on by default once the
+  monitor's window is on): the window grows, shrinks and moves so that everyone is inside it, and
+  takes whichever of three shapes — upright, square, wide — holds them in the least space. The
+  network's cost does not change with any of it, because the network's raster is not the window:
+  it keeps the size the settings give it (the *area* of `MonitorWidth` × `MonitorHeight` of the
+  screen) and the window is drawn into it at whatever scale that takes. A small figure gets the
+  network's pixels one for one; a figure that fills the screen gets them spread thinner, and the
+  status line says how thin. Growing, shrinking and moving are free. A change of *shape* rebuilds
+  the network — a fifth of a second's hitch — so a shape is kept for a couple of seconds at least,
+  and left only for one that is clearly better.
+
 Settings live in `BepInEx\config\jeahbwoi720.vamdlssnr.workscale.cfg` (1.0.0's settings file is
 renamed to that on the first start):
 
@@ -82,7 +122,18 @@ renamed to that on the first start):
 | `ApplyToScreenshots` | true | off = stills always run the network at full size |
 | `Enlargement` | 0 | 0 = matched residual; 1 = classic (the network's small picture simply enlarged — softer, for comparison) |
 | `AllowSupersampling` | false | lets the slider go to 2.0: the network runs on an *enlarged* frame. Experimental, expensive |
-| `DebugView` | 0 | 2 = show the network's edit on its own; 3 = show the frame with the edit left out |
+| `DebugView` | 0 | 2 = show the network's edit on its own (a focus window shows as the patch it is); 3 = show the frame with the edit left out |
+| `[Focus window] Size` | 1.0 | the headset's focus window; 1.0 = off |
+| `[Focus window] EdgeSoftness` | 0.35 | how far in from the window's edge the fade runs, as a fraction of its half-size |
+| `[Focus window] OffsetX`, `OffsetY` | 0 | nudge the window from the lens centre: towards the nose, and up |
+| `[Focus window] OnMonitor` | false | use a focus window on the monitor too |
+| `[Focus window] MonitorWidth`, `MonitorHeight` | 0.45, 0.9 | the monitor window's share of the screen's width and height |
+| `[Focus window] MonitorFollowPerson` | true | aim the monitor's window at the person in view rather than the middle of the screen |
+| `[Focus window] MonitorDeadZone` | 0.04 | how far the figure may move before the monitor's window starts after it |
+| `[Focus window] MonitorFitPeople` | true | size and shape the monitor's window to hold everyone in view, at a fixed cost (`MonitorWidth` × `MonitorHeight` is then the network's area, not a window size) |
+| `[Focus window] FollowGaze` | true | aim the window where you look, when SteamVR has eye tracking for the headset |
+| `[Focus window] GazeDeadZone` | 0.03 | how far the gaze may wander from the window's centre before the window moves (fraction of the eye; 0.03 ≈ 3°) |
+| `[Focus window] GazeHoldSeconds`, `GazeReturnSeconds` | 0.4, 0.3 | how long the window waits when the eye is lost (a blink), and how long it takes back to the lens centre |
 
 ## In-headset controls
 

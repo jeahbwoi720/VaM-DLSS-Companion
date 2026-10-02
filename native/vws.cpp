@@ -21,6 +21,11 @@
 // A set is registered in two halves because its textures become known at two different moments of
 // VamDlssNr's frame: the frame and the model input before its evaluate is set up, the model output
 // and the result after.
+//
+// When the model works on a WINDOW of the frame rather than all of it, its guides -- motion
+// vectors, depth, the control mask -- have to be cut to the same window. Those are VamDlssNr's own
+// textures, three pairs of them (what it has, what the network is given), registered one pair at a
+// time as they are met and copied by a third pass, PSGuide.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -34,16 +39,18 @@
 #include "vws_vs.h"
 #include "vws_ps_down.h"
 #include "vws_ps_resolve.h"
+#include "vws_ps_guide.h"
 
 #define VWS_EXPORT extern "C" __declspec(dllexport)
 
 namespace
 {
-const uint32_t kAbi = 2;
+const uint32_t kAbi = 5;
 const int kEventMagic = 0x57530000; // 'WS'
 const int kEventMask = 0x7FFF0000;
 const int kSlots = 64;
 const uint32_t kSets = 16;
+const uint32_t kGuides = 3;
 
 enum Op : uint32_t
 {
@@ -52,6 +59,8 @@ enum Op : uint32_t
     OpResolve = 3,
     OpRelease = 4,
     OpReleaseAll = 5,
+    OpRegisterGuide = 6, // `which` = which guide; frame = its source, proxy = the model's copy
+    OpGuide = 7,         // `which` = which guide
 };
 
 enum Error : int
@@ -64,7 +73,7 @@ enum Error : int
 };
 
 const uint32_t kFrame = 1, kProxy = 2, kModel = 4, kResult = 8;
-const int kReadyDown = 1, kReadyResolve = 2;
+const int kReadyDown = 1, kReadyResolve = 2, kReadyGuide = 4; // kReadyGuide << n for guide n
 
 #pragma pack(push, 8)
 struct VwsCmd
@@ -79,9 +88,15 @@ struct VwsCmd
     uint32_t eyes;     // passes: 1, or 2 for a double-wide stereo frame
     float strength;    // resolve
     uint32_t mode;     // resolve: 0 matched residual, 1 classic, 2 edit view, 3 frame untouched
-    uint32_t which;    // register: which of the four this command (re)opens (kFrame.. bits)
+    uint32_t which;    // register: which of the four this command (re)opens (kFrame.. bits); guides: which guide
     uint32_t token;    // register: echoed in the status once this command has run
     uint32_t reserved[2];
+    float window[8];   // passes: per eye, the origin (xy) and size (zw) of the model's window, as fractions of the eye
+    float feather;     // resolve: how far in from the window's edge the edit fades, as a fraction of its half-size
+    uint32_t windowed; // passes: 1 when `window` is in force, 0 for the whole of each eye
+    float prev[8];     // guide: per eye, the window as it was a frame ago (origin xy, size zw), as fractions of the eye
+    uint32_t moved;    // guide: 1 when these are motion vectors and `prev` differs from `window`
+    uint32_t topDown;  // guide: 1 when the textures' first row is the top of the picture
 };
 
 struct VwsStatus
@@ -109,12 +124,25 @@ struct Params
     uint32_t flags;
     float strength;
     uint32_t mode;
+    float window[2][4];
+    float fade[4];
+    float prev[2][4];
 };
 
 const uint32_t kFlagFrameEncoded = 1;
 const uint32_t kFlagProxyEncoded = 2;
 const uint32_t kFlagModelEncoded = 4;
 const uint32_t kFlagOutEncoded = 8;
+const uint32_t kFlagWindow = 16;
+const uint32_t kFlagMoved = 32;
+const uint32_t kFlagTopDown = 64;
+
+enum Pass
+{
+    PassDown,
+    PassResolve,
+    PassGuide,
+};
 
 template <typename T> void SafeRelease(T*& p)
 {
@@ -150,6 +178,7 @@ struct Surface
 struct Set
 {
     Surface frame, proxy, model, result;
+    Surface guideSrc[kGuides], guideDst[kGuides];
     VwsStatus status {};
     bool shapeReported = false;
 
@@ -159,11 +188,20 @@ struct Set
         proxy.Release();
         model.Release();
         result.Release();
+
+        for (uint32_t i = 0; i < kGuides; ++i)
+        {
+            guideSrc[i].Release();
+            guideDst[i].Release();
+        }
+
         status = {};
         shapeReported = false;
     }
 
     bool CanDownsample() const { return frame.srv != nullptr && proxy.rtv != nullptr; }
+
+    bool CanGuide(uint32_t i) const { return i < kGuides && guideSrc[i].srv != nullptr && guideDst[i].rtv != nullptr; }
 
     bool Complete() const
     {
@@ -179,6 +217,10 @@ struct Set
     void Refresh()
     {
         status.ready = (CanDownsample() ? kReadyDown : 0) | (Complete() && Paired() ? kReadyResolve : 0);
+
+        for (uint32_t i = 0; i < kGuides; ++i)
+            status.ready |= CanGuide(i) ? (kReadyGuide << i) : 0;
+
         status.frameW = frame.desc.Width;
         status.frameH = frame.desc.Height;
         status.workW = proxy.desc.Width;
@@ -205,6 +247,7 @@ ID3D11DeviceContext* g_ctx = nullptr;
 ID3D11VertexShader* g_vs = nullptr;
 ID3D11PixelShader* g_psDown = nullptr;
 ID3D11PixelShader* g_psResolve = nullptr;
+ID3D11PixelShader* g_psGuide = nullptr;
 ID3D11SamplerState* g_sampler = nullptr;
 ID3D11Buffer* g_cb = nullptr;
 ID3D11RasterizerState* g_raster = nullptr;
@@ -262,6 +305,12 @@ const char* FormatName(DXGI_FORMAT f)
     case DXGI_FORMAT_R10G10B10A2_TYPELESS: return "RGB10A2_TYPELESS";
     case DXGI_FORMAT_R10G10B10A2_UNORM: return "RGB10A2_UNORM";
     case DXGI_FORMAT_R11G11B10_FLOAT: return "R11G11B10_FLOAT";
+    case DXGI_FORMAT_R16G16_TYPELESS: return "RG16_TYPELESS";
+    case DXGI_FORMAT_R16G16_FLOAT: return "RG16_FLOAT";
+    case DXGI_FORMAT_R32_TYPELESS: return "R32_TYPELESS";
+    case DXGI_FORMAT_R32_FLOAT: return "R32_FLOAT";
+    case DXGI_FORMAT_R16_TYPELESS: return "R16_TYPELESS";
+    case DXGI_FORMAT_R16_FLOAT: return "R16_FLOAT";
     default: return "other";
     }
 }
@@ -290,6 +339,9 @@ DXGI_FORMAT ViewFormat(DXGI_FORMAT f, bool* hardwareCodec)
     case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
     case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT; // the guides: motion,
+    case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_R32_FLOAT;       // depth
+    case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_R16_FLOAT;
     default: return f;
     }
 }
@@ -304,6 +356,7 @@ void ReleaseDevice()
     SafeRelease(g_raster);
     SafeRelease(g_cb);
     SafeRelease(g_sampler);
+    SafeRelease(g_psGuide);
     SafeRelease(g_psResolve);
     SafeRelease(g_psDown);
     SafeRelease(g_vs);
@@ -338,6 +391,9 @@ HRESULT EnsureDevice(ID3D11Device* device)
 
     if (SUCCEEDED(hr))
         hr = g_device->CreatePixelShader(g_vwsPsResolve, sizeof(g_vwsPsResolve), nullptr, &g_psResolve);
+
+    if (SUCCEEDED(hr))
+        hr = g_device->CreatePixelShader(g_vwsPsGuide, sizeof(g_vwsPsGuide), nullptr, &g_psGuide);
 
     if (SUCCEEDED(hr))
     {
@@ -573,7 +629,74 @@ void Register(const VwsCmd& cmd)
     Publish(cmd.set);
 }
 
-// Everything the two passes change on the context, put back exactly as it was found.
+// One guide pair: what VamDlssNr has (read) and the copy the network is given (written). A null
+// source lets the pair go.
+void RegisterGuide(const VwsCmd& cmd)
+{
+    Set& set = g_sets[cmd.set];
+    const uint32_t i = cmd.which;
+
+    if (i >= kGuides)
+        return;
+
+    const uint32_t registrations = set.status.registrations + 1;
+    int error = ErrNone;
+    HRESULT hr = S_OK;
+
+    if (cmd.frame != nullptr)
+    {
+        ID3D11Device* device = DeviceOf(cmd.frame);
+
+        if (device == nullptr)
+        {
+            Log("register %u: guide %u's source is not a D3D11 texture", cmd.set, i);
+            error = ErrBadArgs;
+        }
+        else
+        {
+            hr = EnsureDevice(device);
+            device->Release();
+
+            if (FAILED(hr))
+                error = ErrDeviceFailed;
+        }
+    }
+
+    set.guideSrc[i].Release();
+    set.guideDst[i].Release();
+
+    if (cmd.frame != nullptr && error == ErrNone)
+    {
+        error = OpenSurface(set.guideSrc[i], cmd.frame, false, true, false, "guide source", &hr);
+
+        if (error == ErrNone)
+            error = OpenSurface(set.guideDst[i], cmd.proxy, false, false, true, "guide", &hr);
+
+        if (error != ErrNone)
+        {
+            set.guideSrc[i].Release();
+            set.guideDst[i].Release();
+        }
+    }
+
+    // Written last, for the reason Register gives.
+    set.status.registrations = registrations;
+    set.status.token = cmd.token;
+    set.status.error = error;
+    set.status.lastHr = (int32_t) hr;
+    set.Refresh();
+
+    if (error == ErrNone && cmd.frame != nullptr)
+    {
+        Log("set %u: guide %u registered -- %ux%u %s cut to %ux%u %s", cmd.set, i, set.guideSrc[i].desc.Width,
+            set.guideSrc[i].desc.Height, FormatName(set.guideSrc[i].desc.Format), set.guideDst[i].desc.Width,
+            set.guideDst[i].desc.Height, FormatName(set.guideDst[i].desc.Format));
+    }
+
+    Publish(cmd.set);
+}
+
+// Everything the passes change on the context, put back exactly as it was found.
 //
 // Unity keeps its own picture of what is bound and skips calls it believes are redundant, so a
 // plugin that leaves state behind corrupts draws that have nothing to do with it. The hull, domain
@@ -682,16 +805,21 @@ void SetSize(float out[4], uint32_t w, uint32_t h)
 // Whether this pass may run on this set as it stands. A set that is merely incomplete is skipped
 // quietly -- one half is registered before the other, every time. A set that is complete and does
 // not fit together is an error, reported once per registration.
-bool PassAllowed(uint32_t index, Set& set, bool resolve, uint32_t eyes)
+bool PassAllowed(uint32_t index, Set& set, Pass pass, uint32_t guide, uint32_t eyes)
 {
-    const bool complete = resolve ? set.Complete() : set.CanDownsample();
+    const bool complete = pass == PassResolve ? set.Complete() : (pass == PassDown ? set.CanDownsample() : set.CanGuide(guide));
 
     if (!complete || g_ctx == nullptr)
         return false;
 
     const char* why = nullptr;
 
-    if (resolve && !set.Paired())
+    if (pass == PassGuide)
+    {
+        if (eyes == 2 && ((set.guideSrc[guide].desc.Width & 1) != 0 || (set.guideDst[guide].desc.Width & 1) != 0))
+            why = "a double-wide guide needs even widths";
+    }
+    else if (pass == PassResolve && !set.Paired())
         why = "the model's input and output, or the frame and the result, differ in size";
     else if (eyes == 2 && ((set.frame.desc.Width & 1) != 0 || (set.proxy.desc.Width & 1) != 0))
         why = "a double-wide frame needs even widths";
@@ -705,30 +833,54 @@ bool PassAllowed(uint32_t index, Set& set, bool resolve, uint32_t eyes)
     {
         set.shapeReported = true;
         Log("set %u: %s refused -- %s (frame %ux%u, result %ux%u, model in %ux%u out %ux%u)", index,
-            resolve ? "resolve" : "downsample", why, set.frame.desc.Width, set.frame.desc.Height,
-            set.result.desc.Width, set.result.desc.Height, set.proxy.desc.Width, set.proxy.desc.Height,
-            set.model.desc.Width, set.model.desc.Height);
+            pass == PassResolve ? "resolve" : (pass == PassDown ? "downsample" : "guide"), why, set.frame.desc.Width,
+            set.frame.desc.Height, set.result.desc.Width, set.result.desc.Height, set.proxy.desc.Width,
+            set.proxy.desc.Height, set.model.desc.Width, set.model.desc.Height);
     }
 
     return false;
 }
 
-void DrawPass(Set& set, bool resolve, uint32_t eyes, float strength, uint32_t mode)
+void DrawPass(Set& set, Pass pass, const VwsCmd& cmd)
 {
     ID3D11DeviceContext* c = g_ctx;
-    Surface& target = resolve ? set.result : set.proxy;
+    const bool resolve = pass == PassResolve;
+    const bool guide = pass == PassGuide;
+    Surface& target = resolve ? set.result : (guide ? set.guideDst[cmd.which] : set.proxy);
+    Surface& source = guide ? set.guideSrc[cmd.which] : set.frame;
+    Surface& work = guide ? target : set.proxy;
 
     Params params {};
-    SetSize(params.frameSize, set.frame.desc.Width, set.frame.desc.Height);
+    SetSize(params.frameSize, source.desc.Width, source.desc.Height);
     SetSize(params.dstSize, target.desc.Width, target.desc.Height);
-    SetSize(params.workSize, set.proxy.desc.Width, set.proxy.desc.Height);
-    params.eyes = eyes == 2 ? 2u : 1u;
-    params.strength = strength;
-    params.mode = mode;
-    params.flags = (set.frame.Encoded() ? kFlagFrameEncoded : 0) |
-                   (set.proxy.Encoded() ? kFlagProxyEncoded : 0) |
-                   (set.model.Encoded() ? kFlagModelEncoded : 0) |
-                   (target.Encoded() ? kFlagOutEncoded : 0);
+    SetSize(params.workSize, work.desc.Width, work.desc.Height);
+    params.eyes = cmd.eyes == 2 ? 2u : 1u;
+    params.strength = cmd.strength;
+    params.mode = cmd.mode;
+    params.flags = guide ? 0u
+                         : ((set.frame.Encoded() ? kFlagFrameEncoded : 0) | (set.proxy.Encoded() ? kFlagProxyEncoded : 0) |
+                            (set.model.Encoded() ? kFlagModelEncoded : 0) | (target.Encoded() ? kFlagOutEncoded : 0));
+
+    // The whole of each eye unless the command brought a window.
+    for (int e = 0; e < 2; ++e)
+    {
+        params.window[e][0] = params.window[e][1] = 0.0f;
+        params.window[e][2] = params.window[e][3] = 1.0f;
+    }
+
+    if (cmd.windowed != 0)
+    {
+        memcpy(params.window, cmd.window, sizeof(params.window));
+        params.fade[0] = cmd.feather;
+        params.flags |= kFlagWindow;
+    }
+
+    // Only a window can have moved, and only motion vectors care.
+    if (guide && cmd.windowed != 0 && cmd.moved != 0)
+    {
+        memcpy(params.prev, cmd.prev, sizeof(params.prev));
+        params.flags |= kFlagMoved | (cmd.topDown != 0 ? kFlagTopDown : 0);
+    }
 
     D3D11_MAPPED_SUBRESOURCE mapped {};
     const HRESULT hr = c->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -766,11 +918,11 @@ void DrawPass(Set& set, bool resolve, uint32_t eyes, float strength, uint32_t mo
     c->HSSetShader(nullptr, nullptr, 0);
     c->DSSetShader(nullptr, nullptr, 0);
     c->GSSetShader(nullptr, nullptr, 0);
-    c->PSSetShader(resolve ? g_psResolve : g_psDown, nullptr, 0);
+    c->PSSetShader(resolve ? g_psResolve : (guide ? g_psGuide : g_psDown), nullptr, 0);
     c->PSSetConstantBuffers(0, 1, &g_cb);
     c->PSSetSamplers(0, 1, &g_sampler);
 
-    ID3D11ShaderResourceView* inputs[3] = { set.frame.srv, resolve ? set.proxy.srv : nullptr,
+    ID3D11ShaderResourceView* inputs[3] = { source.srv, resolve ? set.proxy.srv : nullptr,
                                             resolve ? set.model.srv : nullptr };
     c->PSSetShaderResources(0, 3, inputs);
 
@@ -780,7 +932,7 @@ void DrawPass(Set& set, bool resolve, uint32_t eyes, float strength, uint32_t mo
 
     if (resolve)
         set.status.resolves++;
-    else
+    else if (!guide)
         set.status.downsamples++;
 }
 
@@ -812,15 +964,24 @@ void Execute(const VwsCmd& cmd)
         Publish(cmd.set);
         break;
 
+    case OpRegisterGuide:
+        RegisterGuide(cmd);
+        break;
+
     case OpDownsample:
     case OpResolve:
-        if (PassAllowed(cmd.set, set, cmd.op == OpResolve, cmd.eyes))
-            DrawPass(set, cmd.op == OpResolve, cmd.eyes, cmd.strength, cmd.mode);
+    case OpGuide:
+    {
+        const Pass pass = cmd.op == OpResolve ? PassResolve : (cmd.op == OpGuide ? PassGuide : PassDown);
+
+        if (PassAllowed(cmd.set, set, pass, cmd.which, cmd.eyes))
+            DrawPass(set, pass, cmd);
         else
             set.status.skipped++;
 
         Publish(cmd.set);
         break;
+    }
 
     default:
         break;
@@ -894,6 +1055,71 @@ VWS_EXPORT int vws_push_pass(uint32_t resolve, uint32_t set, uint32_t eyes, floa
     cmd.eyes = eyes;
     cmd.strength = strength;
     cmd.mode = mode;
+    return Push(cmd);
+}
+
+// The same two passes with the model working on a window of each eye: `window` is eight numbers,
+// origin and size per eye as fractions of the eye, or null for the whole of it.
+VWS_EXPORT int vws_push_pass_window(uint32_t resolve, uint32_t set, uint32_t eyes, float strength, uint32_t mode,
+                                    const float* window, float feather)
+{
+    VwsCmd cmd {};
+    cmd.op = resolve != 0 ? OpResolve : OpDownsample;
+    cmd.set = set;
+    cmd.eyes = eyes;
+    cmd.strength = strength;
+    cmd.mode = mode;
+
+    if (window != nullptr)
+    {
+        memcpy(cmd.window, window, sizeof(cmd.window));
+        cmd.feather = feather;
+        cmd.windowed = 1;
+    }
+
+    return Push(cmd);
+}
+
+// One of the model's guides: the texture VamDlssNr holds and the copy the network is given. A null
+// source lets that guide's pair go.
+VWS_EXPORT int vws_push_register_guide(uint32_t set, uint32_t index, void* source, void* copy, uint32_t token)
+{
+    VwsCmd cmd {};
+    cmd.op = OpRegisterGuide;
+    cmd.set = set;
+    cmd.which = index;
+    cmd.frame = source;
+    cmd.proxy = copy;
+    cmd.token = token;
+    return Push(cmd);
+}
+
+// Cuts that guide to the window (the whole of each eye when `window` is null). `previous`, eight
+// numbers like `window` or null, is the window as it was a frame ago: given for the motion vectors
+// of a window that has moved or changed size, which are then re-expressed for it (see PSGuide).
+// `topDown` says the textures' first row is the top of the picture.
+VWS_EXPORT int vws_push_guide(uint32_t set, uint32_t index, uint32_t eyes, const float* window, const float* previous,
+                              uint32_t topDown)
+{
+    VwsCmd cmd {};
+    cmd.op = OpGuide;
+    cmd.set = set;
+    cmd.which = index;
+    cmd.eyes = eyes;
+
+    if (window != nullptr)
+    {
+        memcpy(cmd.window, window, sizeof(cmd.window));
+        cmd.windowed = 1;
+    }
+
+    if (window != nullptr && previous != nullptr)
+    {
+        memcpy(cmd.prev, previous, sizeof(cmd.prev));
+        cmd.moved = 1;
+        cmd.topDown = topDown;
+    }
+
     return Push(cmd);
 }
 

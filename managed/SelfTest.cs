@@ -419,6 +419,16 @@ namespace VamDlssNrWorkScale
             bool nrWas = nrEnabled.Value;
             float scaleWas = Hooks.CfgScale.Value;
             int enlargementWas = Hooks.CfgEnlargement.Value;
+            float windowWas = Hooks.CfgWindow.Value;
+            bool windowMonitorWas = Hooks.CfgWindowMonitor.Value;
+            float monitorWidthWas = Hooks.CfgMonitorWidth.Value, monitorHeightWas = Hooks.CfgMonitorHeight.Value;
+            bool monitorFollowWas = Hooks.CfgMonitorFollow.Value;
+
+            // This run is on the monitor, whose window is its own: on for the run, in the middle
+            // of the screen (not after the person) so that every run frames the same thing.
+            Hooks.CfgWindowMonitor.Value = true;
+            Hooks.CfgMonitorFollow.Value = false;
+            Say("focus window: " + (Hooks.WindowHooked ? "available" : "NOT available -- " + Hooks.WindowProblem) + " (guide copies " + Hooks.GuideSites + ", SetParams calls " + Hooks.ParamSites + ")");
 
             Pin("CfgSrEnabled", false);
             Pin("CfgFrameGen", false);
@@ -432,24 +442,27 @@ namespace VamDlssNrWorkScale
             Say("scene frozen; measuring Neural Rendering alone -- one pass, no DLSS upscaling, no frame generation, no mask");
             yield return StartCoroutine(Wait(2f));
 
-            // label, NR on, model resolution, enlargement, debug view
+            // label, NR on, model resolution, enlargement, debug view, focus window
             object[][] steps =
             {
-                new object[] { "nr-off", false, 1f, 0, 0 },
-                new object[] { "nr-100", true, 1f, 0, 0 },
-                new object[] { "nr-050", true, 0.5f, 0, 0 },
-                new object[] { "nr-025", true, 0.25f, 0, 0 },
-                new object[] { "nr-075", true, 0.75f, 0, 0 },
-                new object[] { "nr-050-classic", true, 0.5f, 1, 0 },
-                new object[] { "nr-050-edit", true, 0.5f, 0, 2 },
-                new object[] { "nr-050-frame-only", true, 0.5f, 0, 3 },
-                new object[] { "nr-100-again", true, 1f, 0, 0 },
-                new object[] { "nr-off-again", false, 1f, 0, 0 },
+                new object[] { "nr-off", false, 1f, 0, 0, 1f },
+                new object[] { "nr-100", true, 1f, 0, 0, 1f },
+                new object[] { "nr-050", true, 0.5f, 0, 0, 1f },
+                new object[] { "nr-025", true, 0.25f, 0, 0, 1f },
+                new object[] { "nr-075", true, 0.75f, 0, 0, 1f },
+                new object[] { "nr-050-classic", true, 0.5f, 1, 0, 1f },
+                new object[] { "nr-050-edit", true, 0.5f, 0, 2, 1f },
+                new object[] { "nr-050-frame-only", true, 0.5f, 0, 3, 1f },
+                new object[] { "nr-window-050", true, 1f, 0, 0, 0.5f },
+                new object[] { "nr-window-050-edit", true, 1f, 0, 2, 0.5f },
+                new object[] { "nr-window-050-at-050", true, 0.5f, 0, 0, 0.5f },
+                new object[] { "nr-100-again", true, 1f, 0, 0, 1f },
+                new object[] { "nr-off-again", false, 1f, 0, 0, 1f },
             };
 
             if (_quick)
             {
-                steps = new[] { steps[0], steps[2] };
+                steps = new[] { steps[0], steps[2], steps[8], steps[9] };
             }
 
             foreach (object[] s in steps)
@@ -459,6 +472,7 @@ namespace VamDlssNrWorkScale
                 Hooks.CfgScale.Value = (float)s[2];
                 Hooks.CfgEnlargement.Value = (int)s[3];
                 Hooks.CfgDebugView.Value = (int)s[4];
+                Hooks.CfgMonitorWidth.Value = Hooks.CfgMonitorHeight.Value = (float)s[5];
 
                 // The rebuild, then the network's temporal history settling on a still scene.
                 yield return StartCoroutine(Wait(3f));
@@ -550,6 +564,11 @@ namespace VamDlssNrWorkScale
             }
             }
 
+            Hooks.CfgWindow.Value = windowWas;
+            Hooks.CfgWindowMonitor.Value = windowMonitorWas;
+            Hooks.CfgMonitorWidth.Value = monitorWidthWas;
+            Hooks.CfgMonitorHeight.Value = monitorHeightWas;
+            Hooks.CfgMonitorFollow.Value = monitorFollowWas;
             Unpin();
             yield return StartCoroutine(ControlPanelChecks());
 

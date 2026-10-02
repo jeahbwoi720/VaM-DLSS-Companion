@@ -434,6 +434,15 @@ namespace VamDlssNrWorkScale
 
             Toggle(p, Left, "Neural Rendering", nr);
             Slider(p, Left, "NR model resolution (applies when let go)", Hooks.CfgScale, "F2");
+
+            // The focus window: only where its hooks went in, or the slider would move nothing.
+            if (Hooks.WindowHooked)
+            {
+                Slider(p, Left, "NR window (1.00 = whole view)", Hooks.CfgWindow, "F2");
+                Slider(p, Left, "NR window edge softness", Hooks.CfgWindowFeather, "F2");
+                Toggle(p, Left, "NR window follows gaze", Hooks.CfgWindowGaze);
+            }
+
             Slider(p, Left, "NR intensity", intensity, "F2");
             Slider(p, Left, "NR local tone", tone, "F2");
             Slider(p, Left, "NR local structure", structure, "F2");
@@ -491,6 +500,56 @@ namespace VamDlssNrWorkScale
             Toggle(p, Right, "Frame generation (monitor only)", Mod<bool>("CfgFrameGen"));
             Choice(p, Right, "Frame generation multiplier", Mod<int>("CfgFgMultiplier"), new[] { "2x", "3x", "4x" }, new[] { 2, 3, 4 });
             Toggle(p, Right, "Frame generation: even pacing", Mod<bool>("CfgFgPacing"));
+
+            // The monitor's window: its own shape, and aimed at the person rather than the middle.
+            if (Hooks.WindowHooked)
+            {
+                Toggle(p, Right, "NR window on monitor", Hooks.CfgWindowMonitor);
+                Slider(p, Right, "Monitor window width", Hooks.CfgMonitorWidth, "F2");
+                Slider(p, Right, "Monitor window height", Hooks.CfgMonitorHeight, "F2");
+                Toggle(p, Right, "Monitor window: follow", Hooks.CfgMonitorFollow);
+                Toggle(p, Right, "Monitor window: fit people", Hooks.CfgMonitorFit);
+            }
+
+            // What the network changed, on its own: grey where it changed nothing, so a focus
+            // window shows as the patch it is. Only has an effect while the model runs small or
+            // through a window.
+            Choice(p, Right, "NR debug view", Hooks.CfgDebugView, new[] { "Off", "Only what NR changed", "Frame without NR" }, new[] { 0, 2, 3 });
+
+            // DLSS's sign switches. A picture that will not hold still under DLSS is nearly always
+            // one of these pointing the wrong way for the setup it is running on, and from inside
+            // a headset the .cfg is a long way off: here they can be flipped while looking at the
+            // result. In a headset VamDlssNr reads the "headset" pair for motion, on the monitor
+            // the other.
+            ConfigEntry<bool> autoExposure = Mod<bool>("CfgSrAutoExposure");
+            ConfigEntry<bool> jitter = Mod<bool>("CfgSrJitter");
+            ConfigEntry<bool> jitterX = Mod<bool>("CfgSrJitterInvertX");
+            ConfigEntry<bool> jitterY = Mod<bool>("CfgSrJitterInvertY");
+            ConfigEntry<bool> vrMotionX = Mod<bool>("CfgVrInvertMotionX");
+            ConfigEntry<bool> vrMotionY = Mod<bool>("CfgVrInvertMotionY");
+            ConfigEntry<bool> motionX = Mod<bool>("CfgSrInvertMotionX");
+            ConfigEntry<bool> motionY = Mod<bool>("CfgSrInvertMotionY");
+
+            Toggle(p, Right, "DLSS fix: auto exposure", autoExposure);
+            Toggle(p, Right, "DLSS fix: jitter", jitter);
+            Toggle(p, Right, "DLSS fix: jitter Y flip", jitterY);
+            Toggle(p, Right, "DLSS fix: jitter X flip", jitterX);
+            Toggle(p, Right, "DLSS fix: motion Y flip VR", vrMotionY);
+            Toggle(p, Right, "DLSS fix: motion X flip VR", vrMotionX);
+            Toggle(p, Right, "DLSS fix: motion Y flip 2D", motionY);
+            Toggle(p, Right, "DLSS fix: motion X flip 2D", motionX);
+
+            Button(p, Right, "DLSS fix: reset to defaults", delegate
+            {
+                ToDefault(autoExposure);
+                ToDefault(jitter);
+                ToDefault(jitterX);
+                ToDefault(jitterY);
+                ToDefault(vrMotionX);
+                ToDefault(vrMotionY);
+                ToDefault(motionX);
+                ToDefault(motionY);
+            });
 
             Button(p, Right, "Reset NR strengths to defaults", delegate
             {

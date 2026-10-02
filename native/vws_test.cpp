@@ -36,6 +36,12 @@ struct VwsCmd
     uint32_t which;
     uint32_t token;
     uint32_t reserved[2];
+    float window[8];
+    float feather;
+    uint32_t windowed;
+    float prev[8];
+    uint32_t moved;
+    uint32_t topDown;
 };
 
 struct VwsStatus
@@ -808,6 +814,455 @@ static void TestStereoSeam()
     rig.Free();
 }
 
+// ---- the window ---------------------------------------------------------------------------------
+
+// The model's window of each eye, as the plugin describes it: origin and size as fractions.
+static void SetWindow(VwsCmd& c, uint32_t eyeW, uint32_t h, uint32_t lx, uint32_t ly, uint32_t rx, uint32_t ry,
+                      uint32_t ww, uint32_t wh, float feather)
+{
+    const float w[8] = { (float) lx / eyeW, (float) ly / h, (float) ww / eyeW, (float) wh / h,
+                         (float) rx / eyeW, (float) ry / h, (float) ww / eyeW, (float) wh / h };
+    memcpy(c.window, w, sizeof(w));
+    c.feather = feather;
+    c.windowed = 1;
+}
+
+static Image Crop(const Image& src, uint32_t x0, uint32_t y0, uint32_t w, uint32_t h)
+{
+    Image out(w, h);
+
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+            memcpy(out.at(x, y), src.at(x0 + x, y0 + y), 4 * sizeof(float));
+
+    return out;
+}
+
+static std::vector<float> ReadFloats(ID3D11Texture2D* t, int channels)
+{
+    D3D11_TEXTURE2D_DESC d {};
+    t->GetDesc(&d);
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D* staging = nullptr;
+    g_dev->CreateTexture2D(&sd, nullptr, &staging);
+    g_ctx->CopyResource(staging, t);
+
+    std::vector<float> out((size_t) d.Width * d.Height * channels);
+    D3D11_MAPPED_SUBRESOURCE m {};
+
+    if (SUCCEEDED(g_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m)))
+    {
+        for (uint32_t y = 0; y < d.Height; ++y)
+        {
+            const uint8_t* row = (const uint8_t*) m.pData + (size_t) y * m.RowPitch;
+
+            for (uint32_t x = 0; x < d.Width * channels; ++x)
+            {
+                out[(size_t) y * d.Width * channels + x] =
+                    d.Format == DXGI_FORMAT_R32_FLOAT ? ((const float*) row)[x] : HalfToFloat(((const uint16_t*) row)[x]);
+            }
+        }
+
+        g_ctx->Unmap(staging, 0);
+    }
+
+    staging->Release();
+    return out;
+}
+
+// The model on a window of the frame: it is handed that rectangle and nothing else, its edit comes
+// back into that rectangle and nowhere else, faded out along the edge.
+static void TestWindow()
+{
+    printf("[window]\n");
+    const uint32_t fw = 64, fh = 48, wx = 20, wy = 10, ww = 32, wh = 24;
+    const Image frame = TestPattern(fw, fh, 7);
+    const Image seen = Seen(frame);
+
+    // 1:1 -- the model's input is the frame's own pixels of the window.
+    {
+        Rig rig;
+        rig.Make(fw, fh, ww, wh);
+        UploadHalf(rig.frame, frame);
+        Run(rig.Cmd(1, 5));
+        VwsCmd down = rig.Cmd(2, 5);
+        SetWindow(down, fw, fh, wx, wy, wx, wy, ww, wh, 0.25f);
+        Run(down);
+        int ax = 0, ay = 0;
+        const int diff = MaxDiffEncoded(ReadBytes(rig.proxy), Crop(seen, wx, wy, ww, wh), true, &ax, &ay);
+        CHECK(diff <= 1, "1:1 window: model input differs from the frame's window by %d at %d,%d", diff, ax, ay);
+
+        // A model that brightens green everywhere it was shown.
+        Bytes model = ReadBytes(rig.proxy);
+
+        for (uint32_t y = 0; y < wh; ++y)
+            for (uint32_t x = 0; x < ww; ++x)
+                model.at(x, y)[1] = (uint8_t) std::min(255, model.at(x, y)[1] + 40);
+
+        UploadBytes(rig.model, model);
+        Run(rig.Cmd(3, 5, 1, 3)); // the frame as the resolve writes it untouched
+        const Bytes untouched = ReadBytes(rig.result);
+        VwsCmd resolve = rig.Cmd(3, 5);
+        SetWindow(resolve, fw, fh, wx, wy, wx, wy, ww, wh, 0.25f);
+        Run(resolve);
+        const Bytes got = ReadBytes(rig.result);
+
+        int outside = 0, middle = 0, edge = 0, backwards = 0;
+
+        for (uint32_t y = 0; y < fh; ++y)
+        {
+            for (uint32_t x = 0; x < fw; ++x)
+            {
+                const bool in = x >= wx && x < wx + ww && y >= wy && y < wy + wh;
+
+                if (!in)
+                {
+                    for (int c = 0; c < 4; ++c)
+                        outside = std::max(outside, abs((int) got.at(x, y)[c] - (int) untouched.at(x, y)[c]));
+                }
+            }
+        }
+
+        // Along the window's middle row: nothing at the edge, all of it across the middle, never
+        // less further in.
+        const uint32_t row = wy + wh / 2;
+        int last = 0;
+
+        for (uint32_t x = wx; x < wx + ww / 2; ++x)
+        {
+            const int before = untouched.at(x, row)[1];
+            const int room = 255 - before;
+            const int rise = (int) got.at(x, row)[1] - before;
+
+            if (room >= 60)
+            {
+                if (x == wx)
+                    edge = rise;
+
+                if (x >= wx + ww / 2 - 4)
+                    middle = std::max(middle, abs(rise - 40));
+
+                if (rise < last - 1)
+                    backwards++;
+
+                last = rise;
+            }
+        }
+
+        CHECK(outside == 0, "the frame outside the window changed by %d", outside);
+        CHECK(edge <= 2, "the edit does not fade out at the window's edge (it is %d there)", edge);
+        CHECK(middle <= 1, "the edit is not whole across the middle of the window (off by %d)", middle);
+        CHECK(backwards == 0, "the edit does not grow steadily inwards (%d steps back)", backwards);
+
+        // The edit on its own: grey where the model saw nothing.
+        VwsCmd view = rig.Cmd(3, 5, 1, 2);
+        SetWindow(view, fw, fh, wx, wy, wx, wy, ww, wh, 0.25f);
+        Run(view);
+        const Bytes edit = ReadBytes(rig.result);
+        int brightest = 0;
+
+        for (uint32_t x = wx + ww / 2 - 4; x < wx + ww / 2 + 4; ++x)
+            brightest = std::max(brightest, (int) edit.at(x, row)[1]);
+
+        CHECK(abs((int) edit.at(2, 2)[1] - 128) <= 1 && brightest > 200,
+              "edit view: %u outside the window, %d at most in its middle", edit.at(2, 2)[1], brightest);
+
+        Run(rig.Cmd(4, 5));
+        rig.Free();
+    }
+
+    // 2:1 -- the model's input is the exact average of the window, not of the frame.
+    {
+        Rig rig;
+        rig.Make(fw, fh, ww / 2, wh / 2);
+        UploadHalf(rig.frame, frame);
+        Run(rig.Cmd(1, 5));
+        VwsCmd down = rig.Cmd(2, 5);
+        SetWindow(down, fw, fh, wx, wy, wx, wy, ww, wh, 0.25f);
+        Run(down);
+        int ax = 0, ay = 0;
+        const int diff = MaxDiffEncoded(ReadBytes(rig.proxy), AreaReference(Crop(seen, wx, wy, ww, wh), ww / 2, wh / 2),
+                                        true, &ax, &ay);
+        CHECK(diff <= 1, "2:1 window: model input differs from the window's average by %d at %d,%d", diff, ax, ay);
+        Run(rig.Cmd(4, 5));
+        rig.Free();
+    }
+
+    // Two eyes, each with its own window (mirrored, as lens centres are).
+    {
+        const uint32_t eyeW = 64, lx = 24, rx = 8;
+        Rig rig;
+        rig.Make(eyeW * 2, fh, ww * 2, wh);
+        const Image both = TestPattern(eyeW * 2, fh, 11);
+        const Image seenBoth = Seen(both);
+        UploadHalf(rig.frame, both);
+        Run(rig.Cmd(1, 5, 2));
+        VwsCmd down = rig.Cmd(2, 5, 2);
+        SetWindow(down, eyeW, fh, lx, wy, rx, wy, ww, wh, 0.25f);
+        Run(down);
+        const Bytes proxy = ReadBytes(rig.proxy);
+        Bytes left(ww, wh), right(ww, wh);
+
+        for (uint32_t y = 0; y < wh; ++y)
+        {
+            memcpy(left.at(0, y), proxy.at(0, y), (size_t) ww * 4);
+            memcpy(right.at(0, y), proxy.at(ww, y), (size_t) ww * 4);
+        }
+
+        const int dl = MaxDiffEncoded(left, Crop(seenBoth, lx, wy, ww, wh), true);
+        const int dr = MaxDiffEncoded(right, Crop(seenBoth, eyeW + rx, wy, ww, wh), true);
+        CHECK(dl <= 1 && dr <= 1, "stereo windows: left eye off by %d, right eye off by %d", dl, dr);
+
+        // The right eye's model brightens green; the left eye's leaves its input alone.
+        Bytes model = proxy;
+
+        for (uint32_t y = 0; y < wh; ++y)
+            for (uint32_t x = ww; x < ww * 2; ++x)
+                model.at(x, y)[1] = (uint8_t) std::min(255, model.at(x, y)[1] + 40);
+
+        UploadBytes(rig.model, model);
+        Run(rig.Cmd(3, 5, 2, 3));
+        const Bytes untouched = ReadBytes(rig.result);
+        VwsCmd resolve = rig.Cmd(3, 5, 2);
+        SetWindow(resolve, eyeW, fh, lx, wy, rx, wy, ww, wh, 0.25f);
+        Run(resolve);
+        const Bytes got = ReadBytes(rig.result);
+        int leftEye = 0;
+
+        for (uint32_t y = 0; y < fh; ++y)
+            for (uint32_t x = 0; x < eyeW; ++x)
+                for (int c = 0; c < 3; ++c)
+                    leftEye = std::max(leftEye, abs((int) got.at(x, y)[c] - (int) untouched.at(x, y)[c]));
+
+        const uint32_t cx = eyeW + rx + ww / 2, cy = wy + wh / 2;
+        const int rise = (int) got.at(cx, cy)[1] - (int) untouched.at(cx, cy)[1];
+        CHECK(leftEye <= 1, "the right eye's edit reached the left eye (%d)", leftEye);
+        CHECK(untouched.at(cx, cy)[1] > 195 || abs(rise - 40) <= 1, "the right eye's edit is not in its window (rise %d)", rise);
+        Run(rig.Cmd(4, 5));
+        rig.Free();
+    }
+
+    // The guides. Every texel holds its own position, so a copy says where it was taken from.
+    {
+        const uint32_t eyeW = 64, lx = 24, rx = 8;
+        ID3D11Texture2D* depth = MakeTexture(eyeW * 2, fh, DXGI_FORMAT_R32_FLOAT, kRT);
+        ID3D11Texture2D* depthCut = MakeTexture(ww * 2, wh, DXGI_FORMAT_R32_FLOAT, kRT);
+        ID3D11Texture2D* motion = MakeTexture(eyeW * 2, fh, DXGI_FORMAT_R16G16_FLOAT, kRT);
+        ID3D11Texture2D* motionHalf = MakeTexture(ww, wh / 2, DXGI_FORMAT_R16G16_FLOAT, kRT);
+        std::vector<float> d((size_t) eyeW * 2 * fh);
+        std::vector<uint16_t> mv((size_t) eyeW * 2 * fh * 2);
+
+        for (uint32_t y = 0; y < fh; ++y)
+        {
+            for (uint32_t x = 0; x < eyeW * 2; ++x)
+            {
+                d[(size_t) y * eyeW * 2 + x] = (float) x + 1000.0f * (float) y;
+                mv[((size_t) y * eyeW * 2 + x) * 2] = FloatToHalf((float) x);
+                mv[((size_t) y * eyeW * 2 + x) * 2 + 1] = FloatToHalf(-(float) y);
+            }
+        }
+
+        g_ctx->UpdateSubresource(depth, 0, nullptr, d.data(), eyeW * 2 * 4, 0);
+        g_ctx->UpdateSubresource(motion, 0, nullptr, mv.data(), eyeW * 2 * 4, 0);
+
+        VwsCmd reg {};
+        reg.op = 6;
+        reg.set = 5;
+        reg.which = 1;
+        reg.frame = depth;
+        reg.proxy = depthCut;
+        reg.token = ++g_token;
+        Run(reg);
+        reg.which = 0;
+        reg.frame = motion;
+        reg.proxy = motionHalf;
+        reg.token = ++g_token;
+        Run(reg);
+
+        VwsStatus st {};
+        vws_status(5, &st);
+        CHECK(st.error == 0 && (st.ready & (4 | 8)) == (4 | 8) && st.token == g_token, "guides registered: ready=%d error=%d", st.ready, st.error);
+
+        VwsCmd cut {};
+        cut.op = 7;
+        cut.set = 5;
+        cut.eyes = 2;
+        cut.which = 1;
+        SetWindow(cut, eyeW, fh, lx, wy, rx, wy, ww, wh, 0.0f);
+        Run(cut);
+        const std::vector<float> got = ReadFloats(depthCut, 1);
+        int wrong = 0;
+
+        for (uint32_t y = 0; y < wh; ++y)
+        {
+            for (uint32_t x = 0; x < ww * 2; ++x)
+            {
+                const uint32_t sx = x < ww ? lx + x : eyeW + rx + (x - ww);
+                wrong += got[(size_t) y * ww * 2 + x] != (float) sx + 1000.0f * (float) (wy + y) ? 1 : 0;
+            }
+        }
+
+        CHECK(wrong == 0, "depth guide: %d of %u texels were not taken from the window", wrong, ww * 2 * wh);
+
+        // Half size: one texel of each 2x2 block of the window, values untouched.
+        cut.which = 0;
+        Run(cut);
+        const std::vector<float> half = ReadFloats(motionHalf, 2);
+        wrong = 0;
+
+        for (uint32_t y = 0; y < wh / 2; ++y)
+        {
+            for (uint32_t x = 0; x < ww; ++x)
+            {
+                const bool rightEye = x >= ww / 2;
+                const uint32_t bx = (rightEye ? eyeW + rx : lx) + (rightEye ? x - ww / 2 : x) * 2, by = wy + y * 2;
+                const float gx = half[((size_t) y * ww + x) * 2], gy = -half[((size_t) y * ww + x) * 2 + 1];
+                wrong += (gx < (float) bx || gx > (float) bx + 1.0f || gy < (float) by || gy > (float) by + 1.0f) ? 1 : 0;
+            }
+        }
+
+        CHECK(wrong == 0, "motion guide at half size: %d texels came from outside their 2x2 block", wrong);
+
+        // A window that moved: its own movement comes off the motion vectors, each eye's its own.
+        ID3D11Texture2D* motionCut = MakeTexture(ww * 2, wh, DXGI_FORMAT_R16G16_FLOAT, kRT);
+        reg.which = 0;
+        reg.frame = motion;
+        reg.proxy = motionCut;
+        reg.token = ++g_token;
+        Run(reg);
+        // The window a frame ago was the same size, elsewhere: each eye by its own amount.
+        const float shift[4] = { 0.25f, -0.5f, -1.0f, 2.0f };
+        memcpy(cut.prev, cut.window, sizeof(cut.prev));
+
+        for (int e = 0; e < 2; ++e)
+        {
+            cut.prev[e * 4] -= shift[e * 2];
+            cut.prev[e * 4 + 1] -= shift[e * 2 + 1];
+        }
+
+        cut.moved = 1;
+        cut.topDown = 0;
+        Run(cut);
+        const std::vector<float> moved = ReadFloats(motionCut, 2);
+        wrong = 0;
+
+        for (uint32_t y = 0; y < wh; ++y)
+        {
+            for (uint32_t x = 0; x < ww * 2; ++x)
+            {
+                const bool rightEye = x >= ww;
+                const float sx = (float) (rightEye ? eyeW + rx + (x - ww) : lx + x), sy = -(float) (wy + y);
+                const float wantX = sx - (rightEye ? shift[2] : shift[0]), wantY = sy - (rightEye ? shift[3] : shift[1]);
+                wrong += (fabsf(moved[((size_t) y * ww * 2 + x) * 2] - wantX) > 0.07f || fabsf(moved[((size_t) y * ww * 2 + x) * 2 + 1] - wantY) > 0.07f) ? 1 : 0;
+            }
+        }
+
+        CHECK(wrong == 0, "motion guide of a moved window: %d texels do not carry their value less the window's movement", wrong);
+        cut.moved = 0;
+        motionCut->Release();
+
+        // A window that also changed size, in textures stored top row first: the same motion
+        // everywhere in the eye becomes a different one at every point of the window.
+        {
+            const uint32_t sw = 64, sh = 48, dw = 32, dh = 24;
+            ID3D11Texture2D* flow = MakeTexture(sw, sh, DXGI_FORMAT_R16G16_FLOAT, kRT);
+            ID3D11Texture2D* flowCut = MakeTexture(dw, dh, DXGI_FORMAT_R16G16_FLOAT, kRT);
+            const float mx = 0.02f, my = -0.03f; // as stored: y up the picture
+            std::vector<uint16_t> texels((size_t) sw * sh * 2);
+
+            for (size_t i = 0; i < texels.size(); i += 2)
+            {
+                texels[i] = FloatToHalf(mx);
+                texels[i + 1] = FloatToHalf(my);
+            }
+
+            g_ctx->UpdateSubresource(flow, 0, nullptr, texels.data(), sw * 4, 0);
+            reg.which = 0;
+            reg.frame = flow;
+            reg.proxy = flowCut;
+            reg.token = ++g_token;
+            Run(reg);
+
+            VwsCmd zoom {};
+            zoom.op = 7;
+            zoom.set = 5;
+            zoom.eyes = 1;
+            zoom.which = 0;
+            const float now[8] = { 0.25f, 0.25f, 0.5f, 0.5f, 0.25f, 0.25f, 0.5f, 0.5f };
+            const float then[8] = { 0.2f, 0.3f, 0.4f, 0.625f, 0.2f, 0.3f, 0.4f, 0.625f };
+            memcpy(zoom.window, now, sizeof(now));
+            memcpy(zoom.prev, then, sizeof(then));
+            zoom.windowed = 1;
+            zoom.moved = 1;
+            zoom.topDown = 1;
+            Run(zoom);
+            const std::vector<float> got2 = ReadFloats(flowCut, 2);
+            const float storedX = HalfToFloat(FloatToHalf(mx)), storedY = HalfToFloat(FloatToHalf(my));
+            float worst = 0.0f;
+
+            for (uint32_t y = 0; y < dh; ++y)
+            {
+                for (uint32_t x = 0; x < dw; ++x)
+                {
+                    const float atX = now[0] + ((float) x + 0.5f) / dw * now[2], atY = now[1] + ((float) y + 0.5f) / dh * now[3];
+                    const float rowsY = -1.0f; // top row first: motion's y runs against the rows
+                    const float wantX = (atX - now[0]) - (now[2] / then[2]) * (atX - storedX - then[0]);
+                    const float wantY = ((atY - now[1]) - (now[3] / then[3]) * (atY - storedY * rowsY - then[1])) * rowsY;
+                    worst = std::max(worst, fabsf(got2[((size_t) y * dw + x) * 2] - wantX));
+                    worst = std::max(worst, fabsf(got2[((size_t) y * dw + x) * 2 + 1] - wantY));
+                }
+            }
+
+            CHECK(worst < 2e-3f, "motion guide of a window that changed size: off by %g at worst", worst);
+
+            // Unchanged, the same window gives the motion back as it was.
+            memcpy(zoom.prev, now, sizeof(now));
+            Run(zoom);
+            const std::vector<float> same = ReadFloats(flowCut, 2);
+            worst = 0.0f;
+
+            for (size_t i = 0; i < same.size(); i += 2)
+                worst = std::max(worst, std::max(fabsf(same[i] - storedX), fabsf(same[i + 1] - storedY)));
+
+            CHECK(worst < 1e-3f, "motion guide of a window that did not change: off by %g at worst", worst);
+            flow->Release();
+            flowCut->Release();
+        }
+
+        // Without a window the same pass is a plain copy of the whole of each eye.
+        ID3D11Texture2D* depthAll = MakeTexture(eyeW * 2, fh, DXGI_FORMAT_R32_FLOAT, kRT);
+        reg.which = 2;
+        reg.frame = depth;
+        reg.proxy = depthAll;
+        reg.token = ++g_token;
+        Run(reg);
+        VwsCmd whole {};
+        whole.op = 7;
+        whole.set = 5;
+        whole.eyes = 2;
+        whole.which = 2;
+        Run(whole);
+        CHECK(ReadFloats(depthAll, 1) == d, "a guide copied without a window is not the guide");
+
+        // A pair is let go by registering nothing in its place.
+        reg.frame = reg.proxy = nullptr;
+        reg.token = ++g_token;
+        Run(reg);
+        vws_status(5, &st);
+        CHECK((st.ready & 16) == 0 && (st.ready & (4 | 8)) == (4 | 8), "guide 2 let go: ready=%d", st.ready);
+
+        Run(Rig().Cmd(4, 5));
+        depth->Release();
+        depthCut->Release();
+        motion->Release();
+        motionHalf->Release();
+        depthAll->Release();
+    }
+}
+
 // A ratio that is not a whole number, as every real resolution pair is.
 static void TestOddRatio()
 {
@@ -1479,6 +1934,8 @@ int wmain(int argc, wchar_t** argv)
     TestEditTransfer();
     TestCubeScale();
     TestStereoSeam();
+    TestWindow();
+    Drain(true);
     TestOddRatio();
     TestSupersample();
     TestStateRestore();
