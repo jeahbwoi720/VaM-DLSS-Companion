@@ -30,6 +30,7 @@ $csc = Join-Path $sdk 'Roslyn\bincore\csc.dll'
 $refs = @(
     (Join-Path $managed 'mscorlib.dll'), (Join-Path $managed 'System.dll'), (Join-Path $managed 'System.Core.dll'),
     (Join-Path $managed 'UnityEngine.dll'), (Join-Path $managed 'UnityEngine.CoreModule.dll'),
+    (Join-Path $managed 'Assembly-CSharp.dll'),
     (Join-Path $core 'BepInEx.dll'), (Join-Path $core '0Harmony.dll'),
     (Join-Path $modDir 'VamDlssNrPlugin.dll'), $plugin
 ) | ForEach-Object { "-r:$_" }

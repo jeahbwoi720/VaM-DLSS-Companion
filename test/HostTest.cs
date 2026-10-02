@@ -5,8 +5,9 @@
 //      position, state handed to the postfix, a transpiler swapping a field read for a call.
 //   2. The plugin finds everything it reaches into the real VamDlssNrPlugin.dll for.
 //   3. Its patches go onto VamDlssNr's real methods, and the rewritten Compose compiles.
-//   4. The P/Invokes into the native half marshal correctly.
-//   5. The model-extent arithmetic.
+//   4. The hook on VaM's plugin loader, which the in-headset panel is found by, goes on.
+//   5. The P/Invokes into the native half marshal correctly.
+//   6. The model-extent arithmetic.
 //
 // What cannot: anything that needs a running engine (render textures, the render thread).
 
@@ -124,6 +125,7 @@ public static class HostTest
         {
             HarmonyOnThisRuntime();
             RealPlugin();
+            PluginLoaderWatch();
             NativeCalls(pluginDir);
             Extents();
         }
@@ -237,6 +239,35 @@ public static class HostTest
         Check(Hooks.OutputFor(capture) == null, "OutputFor on a bare capture returns its (null) field");
 
         h.UnpatchSelf();
+    }
+
+    // The in-headset panel finds its session script by a postfix on the one method of VaM's that
+    // creates every plugin script. Here: that the method is where it is looked for, and takes it.
+    private static void PluginLoaderWatch()
+    {
+        Console.WriteLine("[watching VaM's plugin loader]");
+        List<string> log = new List<string>();
+        Hooks.Warn = delegate(string s) { log.Add("warn: " + s); };
+        Hooks.Error = delegate(string s) { log.Add("error: " + s); };
+
+        ControlPanel.Watch();
+
+        const BindingFlags any = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+        MethodInfo create = typeof(MVRPluginManager).GetMethod("CreateScriptController", any);
+        Patches info = create != null ? Harmony.GetPatchInfo(create) : null;
+        Check(ControlPanel.Watching, "the loader is watched");
+        Check(info != null && info.Postfixes.Count == 1, "MVRPluginManager.CreateScriptController carries our postfix");
+
+        // What the loader returns for a script it turned away is null; that passes through quietly.
+        ControlPanel.ScriptCreated(null);
+        Check(ControlPanel.PanelCount == 0, "a script that was not created fills no panel");
+
+        foreach (string line in log)
+        {
+            Console.WriteLine("  " + line);
+        }
+
+        Check(log.Count == 0, "nothing was warned about: " + string.Join(" | ", log.ToArray()));
     }
 
     private static void NativeCalls(string pluginDir)

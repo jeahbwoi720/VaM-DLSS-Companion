@@ -1,13 +1,14 @@
-# Builds both halves and stages the plugin folder as it is installed:
+# Builds everything and stages it as it is installed, under dist\:
 #
-#   dist\BepInEx\plugins\VamDlssNrWorkScale\VamDlssNrWorkScale.dll
-#   dist\BepInEx\plugins\VamDlssNrWorkScale\VamDlssNrWorkScaleNative.dll
+#   BepInEx\plugins\VamDlssNrWorkScale\VamDlssNrWorkScale.dll        the plugin
+#   BepInEx\plugins\VamDlssNrWorkScale\VamDlssNrWorkScaleNative.dll  its D3D11 half
+#   AddonPackages\jeahbwoi720.VaMVrNrControl.<n>.var                 the in-headset panel's session script
 #
 #   pwsh build.ps1 [-VamDir D:\Games\VaM_Updater] [-Zip]
 #
-# Needs: the VS 2022 Build Tools (C++), the Windows SDK (fxc), the .NET SDK (for Roslyn), and a VaM
-# install with BepInEx 5 and VaM DLSS in it -- the managed half is compiled against VaM's own
-# assemblies and VamDlssNrPlugin.dll's public types.
+# Needs: the VS 2022 Build Tools (C++), the Windows SDK (fxc), the .NET SDK (for Roslyn), Python 3,
+# and a VaM install with BepInEx 5 and VaM DLSS in it -- the managed half is compiled against VaM's
+# own assemblies and VamDlssNrPlugin.dll's public types.
 param(
     [string]$VamDir = 'D:\Games\VaM_Updater',
     [switch]$Zip
@@ -27,6 +28,9 @@ New-Item -ItemType Directory -Force $plugin | Out-Null
 Copy-Item (Join-Path $here 'managed\out\VamDlssNrWorkScale.dll'), (Join-Path $here 'native\out\VamDlssNrWorkScaleNative.dll') $plugin
 Copy-Item (Join-Path $here 'README.md') (Join-Path $dist 'VamDlssNrWorkScale-README.md')
 Copy-Item (Join-Path $here 'LICENSE') (Join-Path $dist 'VamDlssNrWorkScale-LICENSE.txt')
+
+& python (Join-Path $here 'tools\make-var.py') (Join-Path $dist 'AddonPackages') | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'the .var package could not be built' }
 
 if ($Zip) {
     $zipPath = Join-Path $here "VamDlssNrWorkScale-v$version.zip"

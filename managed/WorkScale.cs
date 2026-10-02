@@ -32,8 +32,8 @@ using VamDlssNr;
 
 [assembly: AssemblyTitle("VamDlssNrWorkScale")]
 [assembly: AssemblyDescription("Model resolution (working scale) for VaM DLSS Neural Rendering")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("VwsHostTest")]
 
 namespace VamDlssNrWorkScale
@@ -769,9 +769,17 @@ namespace VamDlssNrWorkScale
             }
         }
 
-        // The value the passes use follows the setting only once the slider is let go. Every
+        // The value the passes use follows the setting only once it has stopped moving. Every
         // distinct value is a different model size, and a different size rebuilds the network --
         // committing on each pixel of a drag would be dozens of rebuilds a second.
+        //
+        // VamDlssNr's own slider says when it is held, and that is honoured. A slider in VaM's UI
+        // (the in-headset panel) says nothing of the kind -- it only reports values -- so the value
+        // also has to have stood still for a moment, which is what letting go looks like from here.
+        private const float SettleSeconds = 0.35f;
+        private static float _wanted = 1f;
+        private static float _wantedSince;
+
         internal static void Tick()
         {
             if (CfgScale == null)
@@ -781,7 +789,19 @@ namespace VamDlssNrWorkScale
 
             float want = Quantise(CfgScale.Value, MaxScale());
 
-            if (want == _applied || SliderHeld())
+            if (want == _applied)
+            {
+                _wanted = want;
+                return;
+            }
+
+            if (want != _wanted)
+            {
+                _wanted = want;
+                _wantedSince = Time.unscaledTime;
+            }
+
+            if (SliderHeld() || Time.unscaledTime - _wantedSince < SettleSeconds)
             {
                 return;
             }
@@ -1132,6 +1152,7 @@ namespace VamDlssNrWorkScale
         // ---- the panel -----------------------------------------------------------------------
 
         private static string _status = "";
+        private static string _statusBrief = "";
         private static float _statusAt = -1f;
 
         private static string StatusLine()
@@ -1145,7 +1166,7 @@ namespace VamDlssNrWorkScale
 
             if (want != _applied)
             {
-                return "release the slider to apply " + Percent(want);
+                return SliderHeld() ? "release the slider to apply " + Percent(want) : "applying " + Percent(want) + "...";
             }
 
             if (_applied == 1f)
@@ -1160,6 +1181,7 @@ namespace VamDlssNrWorkScale
 
             _statusAt = Time.unscaledTime;
             _status = "";
+            _statusBrief = "";
             View best = null;
 
             foreach (KeyValuePair<int, View> kv in _views)
@@ -1185,6 +1207,11 @@ namespace VamDlssNrWorkScale
                 _status = best.Eyes == 2
                     ? "network: 2 x " + (best.WorkW / 2) + "x" + best.WorkH + " for 2 x " + (best.FrameW / 2) + "x" + best.FrameH + " eyes (" + Percent(ratio) + ")"
                     : "network: " + best.WorkW + "x" + best.WorkH + " for a " + best.FrameW + "x" + best.FrameH + " frame (" + Percent(ratio) + ")";
+
+                // The same, worded for a box half as wide (the in-headset panel's).
+                _statusBrief = best.Eyes == 2
+                    ? "model: 2 x " + (best.WorkW / 2) + "x" + best.WorkH + " of 2 x " + (best.FrameW / 2) + "x" + best.FrameH + " (" + Percent(ratio) + ")"
+                    : "model: " + best.WorkW + "x" + best.WorkH + " of " + best.FrameW + "x" + best.FrameH + " (" + Percent(ratio) + ")";
             }
 
             return _status;
@@ -1198,6 +1225,57 @@ namespace VamDlssNrWorkScale
             }
 
             return Problem;
+        }
+
+        // The same two lines, for the in-headset panel's status box.
+        internal static string ModelLine()
+        {
+            if (!Hooked || !Native.Loaded || CfgScale == null)
+            {
+                return "";
+            }
+
+            string line = StatusLine();
+
+            if (line.Length != 0)
+            {
+                // What the network is running at has a shorter wording; "applying..." is short as it is.
+                return ReferenceEquals(line, _status) && _statusBrief.Length != 0 ? _statusBrief : line;
+            }
+
+            return _applied == 1f ? "model: full frame size (100%)" : "model: " + Percent(_applied) + " per axis, once NR is running";
+        }
+
+        internal static string ProblemText()
+        {
+            return ProblemLine();
+        }
+
+        // Saves both settings files: VamDlssNr's own save, which our hook on it extends to ours.
+        internal static void SaveAll()
+        {
+            try
+            {
+                if (M_saveNow != null)
+                {
+                    M_saveNow.Invoke(null, null);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Warn("VamDlssNr's save failed: " + ex.Message);
+            }
+
+            SaveNowPostfix();
+        }
+
+        internal static void RedrawModPanel(VamDlssNrPanel panel)
+        {
+            if (M_renderTab != null && panel != null)
+            {
+                M_renderTab.Invoke(panel, null);
+            }
         }
 
         public static void RenderTabPostfix(VamDlssNrPanel __instance)
@@ -1293,12 +1371,48 @@ namespace VamDlssNrWorkScale
     public class WorkScalePlugin : BaseUnityPlugin
     {
         public const string Guid = "jeahbwoi720.vamdlssnr.workscale";
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.0";
+
+        // What every build's settings file is called after its owner prefix.
+        private const string SettingsSuffix = ".vamdlssnr.workscale.cfg";
 
         internal static WorkScalePlugin Instance;
 
         private float _nextSweep;
         private float _nextDrain;
+
+        // 1.0.0 kept its settings under a different owner prefix. If this build's file does not
+        // exist yet and that one does, it is renamed into place -- once, before anything is bound,
+        // so the values in it are the ones the settings below come up with.
+        private void AdoptEarlierSettings()
+        {
+            try
+            {
+                string mine = Config.ConfigFilePath;
+
+                if (File.Exists(mine))
+                {
+                    return;
+                }
+
+                foreach (string other in Directory.GetFiles(Path.GetDirectoryName(mine), "*" + SettingsSuffix))
+                {
+                    if (string.Equals(Path.GetFullPath(other), mine, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    File.Move(other, mine);
+                    Config.Reload();
+                    Logger.LogInfo("[vws] settings taken over from an earlier build's file (now " + Path.GetFileName(mine) + ")");
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[vws] an earlier build's settings could not be taken over (" + ex.GetType().Name + ": " + ex.Message + ") -- starting from defaults");
+            }
+        }
 
         private void Awake()
         {
@@ -1307,6 +1421,7 @@ namespace VamDlssNrWorkScale
             Hooks.Warn = delegate(string s) { Logger.LogWarning("[vws] " + s); };
             Hooks.Error = delegate(string s) { Logger.LogError("[vws] " + s); };
 
+            AdoptEarlierSettings();
             Config.SaveOnConfigSet = false;
 
             ConfigEntry<bool> supersample = Config.Bind("Advanced", "AllowSupersampling", false,
@@ -1330,6 +1445,10 @@ namespace VamDlssNrWorkScale
                 "Diagnostic, only while Model resolution is below 1.0. 0 = normal. 2 = show the network's edit on its own, amplified around mid-grey (grey = untouched). 3 = show the frame with the edit left out, while everything still runs. Reset to 0 at startup.",
                 new AcceptableValueRange<int>(0, 3)));
             Hooks.CfgDebugView.Value = 0;
+
+            // The in-headset panel needs none of what follows: it is offered VamDlssNr's settings
+            // even when the frame hook below cannot go in.
+            ControlPanel.Watch();
 
             string dir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
 
@@ -1385,6 +1504,20 @@ namespace VamDlssNrWorkScale
 
         private void Update()
         {
+            // The in-headset panel stands apart from the rest: a fault in it takes only it down.
+            if (!ControlPanel.Off)
+            {
+                try
+                {
+                    ControlPanel.Tick();
+                }
+                catch (Exception ex)
+                {
+                    ControlPanel.Off = true;
+                    Logger.LogError("[vws] the in-headset control panel failed and is off for this session: " + ex.GetType().Name + " -- " + ex.Message + "\n" + ex.StackTrace);
+                }
+            }
+
             try
             {
                 Hooks.Tick();

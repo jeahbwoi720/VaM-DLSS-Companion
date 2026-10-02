@@ -8,6 +8,10 @@
 #
 # -SelfTest builds the in-game self-test driver in as well (see SelfTest.cs), into out-selftest\.
 # That build is for test\run-ingame.ps1 only and is never the one installed.
+#
+# The session script under vam\ is not part of the DLL -- VaM compiles it itself, with an older
+# compiler -- but it is compiled here too, as C# 3 against VaM's assemblies, so that a mistake in
+# it fails the build rather than a headset session.
 param(
     [string]$VamDir = 'D:\Games\VaM_Updater',
     [string]$ModDll = '',
@@ -28,17 +32,21 @@ $sdk = (& dotnet --list-sdks | Select-Object -Last 1) -replace '^(\S+) \[(.+)\]$
 $csc = Join-Path $sdk 'Roslyn\bincore\csc.dll'
 if (-not (Test-Path $csc)) { throw "csc.dll not found under $sdk" }
 
-$refs = @(
+$vamRefs = @(
     (Join-Path $managed 'mscorlib.dll'),
     (Join-Path $managed 'System.dll'),
     (Join-Path $managed 'System.Core.dll'),
     (Join-Path $managed 'UnityEngine.dll'),
     (Join-Path $managed 'UnityEngine.CoreModule.dll'),
+    (Join-Path $managed 'UnityEngine.UI.dll'),
+    (Join-Path $managed 'Assembly-CSharp.dll')
+)
+$refs = $vamRefs + @(
     (Join-Path $core 'BepInEx.dll'),
     (Join-Path $core '0Harmony.dll'),
     $ModDll
 )
-$sources = @((Join-Path $here 'WorkScale.cs'))
+$sources = @((Join-Path $here 'WorkScale.cs'), (Join-Path $here 'ControlPanel.cs'))
 $defines = @()
 
 if ($SelfTest) {
@@ -50,5 +58,13 @@ if ($SelfTest) {
 & dotnet exec $csc -nologo -target:library -nostdlib+ -noconfig -langversion:7.3 -optimize+ -debug- -deterministic `
     -warnaserror- -nowarn:1701,1702 "-out:$(Join-Path $out 'VamDlssNrWorkScale.dll')" @defines @($refs | ForEach-Object { "-r:$_" }) @sources
 if ($LASTEXITCODE -ne 0) { throw 'managed build failed' }
+
+# The session script, as VaM's own compiler would be asked to take it.
+$scripts = Get-ChildItem (Join-Path (Split-Path $here) 'vam\Custom\Scripts') -Recurse -Filter *.cs
+$check = Join-Path $out 'script-check.dll'
+& dotnet exec $csc -nologo -target:library -nostdlib+ -noconfig -langversion:3 -nowarn:1701,1702 "-out:$check" `
+    @($vamRefs | ForEach-Object { "-r:$_" }) @($scripts.FullName)
+if ($LASTEXITCODE -ne 0) { throw 'the VaM session script does not compile' }
+Remove-Item $check -Force -Confirm:$false
 
 Get-Item (Join-Path $out 'VamDlssNrWorkScale.dll') | Select-Object Name, Length, LastWriteTime
