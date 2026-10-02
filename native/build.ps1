@@ -1,0 +1,41 @@
+# Builds VamDlssNrWorkScaleNative.dll (and the offline test harness) with the VS 2022 Build Tools.
+#   pwsh native\build.ps1            -> out\VamDlssNrWorkScaleNative.dll, out\vws_test.exe
+$ErrorActionPreference = 'Stop'
+
+$here = $PSScriptRoot
+$out = Join-Path $here 'out'
+New-Item -ItemType Directory -Force $out | Out-Null
+
+$fxc = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter fxc.exe |
+    Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+if (-not $fxc) { throw 'fxc.exe not found (Windows SDK)' }
+
+$vsRoot = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -all -products * -latest -property installationPath
+$vcvars = Join-Path $vsRoot 'VC\Auxiliary\Build\vcvars64.bat'
+if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found under $vsRoot" }
+
+# fxc, not dxc: the passes run on VaM's D3D11 device, which takes DXBC.
+$shaders = @(
+    @{ Entry = 'VSMain';    Profile = 'vs_5_0'; Name = 'g_vwsVs';        File = 'vws_vs.h' },
+    @{ Entry = 'PSDown';    Profile = 'ps_5_0'; Name = 'g_vwsPsDown';    File = 'vws_ps_down.h' },
+    @{ Entry = 'PSResolve'; Profile = 'ps_5_0'; Name = 'g_vwsPsResolve'; File = 'vws_ps_resolve.h' }
+)
+
+foreach ($s in $shaders) {
+    & $fxc.FullName /nologo /T $s.Profile /E $s.Entry /O3 /Vn $s.Name /Fh (Join-Path $here $s.File) (Join-Path $here 'vws.hlsl')
+    if ($LASTEXITCODE -ne 0) { throw "fxc failed on $($s.Entry)" }
+}
+
+$common = '/nologo /std:c++17 /O2 /W4 /EHsc /MT /DUNICODE /D_UNICODE'
+$dll = "cl $common /LD `"$here\vws.cpp`" /Fo`"$out\\`" /Fe`"$out\VamDlssNrWorkScaleNative.dll`" /link /NOLOGO d3d11.lib dxguid.lib"
+$test = "cl $common `"$here\vws_test.cpp`" /Fo`"$out\\`" /Fe`"$out\vws_test.exe`" /link /NOLOGO d3d11.lib dxguid.lib"
+
+cmd /c "`"$vcvars`" >nul && $dll"
+if ($LASTEXITCODE -ne 0) { throw 'native DLL build failed' }
+
+if (Test-Path (Join-Path $here 'vws_test.cpp')) {
+    cmd /c "`"$vcvars`" >nul && $test"
+    if ($LASTEXITCODE -ne 0) { throw 'test harness build failed' }
+}
+
+Get-ChildItem $out -Include *.dll, *.exe -Recurse | Select-Object Name, Length, LastWriteTime
