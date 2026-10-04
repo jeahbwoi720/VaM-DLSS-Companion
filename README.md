@@ -1,8 +1,35 @@
-# VaM DLSS – Model Resolution
+# VaM DLSS Companion
 
-A companion plugin for [UncleBurrito's VaM DLSS](https://www.patreon.com/UncleBurrito) that adds one
-control to its panel: **Model resolution** — how much of the frame, per axis, DLSS Neural Rendering
-works at. It is the same idea as *WorkingScale* / "Model resolution" in
+A free companion plugin for [UncleBurrito's VaM DLSS](https://www.patreon.com/UncleBurrito) in
+Virt-A-Mate. VaM DLSS itself is a paid mod and nothing of it is included here; this plugin adds to
+it and does nothing without it.
+
+It began as one slider and has grown since:
+
+- **[Model resolution](#model-resolution)** — run DLSS Neural Rendering on a smaller picture, for a
+  multiple of the frame rate, without reducing the frame itself
+- **[Focus window](#using-it)** — Neural Rendering only where you look: in a headset it follows your
+  gaze when there is eye tracking, on a monitor it follows the person in view
+- **[In-headset controls](#in-headset-controls)** — VaM DLSS's settings as a session plugin's UI,
+  where the controllers reach them
+- **[Sharpening](#sharpening)** — a filter over the finished frame
+- **[Headset menu at full size](#headset-menu-at-full-size)** — VaM's menu drawn after DLSS and
+  Neural Rendering, at the headset's own resolution
+- **[Passthrough](#passthrough-playstation-vr2)** — your room behind the person, through a
+  PlayStation VR2's cameras
+
+What is being worked on and what is planned is on the
+[roadmap](https://github.com/users/jeahbwoi720/projects/1). Something wrong or missing: open an
+issue.
+
+> This repository was called *VaM-DLSS-Model-Resolution* until October 2026. Old links lead here,
+> and the plugin's files, folder and settings file keep their names (`VamDlssNrWorkScale…`), so an
+> update installs over what you have.
+
+## Model resolution
+
+**Model resolution** is how much of the frame, per axis, DLSS Neural Rendering works at. It is the
+same idea as *WorkingScale* / "Model resolution" in
 [Dagherbou's OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR), brought to
 Virt-A-Mate.
 
@@ -60,6 +87,7 @@ whole screenshot, with the settings panel in it:
 
 What the network does to skin and light is there at every setting. Its finest grain — pores,
 freckles — thins out as the slider comes down, and two passes at 50% cost less than one at 100%.
+
 ## Requirements
 
 - **VaM DLSS 1.0.3** by UncleBurrito, installed and working. It is a paid mod and nothing of it is
@@ -77,7 +105,7 @@ Unzip the release into your VaM folder, giving you:
 ```
 
 The folder is the plugin; the `.var` is the session script for the [in-headset panel](#in-headset-controls)
-and can be left out if you only want the slider. No file of VaM's or of VaM DLSS's is touched or
+and can be left out if you only use the monitor's panel. No file of VaM's or of VaM DLSS's is touched or
 replaced. To uninstall, delete the folder and the package.
 
 ## Using it
