@@ -44,11 +44,11 @@ numbers will differ with the scene, the card and VaM DLSS's other settings; the 
 One scene at 2560x1440 on the same RTX 5060 Laptop: DLAA, then Neural Rendering. The face is cut
 out of each screenshot at the screenshot's own pixel size, so open the pictures to judge them.
 
-![Neural Rendering off, then on at 100%, 75% and 50% model resolution](docs/examples/compare-one-pass.jpg)
+![Neural Rendering off, then on at 100%, 75%, 50% and 25% model resolution](docs/examples/compare-one-pass.jpg)
 
-The same from a step closer, at 25% and with two passes of the network:
+With two passes of the network (these, and the 25% above, are from a step closer):
 
-![One pass at 25%, then two passes at 100%, 75%, 50% and 25%](docs/examples/compare-two-passes.jpg)
+![Two passes at 100%, 75%, 50% and 25%](docs/examples/compare-two-passes.jpg)
 
 Frames a second in that scene, as the overlay in the screenshots shows them. Each number opens the
 whole screenshot, with the settings panel in it:
