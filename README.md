@@ -17,6 +17,12 @@ It began as one slider and has grown since:
   Neural Rendering, at the headset's own resolution
 - **[Passthrough](#passthrough-playstation-vr2)** — your room behind the person, through a
   PlayStation VR2's cameras
+- **[Flip-model window and frame pacing](#flip-model-window-and-frame-pacing-monitor)** — on the
+  monitor: a window RTX HDR can take, and generated frames spread evenly
+- **[Foveated shading](#foveated-shading)** — the scene shaded at full rate only where you look
+  (NVIDIA cards)
+- **[Hand tracking](#hand-tracking-experimental-playstation-vr2)** — experimental: your hands from
+  the headset's cameras, as VaM's own hands, pointing at the menus and pinching to click
 
 What is being worked on and what is planned is on the
 [roadmap](https://github.com/users/jeahbwoi720/projects/1). Something wrong or missing: open an
@@ -101,12 +107,18 @@ Unzip the release into your VaM folder, giving you:
 ```
 <VaM>\BepInEx\plugins\VamDlssNrWorkScale\VamDlssNrWorkScale.dll
 <VaM>\BepInEx\plugins\VamDlssNrWorkScale\VamDlssNrWorkScaleNative.dll
+<VaM>\BepInEx\plugins\VamDlssNrWorkScale\onnxruntime.dll, hand-palm.onnx, hand-points.onnx
+<VaM>\BepInEx\patchers\VamDlssNrWorkScale.Early.dll
 <VaM>\AddonPackages\jeahbwoi720.VaMVrNrControl.2.var
 ```
 
-The folder is the plugin; the `.var` is the session script for the [in-headset panel](#in-headset-controls)
-and can be left out if you only use the monitor's panel. No file of VaM's or of VaM DLSS's is touched or
-replaced. To uninstall, delete the folder and the package.
+The folder is the plugin. `onnxruntime.dll` and the two `.onnx` models are only loaded when
+[hand tracking](#hand-tracking-experimental-playstation-vr2) is switched on (they are other
+people's work: see `THIRD-PARTY.md`). The file in `patchers` is what makes the
+[flip-model window](#flip-model-window-and-frame-pacing-monitor); without it everything else works.
+The `.var` is the session script for the [in-headset panel](#in-headset-controls) and can be left
+out if you only use the monitor's panel. No file of VaM's or of VaM DLSS's is touched or replaced.
+To uninstall, delete the folder, the file in `patchers` and the package.
 
 ## Using it
 
@@ -242,6 +254,80 @@ may work, but the lens model was measured on a PlayStation VR2 and nothing else 
 | `View` | 0 | 1 = the cut-out alone, 2 = the camera everywhere |
 | `OverlayOtherShape`, `CutOutPose`, `CutOutTimingMs` | false, 0, 0 | for troubleshooting an overlay that sits wrong |
 
+## Flip-model window and frame pacing (monitor)
+
+Unity 2018 presents VaM's window the old way: every frame is copied to the desktop compositor.
+Anything that needs a flip-model window cannot take it — NVIDIA's **RTX HDR**, for one. With
+*Monitor: flip-model window* on (it is by default), the window is made flip-model when VaM starts in
+monitor mode (`-vrmode None`). To the game nothing changes: it still draws into a back buffer of the
+kind it asked for, and that is copied onto the real one at every present. In a headset nothing is
+done.
+
+- It is set up before VaM creates its window, by the file in `BepInEx\patchers`, so the switch takes
+  effect at the next start. The status box says `window: flip model, 2560x1440` when it is at work.
+- VaM's own anti-aliasing has to be off (a flip-model window cannot be multisampled; with DLSS on it
+  is off anyway). With it on, the window is left as it was and the status box says so.
+- RTX HDR itself is switched on in NVIDIA's app for VaM, with Windows HDR on.
+
+**Frame generation.** VaM DLSS's frame generation needs what its own README says: VaM's *Desktop
+VSync* on (or a frame cap below the screen's refresh rate), a rendered rate below the refresh rate
+divided by the multiplier — and DLSS Super Resolution on. With the flip-model window there is also
+*Frame generation: paced by queue* (on by default, and only at work while frame generation is on):
+every frame is told how many screen refreshes to stay up, so that a burst of generated frames waits
+in the window's queue and comes out in rhythm while the game renders the next real frame. Switch VaM
+DLSS's own *space frames evenly* off with it. It adds up to about one rendered frame of delay.
+
+| `[Presentation]` setting | Default | |
+|---|---|---|
+| `FlipModel` | true | the flip-model window, in monitor mode; read when VaM starts |
+| `FramePacing` | true | generated frames spread by the window's queue |
+
+## Foveated shading
+
+*Foveated shading (NVIDIA)* shades the scene at full rate only where the eyes look, and more
+coarsely around that — variable rate shading, on a GTX 16 / RTX 20 series card or later. Edges and
+depth stay at full resolution; only the shading inside surfaces gets coarser. With eye tracking that
+reaches SteamVR it follows the gaze, otherwise it is centred on each lens.
+
+It applies to the scene camera's own geometry: shadows, image effects, DLSS, Neural Rendering and
+the menu are untouched. It saves the graphics card's time, not the processor's — where VaM is held
+back by its main thread, as it often is, the frame rate stays where it was, and what is saved can go
+into a higher render scale instead.
+
+| `[Foveation]` setting | Default | |
+|---|---|---|
+| `Enabled` | false | the switch |
+| `FollowGaze` | true | aim it where the eyes look, when SteamVR has eye tracking |
+| `Inner`, `Outer` | 0.22, 0.42 | full rate within `Inner` of where the eye looks (a share of the picture's height), coarsest beyond `Outer` |
+| `Strong` | true | beyond `Outer`, as coarse as the picture's anti-aliasing allows |
+| `ShowZones` | false | for setting it up: beyond `Outer` the scene is not shaded at all |
+| `UpsideDown` | false | turn on if the zone moves down when the eyes look up |
+| `OnMonitor` | false | also in monitor mode, around the middle of the window |
+
+## Hand tracking (experimental, PlayStation VR2)
+
+Your hands, found in the pictures of the headset's two cameras. Like passthrough it needs the
+cameras to reach SteamVR ([PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit)
+1.0.0-experimental or later). It runs on the processor, on a thread of its own, with
+[ONNX Runtime](https://github.com/microsoft/onnxruntime) and MediaPipe's two hand models, which come
+with the plugin.
+
+- *Hand tracking: show skeleton* draws what it sees: the 21 points of each hand.
+- *VaM's hands follow* — **Controllers**: the tracked hands are only shown. **Auto**: a controller
+  that is being moved or squeezed has its hand; a hand the cameras see, whose controller lies still,
+  follows the cameras. **Tracked hands**: the cameras have every hand they see. VaM's own hand
+  models are driven (through VaM's Leap Motion path), so they touch and push what the controllers'
+  hands do.
+- *Point and pinch menus* — while a tracked hand drives VaM's hand: a line from the hand points at
+  VaM's menus (it is aimed from the shoulder through the hand, so the arm points, not the fingers);
+  pinch thumb and index to click, hold the pinch to drag a slider or scroll. Turn the **left palm to
+  your face and pinch** to open or close the menu.
+
+This is the roughest part of the plugin. Finger poses are approximate — a fist and single raised
+fingers are the weak spots — a hand is lost when it leaves the cameras' view, and the cameras need
+light: in the dark an infra-red lamp works if it lights the side of your hands that faces you (from
+behind or above you, not from the desk in front).
+
 ## In-headset controls
 
 VaM DLSS's own panel is a desktop overlay: in a headset it sits on the mirror window and takes the
@@ -257,7 +343,12 @@ UI**, as VaM's own sliders, toggles and popups, where the controllers' pointer r
 - the [sharpening filter](#sharpening), [headset menu at full size](#headset-menu-at-full-size)
   and [passthrough](#passthrough-playstation-vr2)
 - frame generation on/off, multiplier, pacing (monitor only, as in VaM DLSS)
+- [foveated shading](#foveated-shading), the [flip-model window](#flip-model-window-and-frame-pacing-monitor)
+  and [hand tracking](#hand-tracking-experimental-playstation-vr2)
 - a live status box — what is running, at what size, the frame pacing — and reset buttons
+
+The panel is in pages, one for each of these, with tabs along the top; passthrough's own key colour
+is picked with VaM's colour picker. (The picture below is of the earlier, single-page panel.)
 
 ![The panel in a session plugin's UI](docs/session-panel.png)
 
@@ -312,6 +403,9 @@ pwsh build.ps1 -VamDir D:\path\to\VaM -Zip     # native + managed + the .var -> 
 pwsh install.ps1 -VamDir D:\path\to\VaM        # copy dist\ into the game
 ```
 
+The first build fetches what is not in the repository — ONNX Runtime, the two hand models and
+NVIDIA's NVAPI — with `native\fetch-deps.ps1`, which checks each against a fixed SHA-256.
+
 The session script under `vam\` is compiled by VaM itself, with an older compiler; the build compiles
 it too, as C# 3 against VaM's assemblies, so a mistake in it fails the build rather than a session.
 
@@ -335,5 +429,8 @@ Three layers, none of which needs the others:
 - [UncleBurrito](https://www.patreon.com/UncleBurrito) — VaM DLSS, which does all the real work.
 - [Dagherbou](https://github.com/Dagherbou/OptiScaler_DLSSNR) and hhkbble — the working-scale and
   matched-residual technique this reimplements for Unity/D3D11.
+
+- ONNX Runtime (Microsoft), MediaPipe's hand models (Google, as converted for OpenCV's model zoo)
+  and NVAPI (NVIDIA) — see [THIRD-PARTY.md](THIRD-PARTY.md).
 
 MIT licensed. Not affiliated with any of the above, nor with NVIDIA or MeshedVR.

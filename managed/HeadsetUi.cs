@@ -48,6 +48,7 @@ namespace VamDlssNrWorkScale
         private static FieldInfo F_eyeOut;
         private static FieldInfo F_srPresented;
         private static FieldInfo F_present;
+        private static MethodInfo M_missStreak, M_substitution;
 
         // Any capture's frame while its Compose runs: where it goes, and whether it has been
         // finished yet.
@@ -95,6 +96,10 @@ namespace VamDlssNrWorkScale
             {
                 F_present = null;
             }
+
+            // What VamDlssNr's submit hook says of itself (optional: only for telling, see EndOfFrame).
+            M_missStreak = typeof(VamDlssNrPlugin).GetMethod("VrMissStreak", any, null, Type.EmptyTypes, null);
+            M_substitution = typeof(VamDlssNrPlugin).GetMethod("VrSubstitution", any, null, Type.EmptyTypes, null);
 
             FieldInfo layers = typeof(VamDlssNrPlugin).GetField("CfgUiLayerMask", any);
             _modLayers = layers != null ? layers.GetValue(null) as ConfigEntry<int> : null;
@@ -317,6 +322,7 @@ namespace VamDlssNrWorkScale
                 {
                     // Will the interface be drawn over this frame when it is over?
                     bool menuLater = (object)_dst != null && ReferenceEquals(target, _dst) && (object)_stripped != null && _stripped != null && Method() != 2;
+                    Passthrough.SceneCamera = _composing;
                     touched |= Passthrough.Run(frame, eyes, Hooks.NetIsTopDown(), Time.unscaledTime, menuLater);
                 }
                 catch (Exception ex)
@@ -406,6 +412,8 @@ namespace VamDlssNrWorkScale
             {
                 try
                 {
+                    Passthrough.SceneCamera = __instance;
+
                     if (Passthrough.Run(_frameSrc, null, false, Time.unscaledTime, false))
                     {
                         Graphics.Blit(_frameSrc, _frameDst);
@@ -537,7 +545,28 @@ namespace VamDlssNrWorkScale
                 if (_pendingEyes[0] != null && _pendingEyes[1] != null && _pendingEyes[0].IsCreated() && _pendingEyes[1].IsCreated())
                 {
                     Guarded(delegate { Draw(main, _pendingLayers, _pendingEyes, null, Hooks.NetIsTopDown(), keywordOff); });
+
+                    // And the camera's own frame as well. The reconstructed eyes reach the headset
+                    // only when VamDlssNr's hook on the compositor's submit puts them in place of
+                    // the frame; a submit it misses hands on the frame itself -- which has no
+                    // interface in it, the layers having been taken off the camera. In a heavy
+                    // scene that happens (reported: "enabling DLSS-SR is making menus not
+                    // accessible", only where the frame rate is low), and the menu was gone for as
+                    // long as it did. Drawn into both, it is there whichever of the two is shown.
+                    if (!_failed && dst != null && dst.IsCreated())
+                    {
+                        Guarded(delegate { Draw(main, _pendingLayers, null, dst, false, keywordOff); });
+                        _perEye = true;
+                    }
+
                     MatteAfterMenu(null, _pendingEyes, Hooks.NetIsTopDown());
+                    TellMisses();
+                }
+                else if (dst != null && dst.IsCreated())
+                {
+                    // the eyes went away between the frame's composing and its end: the frame, then
+                    Guarded(delegate { Draw(main, _pendingLayers, null, dst, false, keywordOff); });
+                    MatteAfterMenu(dst, null, false);
                 }
             }
             else if (dst != null && dst.IsCreated())
@@ -549,6 +578,48 @@ namespace VamDlssNrWorkScale
             }
 
             _pendingEyes[0] = _pendingEyes[1] = null;
+        }
+
+        // How often VamDlssNr's submit hook did not put the reconstructed eyes in the frame's
+        // place, by its own count: said in the log when it starts and when it grows, so that a
+        // menu that flickers or softens has its reason on record.
+        private static uint _missesSeen;
+        private static int _missFrames;
+        private static float _missSaidAt = -100f;
+
+        private static void TellMisses()
+        {
+            if (M_missStreak == null)
+            {
+                return;
+            }
+
+            try
+            {
+                uint streak = Convert.ToUInt32(M_missStreak.Invoke(null, null));
+
+                if (streak == 0)
+                {
+                    _missesSeen = 0;
+                    return;
+                }
+
+                _missFrames++;
+
+                if (streak > _missesSeen && Time.unscaledTime - _missSaidAt > 5f)
+                {
+                    _missSaidAt = Time.unscaledTime;
+                    int state = M_substitution != null ? Convert.ToInt32(M_substitution.Invoke(null, null)) : -1;
+                    Say("VaM DLSS's submit hook has missed " + streak + " submits running (substitution state " + state + ", " + _missFrames +
+                        " frames with a miss so far): those frames reach the headset as the camera rendered them, not reconstructed -- the menu is drawn into them too");
+                }
+
+                _missesSeen = streak;
+            }
+            catch (Exception)
+            {
+                M_missStreak = null;
+            }
         }
 
         // The passthrough overlay's matte, now that the interface is in the frame.
@@ -792,7 +863,8 @@ namespace VamDlssNrWorkScale
                 return "headset menu: in the scene (no headset frame from VaM DLSS yet)";
             }
 
-            return _perEye ? "headset menu: drawn at full size, after DLSS" : "headset menu: drawn after DLSS and Neural Rendering";
+            return _perEye ? "headset menu: drawn at full size, after DLSS" + (_missFrames != 0 ? " (" + _missFrames + " frames not reconstructed)" : "") :
+                "headset menu: drawn after DLSS and Neural Rendering";
         }
     }
 }

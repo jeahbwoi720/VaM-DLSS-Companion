@@ -51,7 +51,7 @@ namespace VamDlssNrWorkScale
     internal static class Native
     {
         private const string Dll = "VamDlssNrWorkScaleNative";
-        private const uint ExpectedAbi = 12;
+        private const uint ExpectedAbi = 17;
 
         internal const uint Frame = 1, Proxy = 2, Model = 4, Result = 8;
         internal const int ReadyDown = 1, ReadyResolve = 2, ReadyGuide = 4; // ReadyGuide << n for guide n
@@ -107,7 +107,33 @@ namespace VamDlssNrWorkScale
         private static CamStopFn _camStop;
         private static CamStatusFn _camStatus;
         private static PushPassthroughFn _pushPassthrough;
-        private delegate int PushMatteFn(IntPtr source, uint eyes, uint eye, uint srgb, uint topDown, [In] float[] headPose, uint fromAlpha);
+        private delegate int PushMatteFn(IntPtr source, uint eyes, uint eye, uint srgb, uint topDown, [In] float[] headPose, uint fromAlpha, IntPtr depth, [In] float[] depthInfo);
+        private delegate void OverlayDepthFn(out float room, out float scene);
+        private delegate int DepthReadFn([Out] byte[] rgba, uint capacity, out uint side, out uint micros);
+        private delegate int CamReadFn([Out] byte[] grey, uint capacity, out uint width, out uint height);
+        private delegate int FoveaEventFn(uint on);
+        private delegate void FoveaConfigureFn([In] float[] values, uint count, IntPtr anyTexture);
+        private delegate void FoveaStatusFn(out int state, out uint width, out uint height, out uint samples, out uint coarse, out uint ons);
+        private static FoveaEventFn _foveaEvent;
+        private static FoveaConfigureFn _foveaConfigure;
+        private static FoveaStatusFn _foveaStatus;
+        private delegate void FlipStatusFn(out int state, out uint width, out uint height, out uint presents, out uint tearing);
+        private static FlipStatusFn _flipStatus;
+        private delegate void FlipPaceFn(int on, uint multiplier);
+        private delegate void FlipPaceStatusFn(out float rate, out float refresh, out float each, out float queue, out uint dropped);
+        private static FlipPaceFn _flipPace;
+        private static FlipPaceStatusFn _flipPaceStatus;
+        private delegate int HandLoadFn(IntPtr folder);
+        private delegate void HandErrorFn([Out] byte[] text, uint capacity);
+        private delegate void HandConfigureFn(uint on, uint every, [In] float[] values, uint count);
+        private delegate int HandReadFn([Out] float[] hands, uint capacity, out uint serial, out uint micros, out float ageMs, out uint inRoom);
+        private static HandLoadFn _handLoad;
+        private static HandErrorFn _handError;
+        private static HandConfigureFn _handConfigure;
+        private static HandReadFn _handRead;
+        private static OverlayDepthFn _overlayDepth;
+        private static DepthReadFn _depthRead;
+        private static CamReadFn _camRead;
         private delegate void OverlayStatusFn(out int state, out uint frames, out int error);
         private static PushMatteFn _pushMatte;
         private static OverlayStatusFn _overlayStatus;
@@ -187,6 +213,19 @@ namespace VamDlssNrWorkScale
                 _pushMatte = (PushMatteFn)Bind(module, "vws_push_matte", typeof(PushMatteFn));
                 _overlayStatus = (OverlayStatusFn)Bind(module, "vws_overlay_status", typeof(OverlayStatusFn));
                 _overlayRead = (OverlayReadFn)Bind(module, "vws_overlay_read", typeof(OverlayReadFn));
+                _overlayDepth = (OverlayDepthFn)Bind(module, "vws_overlay_depth", typeof(OverlayDepthFn));
+                _depthRead = (DepthReadFn)Bind(module, "vws_depth_read", typeof(DepthReadFn));
+                _camRead = (CamReadFn)Bind(module, "vws_cam_read", typeof(CamReadFn));
+                _foveaEvent = (FoveaEventFn)Bind(module, "vws_fovea_event", typeof(FoveaEventFn));
+                _foveaConfigure = (FoveaConfigureFn)Bind(module, "vws_fovea_configure", typeof(FoveaConfigureFn));
+                _foveaStatus = (FoveaStatusFn)Bind(module, "vws_fovea_status", typeof(FoveaStatusFn));
+                _flipStatus = (FlipStatusFn)Bind(module, "vws_flip_status", typeof(FlipStatusFn));
+                _flipPace = (FlipPaceFn)Bind(module, "vws_flip_pace", typeof(FlipPaceFn));
+                _flipPaceStatus = (FlipPaceStatusFn)Bind(module, "vws_flip_pace_status", typeof(FlipPaceStatusFn));
+                _handLoad = (HandLoadFn)Bind(module, "vws_hand_load", typeof(HandLoadFn));
+                _handError = (HandErrorFn)Bind(module, "vws_hand_error", typeof(HandErrorFn));
+                _handConfigure = (HandConfigureFn)Bind(module, "vws_hand_configure", typeof(HandConfigureFn));
+                _handRead = (HandReadFn)Bind(module, "vws_hand_read", typeof(HandReadFn));
                 _pushRelease = (PushReleaseFn)Bind(module, "vws_push_release", typeof(PushReleaseFn));
                 _poll = (PollFn)Bind(module, "vws_poll", typeof(PollFn));
                 _drain = (DrainFn)Bind(module, "vws_drain_log", typeof(DrainFn));
@@ -273,9 +312,81 @@ namespace VamDlssNrWorkScale
             return _pushPassthrough(target, (uint)eyes, (uint)eye, srgb ? 1u : 0u, topDown ? 1u : 0u, eyeToRoom);
         }
 
-        internal static int PushMatte(IntPtr source, int eyes, int eye, bool srgb, bool topDown, float[] headPose, bool fromAlpha)
+        internal static int PushMatte(IntPtr source, int eyes, int eye, bool srgb, bool topDown, float[] headPose, bool fromAlpha, IntPtr depth, float[] depthInfo)
         {
-            return _pushMatte(source, (uint)eyes, (uint)eye, srgb ? 1u : 0u, topDown ? 1u : 0u, headPose, fromAlpha ? 1u : 0u);
+            return _pushMatte(source, (uint)eyes, (uint)eye, srgb ? 1u : 0u, topDown ? 1u : 0u, headPose, fromAlpha ? 1u : 0u, depth, depth != IntPtr.Zero ? depthInfo : null);
+        }
+
+        internal static void OverlayDepth(out float room, out float scene)
+        {
+            _overlayDepth(out room, out scene);
+        }
+
+        internal static bool DepthRead(byte[] rgba, out uint side, out uint micros)
+        {
+            return _depthRead(rgba, rgba != null ? (uint)rgba.Length : 0u, out side, out micros) != 0;
+        }
+
+        // The render event that switches foveated shading on (or off) for what is drawn next.
+        internal static int FoveaEvent(bool on)
+        {
+            return _foveaEvent(on ? 1u : 0u);
+        }
+
+        internal static void FoveaConfigure(float[] values, IntPtr anyTexture)
+        {
+            _foveaConfigure(values, (uint)values.Length, anyTexture);
+        }
+
+        internal static void FoveaStatus(out int state, out uint width, out uint height, out uint samples, out uint coarse, out uint ons)
+        {
+            _foveaStatus(out state, out width, out height, out samples, out coarse, out ons);
+        }
+
+        // What became of the flip-model window the preloader patcher armed (vws_flip.h).
+        internal static void FlipStatus(out int state, out uint width, out uint height, out uint presents, out uint tearing)
+        {
+            _flipStatus(out state, out width, out height, out presents, out tearing);
+        }
+
+        // Generated frames spread evenly by the flip-model window's own queue.
+        internal static void FlipPace(bool on, int multiplier)
+        {
+            _flipPace(on ? 1 : 0, (uint)multiplier);
+        }
+
+        internal static void FlipPaceStatus(out float rate, out float refresh, out float each, out float queue, out uint dropped)
+        {
+            _flipPaceStatus(out rate, out refresh, out each, out queue, out dropped);
+        }
+
+        // ONNX Runtime and the two hand models, from beside the native DLL.
+        internal static bool HandLoad()
+        {
+            return _handLoad(IntPtr.Zero) != 0;
+        }
+
+        internal static string HandError()
+        {
+            byte[] text = new byte[256];
+            _handError(text, (uint)text.Length);
+            int length = Array.IndexOf(text, (byte)0);
+            return System.Text.Encoding.ASCII.GetString(text, 0, length < 0 ? text.Length : length);
+        }
+
+        internal static void HandConfigure(bool on, int every, float[] values)
+        {
+            _handConfigure(on ? 1u : 0u, (uint)Math.Max(1, every), values, values != null ? (uint)values.Length : 0u);
+        }
+
+        internal static bool HandRead(float[] hands, out uint serial, out uint micros, out float ageMs, out uint inRoom)
+        {
+            return _handRead(hands, (uint)hands.Length, out serial, out micros, out ageMs, out inRoom) != 0;
+        }
+
+        internal static bool CamRead(byte[] grey, out uint width, out uint height)
+        {
+            return _camRead(grey, (uint)grey.Length, out width, out height) != 0;
         }
 
         // The overlay's picture as RGBA bytes: asks for the next one drawn, returns the last one kept.
@@ -3014,7 +3125,7 @@ namespace VamDlssNrWorkScale
     public class WorkScalePlugin : BaseUnityPlugin
     {
         public const string Guid = "jeahbwoi720.vamdlssnr.workscale";
-        public const string Version = "1.6.0";
+        public const string Version = "1.7.0";
 
         // What every build's settings file is called after its owner prefix.
         private const string SettingsSuffix = ".vamdlssnr.workscale.cfg";
@@ -3190,9 +3301,80 @@ namespace VamDlssNrWorkScale
             Passthrough.CfgFollowHead = Config.Bind("Passthrough", "FollowHead", false,
                 "Carry the camera's picture from where the head was when it was taken to where the head is now, so a turning head does not drag the room with it. Off, the room is drawn as if no time had passed.");
             Passthrough.CfgView = Config.Bind("Passthrough", "View", 0, new ConfigDescription(
-                "0 the picture; 1 the matte (white where the room will show) for setting the tolerance; 2 the camera everywhere, for looking at the room alone.",
-                new AcceptableValueRange<int>(0, 2)));
+                "0 the picture; 1 the matte (white where the room will show) for setting the tolerance; 2 the camera everywhere, for looking at the room alone; 3 how near the room is taken to be (bright = near); 4 how near the scene is.",
+                new AcceptableValueRange<int>(0, 4)));
+            Passthrough.CfgDepth = Config.Bind("Passthrough", "Depth", false,
+                "Experimental, Mode 0 only. Work out how far away the room is from the two cameras, and let whatever in it is nearer than the figure show in front of the figure: a hand held out before it covers it. Costs some frame rate: the game has to keep a depth picture of the scene, and stays doing so until it is restarted.");
+            Passthrough.CfgDepthMargin = Config.Bind("Passthrough", "DepthMargin", 0.25f, new ConfigDescription(
+                "How much nearer than the figure a thing in the room must be to show in front of it, as a difference of one-over-the-distance: 0.25 is a quarter of a metre at one metre, six centimetres at half a metre. Raise it if the room breaks through the figure where it should not.",
+                new AcceptableValueRange<float>(0f, 2f)));
+            Passthrough.CfgDepthSoftness = Config.Bind("Passthrough", "DepthSoftness", 0.1f, new ConfigDescription(
+                "Over how much more than the margin the room fades in.", new AcceptableValueRange<float>(0f, 1f)));
+            Passthrough.CfgDepthFlip = Config.Bind("Passthrough", "DepthUpsideDown", false,
+                "For troubleshooting: take the scene's depth picture the other way up. Set it if View 4 shows the scene's depth upside down.");
             Passthrough.CfgPreset.SettingChanged += delegate { Passthrough.ApplyPreset(); };
+
+            Hands.CfgOn = Config.Bind("Hands", "Tracking", false,
+                "Experimental. Find the wearer's hands in the headset's cameras (a PlayStation VR2 with PSVR2Toolkit 1.0.0 or later; the same cameras passthrough uses). For now they are only shown, as a skeleton in the scene, to judge the tracking by. " +
+                "The finding is done on the processor (ONNX Runtime, two background threads), not the graphics card. It needs onnxruntime.dll, hand-palm.onnx and hand-points.onnx beside the plugin.");
+            Hands.CfgShow = Config.Bind("Hands", "ShowSkeleton", true,
+                "Draw the tracked hands in the scene: lines along the fingers, a dot at each joint. Blue is the left hand, orange the right.");
+            Hands.CfgBoth = Config.Bind("Hands", "BothHands", true,
+                "Look for two hands. Off: one hand only, at about half the cost.");
+            Hands.CfgEvery = Config.Bind("Hands", "EveryNthFrame", 2, new ConfigDescription(
+                "The cameras give 60 frames a second; the hands are looked for in every so many of them. 1 is the smoothest and takes the most of the processor, 2 is 30 looks a second.",
+                new AcceptableValueRange<int>(1, 4)));
+            Hands.CfgSmoothing = Config.Bind("Hands", "Steadiness", 1.5f, new ConfigDescription(
+                "How slow a movement is taken for jitter and smoothed away, in Hz: lower holds a still hand steadier and makes it lag more.",
+                new AcceptableValueRange<float>(0.2f, 10f)));
+            Hands.CfgQuick = Config.Bind("Hands", "Quickness", 20f, new ConfigDescription(
+                "How much less a moving hand is smoothed, the faster it moves: higher follows quick movements more closely and lets more jitter through while moving.",
+                new AcceptableValueRange<float>(0f, 100f)));
+            Foveation.CfgOn = Config.Bind("Foveation", "Enabled", false,
+                "Shade the scene at full rate only where the eyes look, and more coarsely around that (NVIDIA variable rate shading; GTX 16 / RTX 20 series or later). Edges and depth stay at full resolution; only the shading inside surfaces gets coarser. " +
+                "It saves the card's time on the scene itself -- skin, hair, lights -- not on DLSS or Neural Rendering. It applies to the scene camera's own geometry only: shadows, image effects and the menu drawn at full size are untouched. " +
+                "With DLSS upscaling on as well the two coarsenings add up.");
+            Foveation.CfgGaze = Config.Bind("Foveation", "FollowGaze", true,
+                "Aim it where the eyes look, from SteamVR's eye tracking (a PlayStation VR2 with PSVR2Toolkit, for one). Without eye tracking, or with this off, it is aimed at the middle of each lens.");
+            Foveation.CfgInner = Config.Bind("Foveation", "Inner", 0.22f, new ConfigDescription(
+                "How far from where the eye looks the shading stays at full rate, as a share of the picture's height.",
+                new AcceptableValueRange<float>(0.05f, 1f)));
+            Foveation.CfgOuter = Config.Bind("Foveation", "Outer", 0.42f, new ConfigDescription(
+                "Beyond this the coarsest rate is used; between Inner and this, the middle one.",
+                new AcceptableValueRange<float>(0.05f, 1.5f)));
+            Foveation.CfgStrong = Config.Bind("Foveation", "Strong", true,
+                "Beyond Outer, shade as coarsely as the picture's anti-aliasing allows (one shading for 4x4 pixels without anti-aliasing, 2x2 at 4x). Off: no coarser than the ring between Inner and Outer.");
+            Foveation.CfgShow = Config.Bind("Foveation", "ShowZones", false,
+                "For setting it up: beyond Outer the scene is not shaded at all, so the zone shows as a hole around where the eyes look.");
+            Foveation.CfgTopDown = Config.Bind("Foveation", "UpsideDown", false,
+                "Turn on if the zone moves down when the eyes look up.");
+            Foveation.CfgMonitor = Config.Bind("Foveation", "OnMonitor", false,
+                "Also in desktop mode, around the middle of the window.");
+
+            Presentation.CfgFlip = Config.Bind("Presentation", "FlipModel", true,
+                "Monitor mode only, and read when VaM starts: present the game's window with the flip model instead of Unity's old bit-block copy. " +
+                "With the old way the desktop compositor drops most frames above the base rate -- frame generation renders more frames and the picture gets no smoother -- and RTX HDR cannot take the window. " +
+                "Needs VaM's own anti-aliasing off (DLSS does that job) and the file in BepInEx\\patchers that comes with this plugin.");
+
+            Presentation.CfgPace = Config.Bind("Presentation", "FramePacing", true,
+                "Monitor mode, with the flip-model window and VaM DLSS's frame generation on: spread the generated frames evenly on the screen. " +
+                "Frame generation presents its frames as it makes them -- a few in quick succession, then nothing while the next real frame is rendered -- which looks like the base rate however many frames there are. " +
+                "With this on they wait in the window's queue and come out in rhythm, one every so many screen refreshes, while the game is already rendering the next frame. " +
+                "It costs the time a frame waits (up to about one rendered frame), and it replaces VaM's own VSync setting and VaM DLSS's \"space frames evenly\", which is best switched off with it.");
+
+            ControlPanel.CfgPage = Config.Bind("Interface", "PanelPage", 0, new ConfigDescription(
+                "The page the in-headset panel was last on; it opens there again.",
+                new AcceptableValueRange<int>(0, 16)));
+
+            HandDrive.CfgMode = Config.Bind("Hands", "Drive", 1, new ConfigDescription(
+                "Who moves VaM's own hands while hand tracking is on. 0 Controllers: the tracked hands are only shown. 1 Auto: a controller that is being moved or squeezed has its hand; a hand the cameras see, whose controller lies still, follows the cameras. 2 Hands: the cameras have every hand they see. " +
+                "It is done through VaM's Leap Motion hands, without a Leap sensor and without touching VaM's Leap switch. To touch and push a person with them, VaM's own hand collision has to be on (User Preferences).",
+                new AcceptableValueRange<int>(0, 2)));
+            HandUi.CfgOn = Config.Bind("Hands", "Menus", true,
+                "While a tracked hand drives VaM's hand: point at VaM's menus with it (a line from the hand shows where), pinch thumb and index to click, hold the pinch to drag a slider or scroll. " +
+                "Turn the left palm to your face and pinch to open or close the menu. The controller's own pointer comes back the moment the controller is picked up.");
+            Hands.CfgSwap = Config.Bind("Hands", "SwapLeftRight", false,
+                "Turn on if the left hand is shown as the right one (orange) and the right as the left (blue).");
 
             HeadsetUi.CfgSharpen = Config.Bind("Picture", "Sharpening", 0f, new ConfigDescription(
                 "Sharpen the finished frame, after DLSS and Neural Rendering and before the interface is drawn: 0 is off, 1 the most. DLSS has no sharpening of its own any more, and its picture -- DLAA's most of all -- is on the soft side.\n\n" +
@@ -3256,6 +3438,19 @@ namespace VamDlssNrWorkScale
             HeadsetUi.Resolve();
             HeadsetUi.Apply(new Harmony(Guid + ".headsetui"));
 
+            Foveation.Begin();
+
+            try
+            {
+                HandDrive.Apply(new Harmony(Guid + ".hands"));
+            }
+            catch (Exception ex)
+            {
+                Logger.LogWarning("[vws] hands: VaM's Leap hand rule could not be hooked (" + ex.GetType().Name + ": " + ex.Message + ") -- the tracked hands will only be shown");
+            }
+
+            HandUi.Apply(new Harmony(Guid + ".handui"));
+
             if (HeadsetUi.Problem.Length != 0)
             {
                 Logger.LogWarning("[vws] " + HeadsetUi.Problem);
@@ -3287,6 +3482,7 @@ namespace VamDlssNrWorkScale
 
         private void OnApplicationQuit()
         {
+            Hands.Stop();
             Passthrough.Stop();
         }
 
@@ -3307,7 +3503,23 @@ namespace VamDlssNrWorkScale
             // Nothing, unless the panel's button started a probe.
             CameraProbe.Tick(Time.unscaledTime);
 
-            // Gives the headset's camera back once passthrough has not been drawn for a while.
+            Foveation.Tick(Time.unscaledTime);
+            Presentation.Tick(Time.unscaledTime);
+
+            // The wearer's hands, when they are being tracked: it holds the camera, so before the tick
+            // that would give it back.
+            try
+            {
+                Hands.Tick(Time.unscaledTime);
+            }
+            catch (Exception ex)
+            {
+                Hands.Fail(ex);
+            }
+
+            HandUi.Tick(Time.unscaledTime);
+
+            // Gives the headset's camera back once nothing has asked for it for a while.
             Passthrough.Tick(Time.unscaledTime);
 
             // The in-headset panel stands apart from the rest: a fault in it takes only it down.

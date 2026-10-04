@@ -32,9 +32,15 @@ foreach ($s in $shaders) {
     if ($LASTEXITCODE -ne 0) { throw "fxc failed on $($s.Entry)" }
 }
 
+# The hand tracker's outside parts (ONNX Runtime's header and DLL, the two models): fetched once.
+$deps = Join-Path $here 'deps'
+if (-not ((Test-Path (Join-Path $deps 'onnxruntime_c_api.h')) -and (Test-Path (Join-Path $deps 'onnxruntime.dll')) -and (Test-Path (Join-Path $deps 'nvapi\nvapi64.lib')))) {
+    & (Join-Path $here 'fetch-deps.ps1') | Out-Null
+}
+
 $common = '/nologo /std:c++17 /O2 /W4 /EHsc /MT /DUNICODE /D_UNICODE'
-$dll = "cl $common /LD `"$here\vws.cpp`" /Fo`"$out\\`" /Fe`"$out\VamDlssNrWorkScaleNative.dll`" /link /NOLOGO d3d11.lib dxgi.lib dxguid.lib"
-$test = "cl $common `"$here\vws_test.cpp`" /Fo`"$out\\`" /Fe`"$out\vws_test.exe`" /link /NOLOGO d3d11.lib dxguid.lib"
+$dll = "cl $common /LD `"$here\vws.cpp`" /Fo`"$out\\`" /Fe`"$out\VamDlssNrWorkScaleNative.dll`" /link /NOLOGO d3d11.lib dxgi.lib dxguid.lib user32.lib `"$here\deps\nvapi\nvapi64.lib`""
+$test = "cl $common `"$here\vws_test.cpp`" /Fo`"$out\\`" /Fe`"$out\vws_test.exe`" /link /NOLOGO d3d11.lib dxguid.lib user32.lib"
 
 cmd /c "`"$vcvars`" >nul && $dll"
 if ($LASTEXITCODE -ne 0) { throw 'native DLL build failed' }
@@ -43,5 +49,10 @@ if (Test-Path (Join-Path $here 'vws_test.cpp')) {
     cmd /c "`"$vcvars`" >nul && $test"
     if ($LASTEXITCODE -ne 0) { throw 'test harness build failed' }
 }
+
+# Beside the DLL, under the names it looks for.
+Copy-Item (Join-Path $deps 'onnxruntime.dll') (Join-Path $out 'onnxruntime.dll') -Force
+Copy-Item (Join-Path $deps 'palm.onnx') (Join-Path $out 'hand-palm.onnx') -Force
+Copy-Item (Join-Path $deps 'handpose.onnx') (Join-Path $out 'hand-points.onnx') -Force
 
 Get-ChildItem $out -Include *.dll, *.exe -Recurse | Select-Object Name, Length, LastWriteTime

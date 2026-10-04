@@ -15,6 +15,9 @@
 // home -- the two .cfg files -- and a second copy in a session-plugin preset would overwrite them
 // with whatever the preset last held on every launch.
 //
+// The controls are spread over pages, one a feature, with a row of tabs across the top: one list of
+// everything had grown longer than a pointer cares to scroll.
+//
 // None of this may cost a frame in a headset. The script is recognised at the moment VaM creates
 // it (a hook on the one method that creates every plugin script) rather than by searching a scene
 // that can hold a few hundred thousand objects, and a panel nobody has open is not kept up to date.
@@ -170,10 +173,58 @@ namespace VamDlssNrWorkScale
             }
         }
 
+        // A colour that is three settings, on VaM's own colour picker. Picking one there makes the
+        // list of ready-made colours say "Custom"; picking from the list moves the picker.
+        private sealed class ColourBinding : Binding
+        {
+            internal ConfigEntry<float> Red, Green, Blue;
+            internal ConfigEntry<int> Preset;
+            internal JSONStorableColor Storable;
+            private float _r = -1f, _g = -1f, _b = -1f;
+
+            internal void Push(float h, float s, float v)
+            {
+                Color c = HSVColorPicker.HSVToRGB(h, s, v);
+
+                if (Preset != null && Preset.Value != 0)
+                {
+                    Preset.Value = 0;
+                }
+
+                Red.Value = c.r;
+                Green.Value = c.g;
+                Blue.Value = c.b;
+                _r = Red.Value;
+                _g = Green.Value;
+                _b = Blue.Value;
+                Changed();
+            }
+
+            internal override void Pull(bool force)
+            {
+                float r = Red.Value, g = Green.Value, b = Blue.Value;
+
+                if (force || r != _r || g != _g || b != _b)
+                {
+                    _r = r;
+                    _g = g;
+                    _b = b;
+                    Storable.valNoCallback = HSVColorPicker.RGBToHSV(r, g, b);
+                }
+            }
+        }
+
         private sealed class Panel
         {
             internal MVRScript Script;
             internal JSONStorableString Status;
+
+            // The pages: their names, each control with the page it is on, the tab of each page.
+            internal readonly List<string> Pages = new List<string>();
+            internal readonly List<KeyValuePair<GameObject, int>> Items = new List<KeyValuePair<GameObject, int>>();
+            internal readonly List<UIDynamicButton> Tabs = new List<UIDynamicButton>();
+            internal Color TabColour = Color.white;
+            internal int Building, Page;
             internal readonly List<Binding> Bindings = new List<Binding>();
             internal readonly List<Binding> RegionBindings = new List<Binding>();
             internal int Region = 1;
@@ -186,6 +237,9 @@ namespace VamDlssNrWorkScale
 
         private static readonly List<Panel> _panels = new List<Panel>();
         private static readonly HashSet<int> _refused = new HashSet<int>();
+
+        // The page the panel was last on: it opens there again.
+        internal static ConfigEntry<int> CfgPage;
 
         // Set when Tick has thrown: the panel is then left alone for the rest of the session.
         internal static bool Off;
@@ -207,7 +261,7 @@ namespace VamDlssNrWorkScale
 
         // ---- reaching VamDlssNr's settings ---------------------------------------------------
 
-        private static ConfigEntry<T> Mod<T>(string field)
+        internal static ConfigEntry<T> Mod<T>(string field)
         {
             FieldInfo f = typeof(VamDlssNrPlugin).GetField(field, Any);
             ConfigEntry<T> entry = f != null ? f.GetValue(null) as ConfigEntry<T> : null;
@@ -304,6 +358,15 @@ namespace VamDlssNrWorkScale
             hi = range != null ? range.MaxValue : 1f;
         }
 
+        // Every control belongs to the page that was being built when it was made.
+        private static void Put(Panel p, UIDynamic ui)
+        {
+            if (ui != null)
+            {
+                p.Items.Add(new KeyValuePair<GameObject, int>(ui.gameObject, p.Building));
+            }
+        }
+
         private static FloatBinding Slider(Panel p, bool right, string label, Func<ConfigEntry<float>> entry, string format)
         {
             ConfigEntry<float> first = entry();
@@ -331,6 +394,7 @@ namespace VamDlssNrWorkScale
                 ui.rangeAdjustEnabled = false;
             }
 
+            Put(p, ui);
             p.Bindings.Add(b);
             return b;
         }
@@ -360,6 +424,7 @@ namespace VamDlssNrWorkScale
                 ui.label = label;
             }
 
+            Put(p, ui);
             p.Bindings.Add(b);
         }
 
@@ -385,12 +450,42 @@ namespace VamDlssNrWorkScale
                 ui.label = label;
             }
 
+            Put(p, ui);
+            p.Bindings.Add(b);
+        }
+
+        // VaM's own colour picker, for a colour kept as three settings.
+        private static void Colour(Panel p, bool right, string label, ConfigEntry<float> red, ConfigEntry<float> green, ConfigEntry<float> blue, ConfigEntry<int> preset)
+        {
+            if (red == null || green == null || blue == null)
+            {
+                return;
+            }
+
+            ColourBinding b = new ColourBinding();
+            b.Label = label;
+            b.Red = red;
+            b.Green = green;
+            b.Blue = blue;
+            b.Preset = preset;
+            b.Storable = new JSONStorableColor(label, HSVColorPicker.RGBToHSV(red.Value, green.Value, blue.Value), new JSONStorableColor.SetHSVColorCallback(b.Push));
+            b.Storable.defaultVal = HSVColorPicker.RGBToHSV((float)red.DefaultValue, (float)green.DefaultValue, (float)blue.DefaultValue);
+
+            UIDynamicColorPicker ui = p.Script.CreateColorPicker(b.Storable, right);
+
+            if (ui != null)
+            {
+                ui.label = label;
+            }
+
+            Put(p, ui);
             p.Bindings.Add(b);
         }
 
         private static void Button(Panel p, bool right, string label, Action action)
         {
             UIDynamicButton ui = p.Script.CreateButton(label, right);
+            Put(p, ui);
 
             if (ui != null && ui.button != null)
             {
@@ -422,11 +517,171 @@ namespace VamDlssNrWorkScale
             }
         }
 
+        // ---- pages -----------------------------------------------------------------------------
+        //
+        // One long list of everything had the last controls a long way down a scroll bar that is
+        // awkward to work with a pointer. Each feature has a page instead; a row of tabs across the
+        // top of both columns picks it. The controls of the other pages still exist -- they are
+        // switched off, which costs nothing and keeps every binding alive.
+
+        private static void Page(Panel p, string name)
+        {
+            p.Building = p.Pages.Count;
+            p.Pages.Add(name);
+        }
+
+        private static void Show(Panel p, int page)
+        {
+            if (p.Pages.Count == 0)
+            {
+                return;
+            }
+
+            page = Mathf.Clamp(page, 0, p.Pages.Count - 1);
+            p.Page = page;
+
+            for (int i = 0; i < p.Items.Count; i++)
+            {
+                GameObject go = p.Items[i].Key;
+
+                if (go != null && go.activeSelf != (p.Items[i].Value == page))
+                {
+                    go.SetActive(p.Items[i].Value == page);
+                }
+            }
+
+            for (int i = 0; i < p.Tabs.Count; i++)
+            {
+                if (p.Tabs[i] != null)
+                {
+                    p.Tabs[i].buttonColor = i == page ? new Color(0.55f, 0.78f, 1f) : p.TabColour;
+                }
+            }
+
+            if (CfgPage != null && CfgPage.Value != page)
+            {
+                CfgPage.Value = page;
+            }
+        }
+
+        // The tabs: half of them above the left column, the rest above the right. Each row is one of
+        // VaM's own buttons with its face switched off, so that the column lays it out as it does any
+        // other control, holding one small button a tab side by side.
+        private static void Tabs(Panel p)
+        {
+            Transform prefab = p.Script.manager != null ? p.Script.manager.configurableButtonPrefab : null;
+            int count = p.Pages.Count;
+            int leftCount = (count + 1) / 2;
+
+            for (int column = 0; column < 2 && prefab != null && count > 1; column++)
+            {
+                int from = column == 0 ? 0 : leftCount, to = column == 0 ? leftCount : count;
+
+                if (from >= to)
+                {
+                    continue;
+                }
+
+                UIDynamicButton holder = p.Script.CreateButton("", column == 1);
+
+                if (holder == null)
+                {
+                    continue;
+                }
+
+                holder.transform.SetAsFirstSibling();
+
+                if (holder.button != null)
+                {
+                    holder.button.enabled = false;
+                }
+
+                if (holder.buttonImage != null)
+                {
+                    holder.buttonImage.enabled = false;
+                }
+
+                if (holder.buttonText != null)
+                {
+                    holder.buttonText.gameObject.SetActive(false);
+                }
+
+                UnityEngine.UI.HorizontalLayoutGroup row = holder.gameObject.AddComponent<UnityEngine.UI.HorizontalLayoutGroup>();
+                row.spacing = 6f;
+                row.childControlWidth = true;
+                row.childControlHeight = true;
+                row.childForceExpandWidth = true;
+                row.childForceExpandHeight = true;
+
+                for (int i = from; i < to; i++)
+                {
+                    Transform t = UnityEngine.Object.Instantiate(prefab);
+                    t.SetParent(holder.transform, false);
+                    t.gameObject.SetActive(true);
+                    UIDynamicButton tab = t.GetComponent<UIDynamicButton>();
+
+                    // every tab the same share of the row, whatever its word
+                    UnityEngine.UI.LayoutElement size = t.GetComponent<UnityEngine.UI.LayoutElement>();
+
+                    if (size == null)
+                    {
+                        size = t.gameObject.AddComponent<UnityEngine.UI.LayoutElement>();
+                    }
+
+                    size.minWidth = 0f;
+                    size.preferredWidth = 0f;
+                    size.flexibleWidth = 1f;
+
+                    while (p.Tabs.Count <= i)
+                    {
+                        p.Tabs.Add(null);
+                    }
+
+                    p.Tabs[i] = tab;
+
+                    if (tab == null)
+                    {
+                        continue;
+                    }
+
+                    tab.label = p.Pages[i];
+                    p.TabColour = tab.buttonColor;
+
+                    if (tab.buttonText != null)
+                    {
+                        tab.buttonText.resizeTextForBestFit = true;
+                        tab.buttonText.resizeTextMinSize = 14;
+                        tab.buttonText.resizeTextMaxSize = 28;
+                    }
+
+                    if (tab.button != null)
+                    {
+                        int page = i;
+                        tab.button.onClick.AddListener(delegate
+                        {
+                            try
+                            {
+                                Show(p, page);
+                            }
+                            catch (Exception ex)
+                            {
+                                Hooks.Error("control panel: page '" + p.Pages[page] + "' could not be shown: " + ex.Message);
+                            }
+                        });
+                    }
+                }
+            }
+
+            Show(p, CfgPage != null ? CfgPage.Value : 0);
+        }
+
         private static void Build(Panel p)
         {
             const bool Left = false, Right = true;
 
-            // ---- left: Neural Rendering ----
+            // ---- Neural Rendering: the network on the left, its per-region mask on the right ----
+            Page(p, "NR");
+
             ConfigEntry<bool> nr = Mod<bool>("CfgEnabled");
             ConfigEntry<float> intensity = Mod<float>("CfgIntensity");
             ConfigEntry<float> tone = Mod<float>("CfgLocalTone");
@@ -434,15 +689,6 @@ namespace VamDlssNrWorkScale
 
             Toggle(p, Left, "Neural Rendering", nr);
             Slider(p, Left, "NR model resolution (applies when let go)", Hooks.CfgScale, "F2");
-
-            // The focus window: only where its hooks went in, or the slider would move nothing.
-            if (Hooks.WindowHooked)
-            {
-                Slider(p, Left, "NR window (1.00 = whole view)", Hooks.CfgWindow, "F2");
-                Slider(p, Left, "NR window edge softness", Hooks.CfgWindowFeather, "F2");
-                Toggle(p, Left, "NR window follows gaze", Hooks.CfgWindowGaze);
-            }
-
             Slider(p, Left, "NR intensity", intensity, "F2");
             Slider(p, Left, "NR local tone", tone, "F2");
             Slider(p, Left, "NR local structure", structure, "F2");
@@ -450,14 +696,28 @@ namespace VamDlssNrWorkScale
             Choice(p, Left, "NR passes", Mod<int>("CfgPasses"), new[] { "1", "2", "3" }, new[] { 1, 2, 3 });
             Toggle(p, Left, "NR before DLSS (always, in VR)", Mod<bool>("CfgNrBeforeSr"));
 
+            // What the network changed, on its own: grey where it changed nothing, so a focus
+            // window shows as the patch it is. Only has an effect while the model runs small or
+            // through a window.
+            Choice(p, Left, "NR debug view", Hooks.CfgDebugView, new[] { "Off", "Only what NR changed", "Frame without NR" }, new[] { 0, 2, 3 });
+
+            Button(p, Left, "Reset NR strengths to defaults", delegate
+            {
+                // Not the model resolution: that one is a frame-rate setting, and putting it back to
+                // 100% from a button about strengths halves the frame rate without saying so.
+                ToDefault(intensity);
+                ToDefault(tone);
+                ToDefault(structure);
+            });
+
             // The mask: one region at a time, picked from a list, rather than eighteen sliders.
             ConfigEntry<bool> mask = Mod<bool>("CfgControlMask");
             ConfigEntry<float>[] regionIntensity = ModArray("CfgRegionIntensity");
             ConfigEntry<float>[] regionTone = ModArray("CfgRegionTone");
             ConfigEntry<float>[] regionStructure = ModArray("CfgRegionStructure");
 
-            Toggle(p, Left, "Per-region control (mask)", mask);
-            Slider(p, Left, "Region edge softness (px)", Mod<float>("CfgMaskSoftness"), "F0");
+            Toggle(p, Right, "Per-region control (mask)", mask);
+            Slider(p, Right, "Region edge softness (px)", Mod<float>("CfgMaskSoftness"), "F0");
 
             if (regionIntensity != null && regionTone != null && regionStructure != null && regionIntensity.Length >= 6 && regionTone.Length >= 6 && regionStructure.Length >= 6)
             {
@@ -477,45 +737,40 @@ namespace VamDlssNrWorkScale
                     }
                 });
 
-                UIDynamicPopup regionUi = p.Script.CreateScrollablePopup(region, Left);
+                UIDynamicPopup regionUi = p.Script.CreateScrollablePopup(region, Right);
 
                 if (regionUi != null)
                 {
                     regionUi.label = "Region to tune";
                 }
 
-                p.RegionBindings.Add(Slider(p, Left, "Region intensity (x NR intensity)", delegate { return regionIntensity[p.Region]; }, "F2"));
-                p.RegionBindings.Add(Slider(p, Left, "Region tone (x local tone)", delegate { return regionTone[p.Region]; }, "F2"));
-                p.RegionBindings.Add(Slider(p, Left, "Region structure (x local structure)", delegate { return regionStructure[p.Region]; }, "F2"));
+                Put(p, regionUi);
+                p.RegionBindings.Add(Slider(p, Right, "Region intensity (x NR intensity)", delegate { return regionIntensity[p.Region]; }, "F2"));
+                p.RegionBindings.Add(Slider(p, Right, "Region tone (x local tone)", delegate { return regionTone[p.Region]; }, "F2"));
+                p.RegionBindings.Add(Slider(p, Right, "Region structure (x local structure)", delegate { return regionStructure[p.Region]; }, "F2"));
                 p.RegionBindings.RemoveAll(delegate(Binding b) { return b == null; });
+
+                Button(p, Right, "Reset every region to 1.00", delegate
+                {
+                    for (int i = 0; i < 6 && i < regionIntensity.Length && i < regionTone.Length && i < regionStructure.Length; i++)
+                    {
+                        ToDefault(regionIntensity[i]);
+                        ToDefault(regionTone[i]);
+                        ToDefault(regionStructure[i]);
+                    }
+                });
             }
 
-            // ---- right: status (the script's own box), DLSS, frame generation, resets ----
-            Toggle(p, Right, "DLSS Super Resolution", Mod<bool>("CfgSrEnabled"));
-            Choice(p, Right, "DLSS quality", Mod<int>("CfgSrQuality"),
-                new[] { "DLAA (native)", "Ultra Quality", "Quality", "Balanced", "Performance", "Ultra Performance" }, new[] { 5, 4, 2, 1, 0, 3 });
-            Choice(p, Right, "DLSS model", Mod<int>("CfgSrModel"), new[] { "DLSS 3", "DLSS 4", "DLSS 4.5" }, new[] { 0, 1, 2 });
-            // Not a sharpening filter: how far textures are biased towards their sharper mips while
-            // DLSS upscales. It does nothing at DLAA.
-            Slider(p, Right, "DLSS texture detail (not DLAA)", Mod<float>("CfgMipBiasStrength"), "F2");
-
-            if (HeadsetUi.Hooked && HeadsetUi.CfgSharpen != null)
-            {
-                Slider(p, Right, "Sharpening (0 = off)", HeadsetUi.CfgSharpen, "F2");
-            }
-
-            if (HeadsetUi.Hooked && HeadsetUi.CfgOn != null)
-            {
-                Toggle(p, Right, "Headset menu at full size", HeadsetUi.CfgOn);
-            }
-
-            Toggle(p, Right, "Frame generation (monitor only)", Mod<bool>("CfgFrameGen"));
-            Choice(p, Right, "Frame generation multiplier", Mod<int>("CfgFgMultiplier"), new[] { "2x", "3x", "4x" }, new[] { 2, 3, 4 });
-            Toggle(p, Right, "Frame generation: even pacing", Mod<bool>("CfgFgPacing"));
-
-            // The monitor's window: its own shape, and aimed at the person rather than the middle.
+            // ---- the focus window: the headset's on the left, the monitor's on the right. Only
+            // where its hooks went in, or the sliders would move nothing. ----
             if (Hooks.WindowHooked)
             {
+                Page(p, "Window");
+                Slider(p, Left, "NR window (1.00 = whole view)", Hooks.CfgWindow, "F2");
+                Slider(p, Left, "NR window edge softness", Hooks.CfgWindowFeather, "F2");
+                Toggle(p, Left, "NR window follows gaze", Hooks.CfgWindowGaze);
+
+                // The monitor's window: its own shape, and aimed at the person rather than the middle.
                 Toggle(p, Right, "NR window on monitor", Hooks.CfgWindowMonitor);
                 Slider(p, Right, "Monitor window width", Hooks.CfgMonitorWidth, "F2");
                 Slider(p, Right, "Monitor window height", Hooks.CfgMonitorHeight, "F2");
@@ -523,10 +778,36 @@ namespace VamDlssNrWorkScale
                 Toggle(p, Right, "Monitor window: fit people", Hooks.CfgMonitorFit);
             }
 
-            // What the network changed, on its own: grey where it changed nothing, so a focus
-            // window shows as the patch it is. Only has an effect while the model runs small or
-            // through a window.
-            Choice(p, Right, "NR debug view", Hooks.CfgDebugView, new[] { "Off", "Only what NR changed", "Frame without NR" }, new[] { 0, 2, 3 });
+            // ---- DLSS and the picture on the left, its sign switches on the right ----
+            Page(p, "DLSS");
+            Toggle(p, Left, "DLSS Super Resolution", Mod<bool>("CfgSrEnabled"));
+            Choice(p, Left, "DLSS quality", Mod<int>("CfgSrQuality"),
+                new[] { "DLAA (native)", "Ultra Quality", "Quality", "Balanced", "Performance", "Ultra Performance" }, new[] { 5, 4, 2, 1, 0, 3 });
+            Choice(p, Left, "DLSS model", Mod<int>("CfgSrModel"), new[] { "DLSS 3", "DLSS 4", "DLSS 4.5" }, new[] { 0, 1, 2 });
+            // Not a sharpening filter: how far textures are biased towards their sharper mips while
+            // DLSS upscales. It does nothing at DLAA.
+            Slider(p, Left, "DLSS texture detail (not DLAA)", Mod<float>("CfgMipBiasStrength"), "F2");
+
+            if (HeadsetUi.Hooked && HeadsetUi.CfgSharpen != null)
+            {
+                Slider(p, Left, "Sharpening (0 = off)", HeadsetUi.CfgSharpen, "F2");
+            }
+
+            if (HeadsetUi.Hooked && HeadsetUi.CfgOn != null)
+            {
+                Toggle(p, Left, "Headset menu at full size", HeadsetUi.CfgOn);
+            }
+
+            Toggle(p, Left, "Frame generation (monitor only)", Mod<bool>("CfgFrameGen"));
+            Choice(p, Left, "Frame generation multiplier", Mod<int>("CfgFgMultiplier"), new[] { "2x", "3x", "4x" }, new[] { 2, 3, 4 });
+            Toggle(p, Left, "Frame generation: even pacing", Mod<bool>("CfgFgPacing"));
+
+            // Read when VaM starts: without it the compositor drops most generated frames.
+            if (Presentation.CfgFlip != null)
+            {
+                Toggle(p, Left, "Monitor: flip-model window (restart)", Presentation.CfgFlip);
+                Toggle(p, Left, "Frame generation: paced by queue", Presentation.CfgPace);
+            }
 
             // DLSS's sign switches. A picture that will not hold still under DLSS is nearly always
             // one of these pointing the wrong way for the setup it is running on, and from inside
@@ -563,23 +844,46 @@ namespace VamDlssNrWorkScale
                 ToDefault(motionY);
             });
 
+            // ---- foveated shading of the scene ----
+            if (Foveation.CfgOn != null)
+            {
+                Page(p, "Foveation");
+                Toggle(p, Left, "Foveated shading (NVIDIA)", Foveation.CfgOn);
+                Toggle(p, Left, "Foveation follows gaze", Foveation.CfgGaze);
+                Slider(p, Left, "Foveation: full detail within", Foveation.CfgInner, "F2");
+                Slider(p, Left, "Foveation: coarsest beyond", Foveation.CfgOuter, "F2");
+                Toggle(p, Left, "Foveation: strong at the edges", Foveation.CfgStrong);
+
+                Toggle(p, Right, "Foveation: show the zones", Foveation.CfgShow);
+                Toggle(p, Right, "Foveation: zone is upside down", Foveation.CfgTopDown);
+                Toggle(p, Right, "Foveation on the monitor too", Foveation.CfgMonitor);
+            }
+
+            // ---- passthrough: what is cut out on the left, how the room is shown on the right ----
             if (HeadsetUi.Hooked && Passthrough.CfgOn != null)
             {
-                Toggle(p, Right, "Passthrough (headset)", Passthrough.CfgOn);
+                Page(p, "Passthrough");
+                Toggle(p, Left, "Passthrough (headset)", Passthrough.CfgOn);
+                Choice(p, Left, "Passthrough key colour", Passthrough.CfgPreset, new[] { "Custom", "Green", "Blue", "Magenta", "Black", "White" }, new[] { 0, 1, 2, 3, 4, 5 });
+                // VaM's own picker; picking a colour there makes the list above say "Custom".
+                Colour(p, Left, "Key colour", Passthrough.CfgRed, Passthrough.CfgGreen, Passthrough.CfgBlue, Passthrough.CfgPreset);
+                Slider(p, Left, "Passthrough tolerance", Passthrough.CfgTolerance, "F2");
+                Slider(p, Left, "Passthrough edge softness", Passthrough.CfgSoftness, "F2");
+
                 Choice(p, Right, "Passthrough mode", Passthrough.CfgMode, new[] { "Own overlay (camera's pace)", "In the game's frame" }, new[] { 0, 1 });
                 Slider(p, Right, "Passthrough overlay distance (m)", Passthrough.CfgOverlayDistance, "F0");
                 Toggle(p, Right, "Passthrough overlay: room behind", Passthrough.CfgRoomBehind);
-                Choice(p, Right, "Passthrough key colour", Passthrough.CfgPreset, new[] { "Custom", "Green", "Blue", "Magenta", "Black", "White" }, new[] { 0, 1, 2, 3, 4, 5 });
-                Slider(p, Right, "Passthrough key: red", Passthrough.CfgRed, "F2");
-                Slider(p, Right, "Passthrough key: green", Passthrough.CfgGreen, "F2");
-                Slider(p, Right, "Passthrough key: blue", Passthrough.CfgBlue, "F2");
-                Slider(p, Right, "Passthrough tolerance", Passthrough.CfgTolerance, "F2");
-                Slider(p, Right, "Passthrough edge softness", Passthrough.CfgSoftness, "F2");
                 Slider(p, Right, "Passthrough distance (m)", Passthrough.CfgDistance, "F2");
                 Slider(p, Right, "Passthrough brightness", Passthrough.CfgBrightness, "F2");
                 Slider(p, Right, "Passthrough room size", Passthrough.CfgFocal, "F0");
                 Toggle(p, Right, "Passthrough follows head", Passthrough.CfgFollowHead);
-                Choice(p, Right, "Passthrough view", Passthrough.CfgView, new[] { "Picture", "Matte", "Camera everywhere" }, new[] { 0, 1, 2 });
+                Choice(p, Right, "Passthrough view", Passthrough.CfgView, new[] { "Picture", "Matte", "Camera everywhere", "Room depth", "Scene depth" }, new[] { 0, 1, 2, 3, 4 });
+
+                if (Passthrough.CfgDepth != null)
+                {
+                    Toggle(p, Right, "Passthrough depth (experimental)", Passthrough.CfgDepth);
+                    Slider(p, Right, "Passthrough depth margin", Passthrough.CfgDepthMargin, "F2");
+                }
 
                 Button(p, Right, "Passthrough: save a capture", delegate
                 {
@@ -587,34 +891,39 @@ namespace VamDlssNrWorkScale
                 });
             }
 
-            // What the headset's cameras give SteamVR, written to the log: the first question any
-            // passthrough has to ask.
-            Button(p, Right, "Probe headset camera (to log)", delegate
+            // ---- the wearer's hands from the same cameras: what they do on the left, how they are
+            // found and the tools for looking into it on the right ----
+            if (Hands.CfgOn != null)
             {
-                CameraProbe.Begin(Time.unscaledTime);
-            });
+                Page(p, "Hands");
+                Toggle(p, Left, "Hand tracking (experimental)", Hands.CfgOn);
+                Choice(p, Left, "Hand tracking: VaM's hands follow", HandDrive.CfgMode, new[] { "Controllers", "Auto", "Tracked hands" }, new[] { 0, 1, 2 });
+                Toggle(p, Left, "Hand tracking: point and pinch menus", HandUi.CfgOn);
+                Toggle(p, Left, "Hand tracking: show skeleton", Hands.CfgShow);
+                Toggle(p, Left, "Hand tracking: both hands", Hands.CfgBoth);
+                Choice(p, Left, "Hand tracking: looks a second", Hands.CfgEvery, new[] { "60", "30", "20", "15" }, new[] { 1, 2, 3, 4 });
+                Slider(p, Left, "Hand tracking: steadiness", Hands.CfgSmoothing, "F1");
+                Slider(p, Left, "Hand tracking: quickness", Hands.CfgQuick, "F0");
+                Toggle(p, Left, "Hand tracking: swap left and right", Hands.CfgSwap);
 
-            Button(p, Right, "Reset NR strengths to defaults", delegate
-            {
-                // Not the model resolution: that one is a frame-rate setting, and putting it back to
-                // 100% from a button about strengths halves the frame rate without saying so.
-                ToDefault(intensity);
-                ToDefault(tone);
-                ToDefault(structure);
-            });
-
-            if (regionIntensity != null && regionTone != null && regionStructure != null)
-            {
-                Button(p, Right, "Reset every region to 1.00", delegate
+                Button(p, Right, "Hand tracking: save a camera frame", delegate
                 {
-                    for (int i = 0; i < 6 && i < regionIntensity.Length && i < regionTone.Length && i < regionStructure.Length; i++)
-                    {
-                        ToDefault(regionIntensity[i]);
-                        ToDefault(regionTone[i]);
-                        ToDefault(regionStructure[i]);
-                    }
+                    Hands.CaptureWanted = true;
+                });
+                Button(p, Right, "Hand tracking: record 8 s (starts in 4 s)", delegate
+                {
+                    Hands.RecordWanted = true;
+                });
+
+                // What the headset's cameras give SteamVR, written to the log: the first question any
+                // passthrough has to ask.
+                Button(p, Right, "Probe headset camera (to log)", delegate
+                {
+                    CameraProbe.Begin(Time.unscaledTime);
                 });
             }
+
+            Tabs(p);
         }
 
         private static bool Attach(MVRScript script, Type type)
@@ -797,6 +1106,26 @@ namespace VamDlssNrWorkScale
             if (Passthrough.Status.Length != 0)
             {
                 sb.Append(Passthrough.Status).Append('\n');
+            }
+
+            if (Presentation.Status.Length != 0)
+            {
+                sb.Append(Presentation.Status).Append('\n');
+            }
+
+            if (Foveation.Status.Length != 0)
+            {
+                sb.Append(Foveation.Status).Append('\n');
+            }
+
+            if (Hands.Status.Length != 0)
+            {
+                sb.Append(Hands.Status).Append('\n');
+            }
+
+            if (HandUi.Note.Length != 0)
+            {
+                sb.Append(HandUi.Note).Append('\n');
             }
 
             if (CameraProbe.Summary.Length != 0)

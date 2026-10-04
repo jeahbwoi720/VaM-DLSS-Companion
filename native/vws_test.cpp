@@ -9,6 +9,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
+#include <dxgi1_2.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -2387,12 +2388,399 @@ static int __stdcall FakeFrame(uint64_t, int, void* buffer, uint32_t size, void*
     return 0;
 }
 
+// ---- the wearer's hands ---------------------------------------------------------------------------
+//
+// There is no picture of a hand to give it here (the saved camera frames are of somebody's room and
+// stay out of the repository, as does the script that runs the tracker on them). What is checked is the plumbing: the
+// networks load from beside the DLL, a frame with no hand in it gives none, and the camera thread
+// feeds the hand thread and takes its answers. Run after TestOverlay: the camera's numbers and the
+// stand-in frame are that test's.
+static void TestHands(HMODULE dll)
+{
+    printf("[hands: the networks load, a frame without a hand has none, the camera thread feeds the tracker]\n");
+
+    typedef int (*LoadFn)(const wchar_t*);
+    typedef void (*ErrorFn)(char*, uint32_t);
+    typedef void (*HandConfigureFn)(uint32_t, uint32_t, const float*, uint32_t);
+    typedef int (*HandReadFn)(float*, uint32_t, uint32_t*, uint32_t*, float*, uint32_t*);
+    typedef uint32_t (*SolveFn)(const uint8_t*, uint32_t, uint32_t, const float*, const float*, const float*, uint32_t, float*);
+    typedef int (*StartFn)(void*, uint64_t, uint32_t, uint32_t);
+    typedef void (*StopFn)();
+    const LoadFn load = (LoadFn) GetProcAddress(dll, "vws_hand_load");
+    const ErrorFn error = (ErrorFn) GetProcAddress(dll, "vws_hand_error");
+    const HandConfigureFn configure = (HandConfigureFn) GetProcAddress(dll, "vws_hand_configure");
+    const HandReadFn read = (HandReadFn) GetProcAddress(dll, "vws_hand_read");
+    const SolveFn solve = (SolveFn) GetProcAddress(dll, "vws_hand_solve");
+    const StartFn start = (StartFn) GetProcAddress(dll, "vws_cam_start");
+    const StopFn stop = (StopFn) GetProcAddress(dll, "vws_cam_stop");
+
+    CHECK(load && error && configure && read && solve && start && stop, "the hand exports are there");
+
+    if (!load || !error || !configure || !read || !solve || !start || !stop)
+        return;
+
+    const uint32_t floats = 2 * 67;
+    float hands[floats];
+    uint32_t serial = 99, micros = 99, inRoom = 99;
+    float age = 0.0f;
+    memset(hands, 0x7f, sizeof(hands));
+    CHECK(read(hands, floats - 1, &serial, &micros, &age, &inRoom) == 0, "too small a buffer is not written to");
+    CHECK(read(hands, floats, &serial, &micros, &age, &inRoom) == 1 && hands[0] == 0.0f && hands[67] == 0.0f && age < 0.0f,
+          "before anything has run there are no hands, and no age");
+
+    if (load(nullptr) != 1)
+    {
+        char why[256] = {};
+        error(why, sizeof(why));
+        CHECK(why[0] != 0, "a load that fails says why");
+        printf("  the rest is skipped: %s\n", why);
+        return;
+    }
+
+    CHECK(load(nullptr) == 1, "loading twice is loading once");
+
+    float cfg[96] = {};
+    cfg[7] = 382.6f;
+    cfg[8] = 0.01983145f; cfg[9] = -0.0011872f; cfg[10] = -0.00294614f; cfg[11] = 0.00045608f;
+    cfg[12] = 507.887f; cfg[13] = 510.078f; cfg[14] = 506.532f; cfg[15] = 504.605f;
+    const float camToHead[24] = { 0.9647f, 0.0022f, 0.2635f, -0.04f, -0.1331f, 0.8671f, 0.48f, -0.0392f, -0.2274f, -0.4981f, 0.8368f, -0.0809f,
+                                  0.9653f, 0.0041f, -0.261f, 0.0388f, 0.1275f, 0.8651f, 0.4852f, -0.0393f, 0.2278f, -0.5016f, 0.8345f, -0.0806f };
+    memcpy(cfg + 24, camToHead, sizeof(camToHead));
+
+    memset(hands, 0x7f, sizeof(hands));
+    const uint32_t took = solve(g_fakeCam.data(), g_fakeW, g_fakeH, cfg, nullptr, nullptr, 8, hands);
+    CHECK(took > 0 && hands[0] == 0.0f && hands[67] == 0.0f, "stripes are not a hand (%u us a frame, live %g %g)", took, hands[0], hands[67]);
+    printf("  a frame with no hand to follow: %.1f ms\n", took / 1000.0);
+
+    // Through the threads: every camera frame to the tracker.
+    configure(1, 1, nullptr, 0);
+    CHECK(start((void*) &FakeFrame, 1, g_fakeW, g_fakeH) == 1, "the camera thread starts");
+
+    const uint32_t before = serial;
+
+    for (int i = 0; i < 250 && serial < before + 3; ++i)
+    {
+        Sleep(20);
+        read(hands, floats, &serial, &micros, &age, &inRoom);
+    }
+
+    CHECK(serial >= before + 3, "the hand thread works the camera's frames (%u of them)", serial - before);
+    CHECK(hands[0] == 0.0f && hands[67] == 0.0f && inRoom == 1 && age >= 0.0f && age < 2000.0f && micros > 0,
+          "and says there is no hand, with the head's place known (age %.0f ms, %u us)", age, micros);
+
+    stop();
+    configure(0, 2, nullptr, 0);
+    read(hands, floats, &serial, &micros, &age, &inRoom);
+    const uint32_t after = serial;
+    Sleep(100);
+    read(hands, floats, &serial, &micros, &age, &inRoom);
+    CHECK(serial == after && hands[0] == 0.0f, "stopping the camera stops the tracker");
+    Drain(true);
+}
+
+// ---- foveated shading -----------------------------------------------------------------------------
+//
+// Variable rate shading is the driver's and the card's: on the software rasterizer there is none,
+// and what can be checked is that asking for it there is refused quietly and leaves no state behind.
+static void TestFovea(HMODULE dll)
+{
+    printf("[foveated shading: its events are harmless where the card cannot do it]\n");
+
+    typedef int (*EventIdFn)(uint32_t);
+    typedef void (*FovConfigureFn)(const float*, uint32_t, void*);
+    typedef void (*FovStatusFn)(int32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*);
+    const EventIdFn eventId = (EventIdFn) GetProcAddress(dll, "vws_fovea_event");
+    const FovConfigureFn configure = (FovConfigureFn) GetProcAddress(dll, "vws_fovea_configure");
+    const FovStatusFn status = (FovStatusFn) GetProcAddress(dll, "vws_fovea_status");
+
+    CHECK(eventId && configure && status, "the foveation exports are there");
+
+    if (!eventId || !configure || !status)
+        return;
+
+    CHECK(eventId(1) != eventId(0) && eventId(1) > 0, "on and off are two events");
+
+    ID3D11Texture2D* target = MakeTexture(1024, 512, DXGI_FORMAT_R8G8B8A8_UNORM, kRT);
+    ID3D11RenderTargetView* rtv = nullptr;
+    g_dev->CreateRenderTargetView(target, nullptr, &rtv);
+    g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+
+    float cfg[16] = {};
+    cfg[0] = 1.0f;
+    cfg[1] = cfg[2] = cfg[3] = cfg[4] = 0.5f;
+    cfg[5] = 0.2f;
+    cfg[6] = 0.4f;
+    configure(cfg, 16, target);
+    g_event(eventId(1));
+    g_event(eventId(0));
+
+    int32_t state = -1;
+    uint32_t w = 0, h = 0, samples = 0, coarse = 0, ons = 0;
+    status(&state, &w, &h, &samples, &coarse, &ons);
+
+    if (g_warp)
+        CHECK(state == 2 && ons == 0, "the software rasterizer has no variable rate shading, and is told nothing (state %d, %u times on)", state, ons);
+    else
+        CHECK(state == 2 || (state == 1 && w == 1024 && h == 512 && coarse > 20 && coarse < 95),
+              "on a real card it either cannot, or made a map for the target (state %d, %ux%u, %u%% coarse)", state, w, h, coarse);
+
+    cfg[0] = 0.0f;
+    configure(cfg, 16, target);
+    g_event(eventId(1));
+    status(&state, &w, &h, &samples, &coarse, &ons);
+    CHECK(state == 0 || state == 2, "switched off, on does nothing (state %d)", state);
+
+    g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    rtv->Release();
+    target->Release();
+    Drain(true);
+}
+
+// ---- the flip-model window ------------------------------------------------------------------------
+//
+// The game asks for a swap chain the old way (one sRGB buffer, bit-block transfer). Armed, the DLL
+// makes it flip-model underneath and hands the game a stand-in back buffer of the kind it asked for;
+// what is drawn into the stand-in has to arrive on the real back buffer at Present.
+static HWND FlipWindow()
+{
+    WNDCLASSW wc {};
+    wc.lpfnWndProc = DefWindowProcW;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = L"VwsFlipTest";
+    RegisterClassW(&wc);
+    return CreateWindowExW(0, L"VwsFlipTest", L"", WS_OVERLAPPEDWINDOW, 0, 0, 640, 360, nullptr, nullptr, wc.hInstance, nullptr);
+}
+
+static void TestFlip(HMODULE dll)
+{
+    printf("[flip-model window: the game asks for the old kind and draws into a stand-in]\n");
+
+    typedef int (*ArmFn)();
+    typedef void (*FlipStatusFn)(int32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*);
+    const ArmFn arm = (ArmFn) GetProcAddress(dll, "vws_flip_arm");
+    typedef int (*DeliverFn)(void*, void**);
+    const FlipStatusFn status = (FlipStatusFn) GetProcAddress(dll, "vws_flip_status");
+    const DeliverFn deliver = (DeliverFn) GetProcAddress(dll, "vws_flip_deliver");
+    typedef void (*PaceFn)(int32_t, uint32_t);
+    typedef void (*PaceStatusFn)(float*, float*, float*, float*, uint32_t*);
+    const PaceFn pace = (PaceFn) GetProcAddress(dll, "vws_flip_pace");
+    const PaceStatusFn paceStatus = (PaceStatusFn) GetProcAddress(dll, "vws_flip_pace_status");
+
+    CHECK(arm && status && deliver, "the flip-model exports are there");
+
+    if (!arm || !status || !deliver)
+        return;
+
+    int32_t state = -1;
+    uint32_t w = 0, h = 0, presents = 0, tearing = 0;
+    status(&state, &w, &h, &presents, &tearing);
+    CHECK(state == 0, "not armed, it is off (state %d)", state);
+    CHECK(arm() == 1 && arm() == 1, "armed, and arming twice is harmless");
+
+    IDXGIDevice* dxgi = nullptr;
+    IDXGIAdapter* adapter = nullptr;
+    IDXGIFactory2* factory = nullptr;
+
+    if (FAILED(g_dev->QueryInterface(__uuidof(IDXGIDevice), (void**) &dxgi)) || FAILED(dxgi->GetAdapter(&adapter)) ||
+        FAILED(adapter->GetParent(__uuidof(IDXGIFactory2), (void**) &factory)))
+    {
+        CHECK(false, "the device's factory");
+        return;
+    }
+
+    HWND window = FlipWindow();
+    DXGI_SWAP_CHAIN_DESC1 d {};
+    d.Width = 320;
+    d.Height = 200;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    d.SampleDesc.Count = 1;
+    d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;
+    d.BufferCount = 1;
+    d.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    d.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+
+    IDXGISwapChain1* chain = nullptr;
+    HRESULT hr = factory->CreateSwapChainForHwnd(g_dev, window, &d, nullptr, nullptr, &chain);
+    CHECK(SUCCEEDED(hr) && chain != nullptr, "the swap chain is made (0x%08X)", (unsigned) hr);
+
+    if (chain != nullptr)
+    {
+        DXGI_SWAP_CHAIN_DESC1 real {};
+        chain->GetDesc1(&real);
+        status(&state, &w, &h, &presents, &tearing);
+        CHECK(state == 2 && real.SwapEffect == DXGI_SWAP_EFFECT_FLIP_DISCARD && real.BufferCount >= 2 && real.Format == DXGI_FORMAT_R8G8B8A8_UNORM,
+              "underneath it is flip-model (state %d, swap effect %d, %u buffers, format %d)", state, (int) real.SwapEffect, real.BufferCount, (int) real.Format);
+        CHECK(w == 320 && h == 200, "the stand-in has the window's size (%ux%u)", w, h);
+
+        ID3D11Texture2D* back = nullptr;
+        hr = chain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**) &back);
+        D3D11_TEXTURE2D_DESC td {};
+
+        if (back) back->GetDesc(&td);
+
+        CHECK(SUCCEEDED(hr) && td.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB && td.Width == 320 && td.Height == 200,
+              "the game gets the back buffer it asked for (format %d, %ux%u)", (int) td.Format, td.Width, td.Height);
+
+        if (back != nullptr)
+        {
+            ID3D11RenderTargetView* rtv = nullptr;
+            g_dev->CreateRenderTargetView(back, nullptr, &rtv);
+            const float orange[4] = { 1.0f, 0.2140f, 0.0f, 1.0f };
+
+            if (rtv != nullptr)
+            {
+                g_ctx->ClearRenderTargetView(rtv, orange);
+                rtv->Release();
+            }
+
+            // What Present does first: the picture has to be on the real back buffer.
+            ID3D11Texture2D* shown = nullptr;
+            ID3D11Texture2D* staging = nullptr;
+
+            if (deliver(chain, (void**) &shown) != 0 && shown != nullptr)
+            {
+                D3D11_TEXTURE2D_DESC sd {};
+                shown->GetDesc(&sd);
+                sd.Usage = D3D11_USAGE_STAGING;
+                sd.BindFlags = 0;
+                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                sd.MiscFlags = 0;
+                g_dev->CreateTexture2D(&sd, nullptr, &staging);
+                D3D11_MAPPED_SUBRESOURCE map {};
+
+                if (staging != nullptr)
+                {
+                    g_ctx->CopyResource(staging, shown);
+
+                    if (SUCCEEDED(g_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &map)))
+                    {
+                        const uint8_t* px = (const uint8_t*) map.pData + 100 * map.RowPitch + 160 * 4;
+                        CHECK(px[0] == 255 && px[1] > 120 && px[1] < 136 && px[2] == 0,
+                              "what was drawn into the stand-in is on the real back buffer (%u %u %u)", px[0], px[1], px[2]);
+                        g_ctx->Unmap(staging, 0);
+                    }
+
+                    staging->Release();
+                }
+
+                shown->Release();
+            }
+            else
+            {
+                CHECK(false, "the real back buffer can be read");
+            }
+
+            hr = chain->Present(0, 0);
+            CHECK(SUCCEEDED(hr), "Present succeeds (0x%08X)", (unsigned) hr);
+
+            ID3D11Texture2D* again = nullptr;
+            chain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**) &again);
+            CHECK(again == back, "after Present the game still has the same stand-in");
+
+            if (again) again->Release();
+
+            back->Release();
+        }
+
+        g_ctx->ClearState();
+        g_ctx->Flush();
+        hr = chain->ResizeBuffers(1, 400, 240, DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
+        back = nullptr;
+        chain->GetBuffer(0, __uuidof(ID3D11Texture2D), (void**) &back);
+        td = D3D11_TEXTURE2D_DESC {};
+
+        if (back) back->GetDesc(&td);
+
+        CHECK(SUCCEEDED(hr) && td.Width == 400 && td.Height == 240 && td.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
+              "resized as the game asks, the stand-in follows (0x%08X, %ux%u format %d)", (unsigned) hr, td.Width, td.Height, (int) td.Format);
+
+        if (back) back->Release();
+
+        hr = chain->Present(0, 0);
+        status(&state, &w, &h, &presents, &tearing);
+        CHECK(SUCCEEDED(hr) && presents == 2, "and presents again (0x%08X, %u presents)", (unsigned) hr, presents);
+
+        // Pacing: frames thrown at it far faster than any screen refreshes are all taken, most of
+        // them left out, and the device's queue length is put back when it is switched off.
+        CHECK(pace && paceStatus, "the pacing exports are there");
+
+        if (pace && paceStatus)
+        {
+            IDXGIDevice1* one = nullptr;
+            UINT before = 0, during = 0, after = 0;
+            g_dev->QueryInterface(__uuidof(IDXGIDevice1), (void**) &one);
+
+            if (one) one->GetMaximumFrameLatency(&before);
+
+            pace(1, 4);
+            bool all = true;
+
+            for (int i = 0; i < 400; i++)
+                all = all && SUCCEEDED(chain->Present(0, 0));
+
+            if (one) one->GetMaximumFrameLatency(&during);
+
+            float rate = 0, refresh = 0, each = 0, queue = 0;
+            uint32_t left = 0;
+            paceStatus(&rate, &refresh, &each, &queue, &left);
+            CHECK(all && refresh > 1.0f && rate > refresh && each < 1.0f && left > 100,
+                  "paced: every present taken, the ones the screen has no room for left out (%.0f/s onto %.0f Hz, %.2f each, %u left out)",
+                  rate, refresh, each, left);
+            CHECK(during > before, "while pacing the queue is longer (%u -> %u)", before, during);
+
+            pace(0, 4);
+            hr = chain->Present(0, 0);
+
+            if (one) one->GetMaximumFrameLatency(&after);
+
+            CHECK(SUCCEEDED(hr) && after == before, "switched off, the queue is as the game had it (%u, was %u)", after, before);
+
+            if (one) one->Release();
+        }
+
+        chain->Release();
+        g_ctx->ClearState();
+        g_ctx->Flush();
+        status(&state, &w, &h, &presents, &tearing);
+        CHECK(state == 1, "when the swap chain goes its stand-in goes with it (state %d)", state);
+    }
+
+    // A multisampled swap chain cannot be flip-model: it is made as asked.
+    HWND second = FlipWindow();
+    d.SampleDesc.Count = 4;
+    chain = nullptr;
+    hr = factory->CreateSwapChainForHwnd(g_dev, second, &d, nullptr, nullptr, &chain);
+
+    if (SUCCEEDED(hr) && chain != nullptr)
+    {
+        DXGI_SWAP_CHAIN_DESC1 real {};
+        chain->GetDesc1(&real);
+        status(&state, &w, &h, &presents, &tearing);
+        CHECK(real.SwapEffect == DXGI_SWAP_EFFECT_DISCARD && real.SampleDesc.Count == 4 && state == 3,
+              "a multisampled swap chain is left as the game asked (swap effect %d, state %d)", (int) real.SwapEffect, state);
+        chain->Release();
+    }
+    else
+    {
+        printf("  (no 4x multisampled swap chain on this device: 0x%08X)\n", (unsigned) hr);
+    }
+
+    g_ctx->ClearState();
+    g_ctx->Flush();
+    factory->Release();
+    adapter->Release();
+    dxgi->Release();
+    DestroyWindow(window);
+    DestroyWindow(second);
+    Drain(true);
+}
+
 static void TestOverlay(HMODULE dll)
 {
     printf("[passthrough as an overlay: a second device, the game's matte, the camera's own pace]\n");
 
     typedef void (*ConfigureFn)(const float*, uint32_t);
-    typedef int (*PushMatteFn)(void*, uint32_t, uint32_t, uint32_t, uint32_t, const float*, uint32_t);
+    typedef int (*PushMatteFn)(void*, uint32_t, uint32_t, uint32_t, uint32_t, const float*, uint32_t, void*, const float*);
     typedef int (*StartFn)(void*, uint64_t, uint32_t, uint32_t);
     typedef void (*StopFn)();
     typedef int (*ReadFn)(uint8_t*, uint32_t, uint32_t*, uint32_t*);
@@ -2418,7 +2806,7 @@ static void TestOverlay(HMODULE dll)
         for (uint32_t x = 0; x < cw; ++x)
             g_fakeCam[(size_t) y * cw + x] = (uint8_t) lroundf(128.0f + 90.0f * sinf(x * 0.013f) * cosf(y * 0.017f));
 
-    float cfg[80] = {};
+    float cfg[96] = {};
     cfg[0] = 0.0f; cfg[1] = 1.0f; cfg[2] = 0.0f;
     cfg[3] = 0.30f;
     cfg[4] = 0.20f;
@@ -2476,8 +2864,8 @@ static void TestOverlay(HMODULE dll)
 
     ID3D11Texture2D* frame = MakeTexture(w, h, DXGI_FORMAT_R16G16B16A16_TYPELESS, kRT);
     UploadHalf(frame, img);
-    g_event(pushMatte(frame, 2, 0, 0, 1, headNow, 0));
-    g_event(pushMatte(frame, 2, 1, 0, 1, headNow, 0));
+    g_event(pushMatte(frame, 2, 0, 0, 1, headNow, 0, nullptr, nullptr));
+    g_event(pushMatte(frame, 2, 1, 0, 1, headNow, 0, nullptr, nullptr));
     g_ctx->Flush();
     Drain(true);
 
@@ -2596,6 +2984,184 @@ static void TestOverlay(HMODULE dll)
         CHECK(shown > 20, "some of the quad is the room (%d of the texels checked)", shown);
     }
 
+    // ---- the room's depth --------------------------------------------------------------------
+    //
+    // A wall a metre in front of the head, patterned finely enough for the two lenses to tell
+    // where it is, as each lens would see it. The grid of distances worked out from the pair is
+    // held to the wall's; then a scene that is all figure is put behind the wall, and in front.
+    typedef int (*DepthReadFn)(uint8_t*, uint32_t, uint32_t*, uint32_t*);
+    const DepthReadFn depthRead = (DepthReadFn) GetProcAddress(dll, "vws_depth_read");
+    CHECK(depthRead != nullptr, "the depth export is there");
+
+    if (depthRead != nullptr && filled)
+    {
+        const double wall = 1.0;
+
+        const auto speck = [](int x, int y)
+        {
+            uint32_t n = (uint32_t) x * 374761393u + (uint32_t) y * 668265263u;
+            n = (n ^ (n >> 13)) * 1274126177u;
+            return ((n ^ (n >> 16)) & 0xFFFF) / 65535.0;
+        };
+
+        const auto pattern = [&](double x, double y)
+        {
+            const double gx = x / 0.04, gy = y / 0.04;
+            const int ix = (int) floor(gx), iy = (int) floor(gy);
+            const double fx = gx - ix, fy = gy - iy;
+            return speck(ix, iy) * (1 - fx) * (1 - fy) + speck(ix + 1, iy) * fx * (1 - fy) + speck(ix, iy + 1) * (1 - fx) * fy + speck(ix + 1, iy + 1) * fx * fy;
+        };
+
+        for (uint32_t lens = 0; lens < 2; ++lens)
+        {
+            const float* m = camToHead + lens * 12;
+
+            for (uint32_t y = 0; y < ch; ++y)
+            {
+                for (uint32_t x = 0; x < cw / 2; ++x)
+                {
+                    const double dx = x - cfg[12 + lens * 2], dy = y - cfg[13 + lens * 2];
+                    const double radius = std::max(sqrt(dx * dx + dy * dy), 1e-9);
+                    double angle = radius / cfg[7];
+
+                    for (int i = 0; i < 8; ++i)
+                    {
+                        const double a2 = angle * angle;
+                        const double poly = 1.0 + a2 * (cfg[8] + a2 * (cfg[9] + a2 * (cfg[10] + a2 * cfg[11])));
+                        const double slope = 1.0 + a2 * (3 * cfg[8] + a2 * (5 * cfg[9] + a2 * (7 * cfg[10] + a2 * 9 * cfg[11])));
+                        angle -= (cfg[7] * angle * poly - radius) / (cfg[7] * slope);
+                    }
+
+                    const double q[3] = { sin(angle) * dx / radius, -sin(angle) * dy / radius, -cos(angle) };
+                    double dir[3];
+
+                    for (int i = 0; i < 3; ++i)
+                        dir[i] = m[i * 4] * q[0] + m[i * 4 + 1] * q[1] + m[i * 4 + 2] * q[2];
+
+                    uint8_t value = 128;
+
+                    if (dir[2] < -0.05)
+                    {
+                        const double reach = (-wall - m[11]) / dir[2];
+                        value = (uint8_t) lround(40.0 + 180.0 * pattern(m[3] + reach * dir[0], m[7] + reach * dir[1]));
+                    }
+
+                    g_fakeCam[(size_t) y * cw + lens * (cw / 2) + x] = value;
+                }
+            }
+        }
+
+        cfg[80] = 1.0f;  // the room's depth is used
+        cfg[81] = 0.25f; // how much nearer the room must be
+        cfg[82] = 0.10f; // and over how much more it fades in
+        configure(cfg, 96);
+
+        std::vector<uint8_t> grid((size_t) 96 * 96 * 4);
+        uint32_t side = 0, micros = 0;
+        double share = 0.0, median = 9.0;
+
+        for (int i = 0; i < 240 && !(share > 0.7 && median < 0.1); ++i)
+        {
+            Sleep(250);
+
+            if (depthRead(grid.data(), (uint32_t) grid.size(), &side, &micros) != 1 || side != 96)
+                continue;
+
+            std::vector<double> off;
+            int cells = 0;
+
+            for (uint32_t y = 0; y < side; ++y)
+            {
+                for (uint32_t x = 0; x < side; ++x)
+                {
+                    const double tx = (2.0 * (x + 0.5) / side - 1.0) * 1.2, ty = (2.0 * (y + 0.5) / side - 1.0) * 1.2;
+
+                    if (fabs(tx) > 0.6 || fabs(ty) > 0.6)
+                        continue;
+
+                    cells++;
+                    const uint8_t held = grid[((size_t) y * side + x) * 4 + 2];
+
+                    if (held != 0)
+                        off.push_back(fabs(held / 255.0 * 6.0 - 1.0 / (wall * sqrt(1.0 + tx * tx + ty * ty))));
+                }
+            }
+
+            share = (double) off.size() / cells;
+
+            if (!off.empty())
+            {
+                std::sort(off.begin(), off.end());
+                median = off[off.size() / 2];
+            }
+        }
+
+        CHECK(share > 0.7 && median < 0.1, "the wall is found where it stands (%.0f%% of the lines of sight -- the rest lie above what both lenses see --, off by %.3f per metre at the median)", share * 100.0, median);
+        printf("  (the room's depth takes %.1f ms to work out here)\n", micros / 1000.0);
+
+        // The scene: nothing of the key colour anywhere, at one distance throughout.
+        Image figure(w, h);
+
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                float* p = figure.at(x, y);
+                p[0] = thirds[2][0];
+                p[1] = thirds[2][1];
+                p[2] = thirds[2][2];
+                p[3] = 1.0f;
+            }
+        }
+
+        ID3D11Texture2D* scene = MakeTexture(w, h, DXGI_FORMAT_R16G16B16A16_TYPELESS, kRT);
+        UploadHalf(scene, figure);
+        ID3D11Texture2D* sceneDepth = MakeTexture(w, h, DXGI_FORMAT_R32_FLOAT, kRT);
+        const float closest = 0.1f, farthest = 100.0f;
+        const float info[4] = { closest, farthest, 1.0f, 7.0f };
+
+        const auto alphaAhead = [&](double z, int view, int* greyOut)
+        {
+            std::vector<float> stored((size_t) w * h, (float) ((closest * farthest / z - closest) / (farthest - closest)));
+            g_ctx->UpdateSubresource(sceneDepth, 0, nullptr, stored.data(), w * 4, 0);
+            cfg[73] = (float) view;
+            configure(cfg, 96);
+            g_event(pushMatte(scene, 2, 0, 0, 1, headNow, 0, sceneDepth, info));
+            g_event(pushMatte(scene, 2, 1, 0, 1, headNow, 0, sceneDepth, info));
+            g_ctx->Flush();
+            Drain(true);
+
+            // A few pictures later it has certainly been drawn from this matte.
+            int alpha = -1;
+
+            for (int i = 0; i < 6; ++i)
+            {
+                read(picture.data(), (uint32_t) picture.size(), &pw, &ph);
+                Sleep(700);
+            }
+
+            if (read(picture.data(), (uint32_t) picture.size(), &pw, &ph) == 1)
+            {
+                const uint8_t* got = &picture[((size_t) (ph / 2) * pw + pw / 4) * 4];
+                alpha = got[3];
+                *greyOut = got[0];
+            }
+
+            return alpha;
+        };
+
+        int grey = 0;
+        const int behind = alphaAhead(3.0, 0, &grey);
+        CHECK(behind >= 250, "the wall shows in front of a figure that stands behind it (alpha %d/255)", behind);
+        const int before = alphaAhead(0.5, 0, &grey);
+        CHECK(before >= 0 && before <= 5, "and not in front of one that stands before it (alpha %d/255)", before);
+        alphaAhead(3.0, 4, &grey);
+        CHECK(abs(grey - 74) <= 4, "the scene's depth crosses in the matte as the distance it is (%d/255 for three metres, 74 expected)", grey);
+
+        scene->Release();
+        sceneDepth->Release();
+    }
+
     stop();
     frame->Release();
     Drain(true);
@@ -2682,6 +3248,9 @@ int wmain(int argc, wchar_t** argv)
     TestSharpen();
     TestPassthrough(dll);
     TestOverlay(dll);
+    TestHands(dll);
+    TestFovea(dll);
+    TestFlip(dll);
     Drain(true);
     TestStereoSeam();
     TestWindow();

@@ -47,13 +47,22 @@
 #include "vws_ps_matte.h"
 #include "vws_ps_overlay.h"
 #include "vws_vs_overlay.h"
+#include "vws_depth.h"
+#include "vws_hand.h"
+
+// NVIDIA's own interface to its driver, for variable rate shading (see "foveated shading" below).
+// Its header is not written for /W4.
+#pragma warning(push, 0)
+#include "deps/nvapi/nvapi.h"
+#pragma warning(pop)
 
 #define VWS_EXPORT extern "C" __declspec(dllexport)
 
 namespace
 {
-const uint32_t kAbi = 12;
+const uint32_t kAbi = 17;
 const int kEventMagic = 0x57530000; // 'WS'
+const int kEventFovea = 0x57460000; // 'WF': | 1 foveated shading on for what is drawn next, | 2 off
 const int kEventMask = 0x7FFF0000;
 const int kSlots = 64;
 const uint32_t kSets = 16;
@@ -371,7 +380,7 @@ DXGI_FORMAT ViewFormat(DXGI_FORMAT f, bool* hardwareCodec)
 typedef int(__stdcall* CamFrameFn)(uint64_t handle, int frameType, void* buffer, uint32_t bufferSize, void* header,
                                    uint32_t headerSize);
 
-const uint32_t kCamFloats = 80;
+const uint32_t kCamFloats = 96;
 
 enum CamField : uint32_t
 {
@@ -394,6 +403,9 @@ enum CamField : uint32_t
     kCfgStereoRule = 77, // overlay: 0 SteamVR shapes a side-by-side overlay by one eye's picture, 1 by the whole texture
     kCfgSpace = 78,     // the tracking universe the camera's poses are in
     kCfgPoseIsCamera = 79, // 1: the pose a camera frame comes with is the first camera's, not the head's
+    kCfgDepth = 80,     // overlay: 1 the room's depth is worked out and set against the scene's
+    kCfgDepthMargin = 81, // ...how much nearer the room must be to show in front, in 1/metres
+    kCfgDepthSoft = 82, // ...over how much more it fades in
 };
 
 struct PassParams
@@ -448,10 +460,12 @@ const uint32_t kMatteTexH = kMatteH + 8, kMattePoseRow = kMatteH + 4; // below t
 ID3D11Texture2D* g_matteTex = nullptr;
 ID3D11RenderTargetView* g_matteRtv = nullptr;
 void* g_matteRefused = nullptr;
+void* g_depthRefused = nullptr;
 
 // the overlay's own thread
 volatile LONG g_ovState = 0, g_ovFrames = 0, g_ovError = 0;
 volatile LONG g_ovDebugWant = 0;
+volatile LONG g_ovDepthRoom = -1, g_ovDepthScene = -1; // straight ahead, 1/metres in thousandths; -1 not read
 uint8_t* g_ovDebug = nullptr;
 uint32_t g_ovDebugW = 0, g_ovDebugH = 0;
 
@@ -476,10 +490,14 @@ void ReleaseCamera()
     g_passRefused = nullptr;
 }
 
+void FoveaRelease();
+
 void ReleaseDevice()
 {
     for (Set& s : g_sets)
         s.Release();
+
+    FoveaRelease();
 
     SafeRelease(g_depth);
     SafeRelease(g_blend);
@@ -644,6 +662,305 @@ ID3D11Device* DeviceOf(void* raw)
     tex->GetDevice(&device);
     tex->Release();
     return device;
+}
+
+// ---- foveated shading -----------------------------------------------------------------------------
+//
+// An eye sees detail only where it is looking, and a headset's lens is sharp only near its middle.
+// NVIDIA's cards can be told to run the pixel shader once for a block of two or four pixels instead
+// of once a pixel, tile by tile of the render target ("variable rate shading"): edges and depth
+// stay at full resolution, only the shading inside surfaces gets coarser. So: full rate where each
+// eye looks, coarser in a ring around that, coarsest beyond.
+//
+// The game's camera is told to raise two events of ours around its own geometry -- on before the
+// opaque and the transparent pass, off after each (Foveation.cs). Nothing else is to be shaded
+// coarsely: not the shadow maps drawn before, nor the image effects, DLSS, the menu or the
+// compositor's copy after. Each "on" looks at the render target bound at that moment, makes the
+// map of rates for its size, and sets it; "off" takes it away.
+const uint32_t kFovFloats = 16;
+
+enum FovField : uint32_t
+{
+    kFovOn = 0,       // 1: wanted
+    kFovCentre = 1,   // 4: where each eye looks in its own picture: left u, v, right u, v; v up from the bottom
+    kFovInner = 5,    // full rate within this of it, as a share of the picture's height
+    kFovOuter = 6,    // the coarsest rate beyond this
+    kFovStrong = 7,   // 1: the coarsest rate is as coarse as the target's anti-aliasing allows, else as the ring's
+    kFovShow = 8,     // 1: beyond the outer radius nothing is shaded at all -- to see where the zones are
+    kFovTopDown = 9,  // 1: the target's first row is the top of the picture
+};
+
+SRWLOCK g_fovLock = SRWLOCK_INIT;
+float g_fovCfg[kFovFloats] {};
+void* g_fovAnyTexture = nullptr; // a texture of the game's device: the way to that device
+volatile LONG g_fovState = 0, g_fovW = 0, g_fovH = 0, g_fovSamples = 0, g_fovCoarse = 0, g_fovOns = 0;
+
+// The render thread's.
+struct Fovea
+{
+    ID3D11Device* askedOf = nullptr; // the device NVAPI was last asked about
+    bool able = false;
+    bool set = false;                // the context has our rates on it
+    ID3D11Texture2D* map = nullptr;
+    ID3D11NvShadingRateResourceView* view = nullptr;
+    uint32_t w = 0, h = 0, samples = 0, tilesW = 0, tilesH = 0;
+    float made[kFovFloats] {};
+    uint8_t* tiles = nullptr;
+} g_fov;
+
+void FoveaRelease()
+{
+    SafeRelease(g_fov.view);
+    SafeRelease(g_fov.map);
+    delete[] g_fov.tiles;
+    g_fov.tiles = nullptr;
+    g_fov.w = g_fov.h = 0;
+    g_fov.askedOf = nullptr;
+    g_fov.able = false;
+    g_fov.set = false;
+}
+
+void FoveaOff()
+{
+    if (!g_fov.set || g_ctx == nullptr)
+        return;
+
+    // No viewports named: off for all of them.
+    NV_D3D11_VIEWPORTS_SHADING_RATE_DESC none {};
+    none.version = NV_D3D11_VIEWPORTS_SHADING_RATE_DESC_VER;
+    none.numViewports = 0;
+    NvAPI_D3D11_RSSetViewportsPixelShadingRates(g_ctx, &none);
+    NvAPI_D3D11_RSSetShadingRateResourceView(g_ctx, nullptr);
+    g_fov.set = false;
+}
+
+void FoveaOn()
+{
+    float cfg[kFovFloats];
+    AcquireSRWLockShared(&g_fovLock);
+    memcpy(cfg, g_fovCfg, sizeof(cfg));
+    void* any = g_fovAnyTexture;
+    ReleaseSRWLockShared(&g_fovLock);
+
+    if (cfg[kFovOn] < 0.5f)
+    {
+        FoveaOff();
+        InterlockedExchange(&g_fovState, 0);
+        return;
+    }
+
+    ID3D11Device* device = DeviceOf(any);
+
+    if (device == nullptr)
+        return;
+
+    const HRESULT ready = EnsureDevice(device);
+    device->Release();
+
+    if (FAILED(ready))
+        return;
+
+    // Can this card do it? Asked once a device.
+    if (g_fov.askedOf != g_device)
+    {
+        g_fov.askedOf = g_device;
+        g_fov.able = false;
+        static bool started = false, usable = false;
+
+        if (!started)
+        {
+            started = true;
+            usable = NvAPI_Initialize() == NVAPI_OK;
+        }
+
+        NV_D3D1x_GRAPHICS_CAPS caps {};
+
+        if (usable && NvAPI_D3D1x_GetGraphicsCapabilities(g_device, NV_D3D1x_GRAPHICS_CAPS_VER, &caps) == NVAPI_OK)
+            g_fov.able = caps.bVariablePixelRateShadingSupported != 0;
+
+        Log("foveated shading: %s", g_fov.able ? "this card has variable rate shading" :
+                                                 (usable ? "this card has no variable rate shading" : "no NVIDIA driver to ask (NVAPI)"));
+    }
+
+    if (!g_fov.able)
+    {
+        InterlockedExchange(&g_fovState, 2);
+        return;
+    }
+
+    // What is being drawn into.
+    ID3D11RenderTargetView* rtv = nullptr;
+    g_ctx->OMGetRenderTargets(1, &rtv, nullptr);
+
+    if (rtv == nullptr)
+        return;
+
+    ID3D11Resource* resource = nullptr;
+    ID3D11Texture2D* target = nullptr;
+    rtv->GetResource(&resource);
+    rtv->Release();
+
+    if (resource != nullptr)
+    {
+        resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**) &target);
+        resource->Release();
+    }
+
+    if (target == nullptr)
+        return;
+
+    D3D11_TEXTURE2D_DESC td {};
+    target->GetDesc(&td);
+    target->Release();
+
+    // (a shadow map, a probe: not the picture)
+    if (td.Width < 256 || td.Height < 256)
+        return;
+
+    const uint32_t tw = (td.Width + NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH - 1) / NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH;
+    const uint32_t th = (td.Height + NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT - 1) / NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT;
+    bool fresh = false;
+
+    if (g_fov.map == nullptr || g_fov.w != td.Width || g_fov.h != td.Height)
+    {
+        SafeRelease(g_fov.view);
+        SafeRelease(g_fov.map);
+        delete[] g_fov.tiles;
+        g_fov.tiles = new uint8_t[(size_t) tw * th];
+        g_fov.w = td.Width;
+        g_fov.h = td.Height;
+        g_fov.tilesW = tw;
+        g_fov.tilesH = th;
+
+        D3D11_TEXTURE2D_DESC md {};
+        md.Width = tw;
+        md.Height = th;
+        md.MipLevels = 1;
+        md.ArraySize = 1;
+        md.Format = DXGI_FORMAT_R8_UINT;
+        md.SampleDesc.Count = 1;
+        md.Usage = D3D11_USAGE_DEFAULT;
+        md.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        HRESULT hr = g_device->CreateTexture2D(&md, nullptr, &g_fov.map);
+
+        NV_D3D11_SHADING_RATE_RESOURCE_VIEW_DESC vd {};
+        vd.version = NV_D3D11_SHADING_RATE_RESOURCE_VIEW_DESC_VER;
+        vd.Format = DXGI_FORMAT_R8_UINT;
+        vd.ViewDimension = NV_SRRV_DIMENSION_TEXTURE2D;
+        vd.Texture2D.MipSlice = 0;
+
+        if (FAILED(hr) || NvAPI_D3D11_CreateShadingRateResourceView(g_device, g_fov.map, &vd, &g_fov.view) != NVAPI_OK)
+        {
+            Log("foveated shading: no rate map for a %ux%u target (hr=0x%08X)", td.Width, td.Height, (unsigned) hr);
+            SafeRelease(g_fov.view);
+            SafeRelease(g_fov.map);
+            g_fov.w = g_fov.h = 0;
+            InterlockedExchange(&g_fovState, 3);
+            return;
+        }
+
+        fresh = true;
+    }
+
+    g_fov.samples = td.SampleDesc.Count;
+
+    if (fresh || memcmp(cfg, g_fov.made, sizeof(cfg)) != 0)
+    {
+        memcpy(g_fov.made, cfg, sizeof(cfg));
+
+        // Two eyes side by side in one target, or one eye (or the monitor) in it.
+        const bool pair = td.Width > td.Height + td.Height / 2;
+        const float eyeW = pair ? td.Width * 0.5f : (float) td.Width, height = (float) td.Height;
+        const float inner = cfg[kFovInner] * height, outer = cfg[kFovOuter] * height;
+        const uint8_t last = cfg[kFovShow] > 0.5f ? 3 : 2;
+        uint32_t coarse = 0;
+
+        for (uint32_t y = 0; y < th; ++y)
+        {
+            const float py = (float) y * NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT + NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT * 0.5f;
+
+            for (uint32_t x = 0; x < tw; ++x)
+            {
+                const float px = (float) x * NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH + NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH * 0.5f;
+                const int eye = pair && px >= eyeW ? 1 : 0;
+                const float u = cfg[kFovCentre + eye * 2], v = cfg[kFovCentre + eye * 2 + 1];
+                const float dx = px - (eye * eyeW + u * eyeW), dy = py - (cfg[kFovTopDown] > 0.5f ? 1.0f - v : v) * height;
+                const float away = sqrtf(dx * dx + dy * dy);
+                const uint8_t rate = away < inner ? 0 : (away < outer ? 1 : last);
+                g_fov.tiles[(size_t) y * tw + x] = rate;
+                coarse += rate != 0 ? 1 : 0;
+            }
+        }
+
+        g_ctx->UpdateSubresource(g_fov.map, 0, nullptr, g_fov.tiles, tw, 0);
+        InterlockedExchange(&g_fovCoarse, (LONG) (coarse * 100 / (tw * th)));
+    }
+
+    // What each number in the map means. A coarse pixel may not hold more than sixteen samples,
+    // so anti-aliasing limits how coarse it can be: 4x4 without, 2x2 at four samples a pixel.
+    const uint32_t samples = td.SampleDesc.Count;
+    const bool strong = cfg[kFovStrong] > 0.5f;
+    NV_PIXEL_SHADING_RATE ring, beyond;
+
+    if (samples >= 8)
+    {
+        ring = beyond = NV_PIXEL_X1_PER_2X1_RASTER_PIXELS;
+    }
+    else if (samples >= 4)
+    {
+        ring = NV_PIXEL_X1_PER_2X1_RASTER_PIXELS;
+        beyond = strong ? NV_PIXEL_X1_PER_2X2_RASTER_PIXELS : ring;
+    }
+    else if (samples >= 2)
+    {
+        ring = NV_PIXEL_X1_PER_2X2_RASTER_PIXELS;
+        beyond = strong ? NV_PIXEL_X1_PER_4X2_RASTER_PIXELS : ring;
+    }
+    else
+    {
+        ring = NV_PIXEL_X1_PER_2X2_RASTER_PIXELS;
+        beyond = strong ? NV_PIXEL_X1_PER_4X4_RASTER_PIXELS : ring;
+    }
+
+    NV_D3D11_VIEWPORT_SHADING_RATE_DESC one {};
+    one.enableVariablePixelShadingRate = true;
+
+    for (NV_PIXEL_SHADING_RATE& r : one.shadingRateTable)
+        r = NV_PIXEL_X1_PER_RASTER_PIXEL;
+
+    one.shadingRateTable[1] = ring;
+    one.shadingRateTable[2] = beyond;
+    one.shadingRateTable[3] = NV_PIXEL_X0_CULL_RASTER_PIXELS;
+
+    // The same for every viewport the game has set (one, as a rule).
+    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    g_ctx->RSGetViewports(&count, viewports);
+    count = count < 1 ? 1 : (count > NV_MAX_NUM_VIEWPORTS ? NV_MAX_NUM_VIEWPORTS : count);
+    NV_D3D11_VIEWPORT_SHADING_RATE_DESC all[NV_MAX_NUM_VIEWPORTS];
+
+    for (UINT i = 0; i < count; ++i)
+        all[i] = one;
+
+    NV_D3D11_VIEWPORTS_SHADING_RATE_DESC desc {};
+    desc.version = NV_D3D11_VIEWPORTS_SHADING_RATE_DESC_VER;
+    desc.numViewports = count;
+    desc.pViewports = all;
+
+    if (NvAPI_D3D11_RSSetViewportsPixelShadingRates(g_ctx, &desc) != NVAPI_OK || NvAPI_D3D11_RSSetShadingRateResourceView(g_ctx, g_fov.view) != NVAPI_OK)
+    {
+        g_fov.set = true;
+        FoveaOff();
+        InterlockedExchange(&g_fovState, 3);
+        return;
+    }
+
+    g_fov.set = true;
+    InterlockedExchange(&g_fovState, 1);
+    InterlockedExchange(&g_fovW, (LONG) td.Width);
+    InterlockedExchange(&g_fovH, (LONG) td.Height);
+    InterlockedExchange(&g_fovSamples, (LONG) samples);
+    InterlockedIncrement(&g_fovOns);
 }
 
 // Takes a reference on the texture behind `raw` and builds the views this pass needs of it.
@@ -1182,8 +1499,260 @@ struct OverlayParams
     float camRows[2][3][4]; // the head's space -> each camera's
     float rot[3][4];  // the head at the camera frame's moment, in the room (rotation); [0][3] = it is known
     float out[4];     // texture width, height, 1/width, 1/height
-    float matte[4];   // how much of the matte texture's height is matte; the row its pose is in
+    float matte[4];   // how much of the matte texture's height is matte; the row its pose is in; the depth grid's reach (tangent)
+    float depth[4];   // used, margin, softness
+    float grid[4];    // cells per side, -, -, the most 1/distance
 };
+
+// The room's depth: a grid of lines of sight from the middle of the head (see vws_depth.h).
+const uint32_t kGridN = vwsdepth::kCells;
+const float kGridTan = vwsdepth::kReach, kGridMost = vwsdepth::kMost;
+
+// It is worked out on a thread of its own: the camera's thread hands it a frame whenever it is
+// free, and takes whatever it last finished. It runs a frame or two behind the picture, which the
+// head's turning in that time does not make matter at the grid's scale.
+SRWLOCK g_depthLock = SRWLOCK_INIT;
+HANDLE g_depthThread = nullptr, g_depthWake = nullptr;
+volatile LONG g_depthQuit = 0, g_depthBusy = 0, g_depthSerial = 0, g_depthMicros = 0;
+uint8_t* g_depthIn = nullptr;
+uint32_t g_depthW = 0, g_depthH = 0;
+float g_depthCfg[vwsdepth::kCalibration] {};
+uint8_t g_depthOut[vwsdepth::kCells * vwsdepth::kCells * 4];
+
+DWORD WINAPI DepthThread(void*)
+{
+    vwsdepth::Solver* solver = new vwsdepth::Solver();
+    uint8_t* out = new uint8_t[sizeof(g_depthOut)];
+
+    while (WaitForSingleObject(g_depthWake, INFINITE) == WAIT_OBJECT_0 && g_depthQuit == 0)
+    {
+        // The frame is the camera thread's until it has set the flag, and this thread's until it
+        // clears it.
+        const double start = Seconds();
+        solver->Solve(g_depthIn, g_depthW, g_depthH, g_depthCfg, out);
+        InterlockedExchange(&g_depthMicros, (LONG) ((Seconds() - start) * 1e6));
+
+        AcquireSRWLockExclusive(&g_depthLock);
+        memcpy(g_depthOut, out, sizeof(g_depthOut));
+        ReleaseSRWLockExclusive(&g_depthLock);
+        InterlockedIncrement(&g_depthSerial);
+        InterlockedExchange(&g_depthBusy, 0);
+    }
+
+    delete[] out;
+    delete solver;
+    return 0;
+}
+
+// Camera thread: hand the depth thread this frame if it is free.
+void DepthFeed(const uint8_t* grey, uint32_t w, uint32_t h, const float* cfg)
+{
+    if (g_depthThread == nullptr)
+    {
+        InterlockedExchange(&g_depthQuit, 0);
+        InterlockedExchange(&g_depthBusy, 0);
+        g_depthWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        g_depthThread = g_depthWake != nullptr ? CreateThread(nullptr, 0, DepthThread, nullptr, 0, nullptr) : nullptr;
+
+        if (g_depthThread == nullptr)
+            return;
+
+        // Below the game's own threads: it must never be what a frame waits for.
+        SetThreadPriority(g_depthThread, THREAD_PRIORITY_BELOW_NORMAL);
+    }
+
+    if (InterlockedCompareExchange(&g_depthBusy, 1, 0) != 0)
+        return;
+
+    if (g_depthIn == nullptr || g_depthW != w || g_depthH != h)
+    {
+        delete[] g_depthIn;
+        g_depthIn = new uint8_t[(size_t) w * h];
+        g_depthW = w;
+        g_depthH = h;
+    }
+
+    memcpy(g_depthIn, grey, (size_t) w * h);
+    memcpy(g_depthCfg, cfg, sizeof(g_depthCfg));
+    SetEvent(g_depthWake);
+}
+
+void DepthStop()
+{
+    if (g_depthThread == nullptr)
+        return;
+
+    InterlockedExchange(&g_depthQuit, 1);
+    SetEvent(g_depthWake);
+
+    if (WaitForSingleObject(g_depthThread, 3000) == WAIT_OBJECT_0)
+    {
+        delete[] g_depthIn;
+        g_depthIn = nullptr;
+        g_depthW = g_depthH = 0;
+    }
+
+    CloseHandle(g_depthThread);
+    CloseHandle(g_depthWake);
+    g_depthThread = g_depthWake = nullptr;
+}
+
+// ---- the wearer's hands (see vws_hand.h) --------------------------------------------------------
+//
+// Like the room's depth, worked out on a thread of its own from the frames the camera's thread
+// hands it whenever it is free; the game reads whatever it last finished.
+vwshand::Networks g_handNets;
+SRWLOCK g_handLock = SRWLOCK_INIT;
+HANDLE g_handThread = nullptr, g_handWake = nullptr;
+volatile LONG g_handQuit = 0, g_handBusy = 0, g_handSerial = 0, g_handMicros = 0, g_handOn = 0, g_handEvery = 2;
+uint8_t* g_handIn = nullptr;
+uint32_t g_handW = 0, g_handH = 0, g_handSince = 0;
+float g_handCfg[kCamFloats] {}, g_handHead[12] {}, g_handSet[vwshand::kSettings] {};
+bool g_handHeadKnown = false, g_handSetGiven = false, g_handOutInRoom = false;
+double g_handAt = 0.0, g_handOutAt = 0.0;
+vwshand::HandOut g_handOut[vwshand::kHands] {};
+
+DWORD WINAPI HandThread(void*)
+{
+    vwshand::Tracker* tracker = new vwshand::Tracker();
+    tracker->nets = &g_handNets;
+    vwshand::HandOut out[vwshand::kHands];
+    double said = Seconds(), spent = 0.0;
+
+    while (WaitForSingleObject(g_handWake, INFINITE) == WAIT_OBJECT_0 && g_handQuit == 0)
+    {
+        // The frame is the camera thread's until it has set the flag, and this thread's until it
+        // clears it.
+        AcquireSRWLockShared(&g_handLock);
+
+        if (g_handSetGiven)
+            memcpy(tracker->set, g_handSet, sizeof(g_handSet));
+
+        ReleaseSRWLockShared(&g_handLock);
+
+        const double start = Seconds();
+        tracker->Track(g_handIn, g_handW, g_handH, g_handCfg, g_handHeadKnown ? g_handHead : nullptr, g_handAt, out);
+        const double took = Seconds() - start;
+        spent += took;
+        InterlockedExchange(&g_handMicros, (LONG) (took * 1e6));
+
+        // What it did, said every five seconds: there is no looking into a headset from outside.
+        if (start + took - said >= 5.0)
+        {
+            const vwshand::Tracker::Tally& t = tracker->tally;
+            Log("hand thread: %u frames in %.0f s (%.1f ms each, frame mean %.0f/255), a hand followed in %u (by one lens alone %u); looked for palms %u times: %u in the left lens, %u in the right, %u believed by the points network, %u hands begun, %u lost and found again, %u given up, %u dropped as doubles; %u sudden turns not believed, %u finger joints put back; now %s%s",
+                t.frames, start + took - said, t.frames != 0 ? spent / t.frames * 1000.0 : 0.0, tracker->frameMean * 255.0f, t.followed, t.oneLens, t.looks,
+                t.palms[0], t.palms[1], t.believed, t.begun, t.found, t.lost, t.same, t.doubted, t.folded,
+                out[0].live > 0.5f ? (out[0].left > 0.5f ? "left " : "right ") : "", out[1].live > 0.5f ? (out[1].left > 0.5f ? "left" : "right") : (out[0].live > 0.5f ? "" : "none"));
+            tracker->tally = {};
+            said = start + took;
+            spent = 0.0;
+        }
+
+        AcquireSRWLockExclusive(&g_handLock);
+        memcpy(g_handOut, out, sizeof(g_handOut));
+        g_handOutAt = g_handAt;
+        g_handOutInRoom = g_handHeadKnown;
+        ReleaseSRWLockExclusive(&g_handLock);
+        InterlockedIncrement(&g_handSerial);
+        InterlockedExchange(&g_handBusy, 0);
+    }
+
+    delete tracker;
+    return 0;
+}
+
+// Camera thread: hand the hand thread this frame if it is wanted and the thread is free. `header`
+// is the frame's own (the pose it was taken at).
+void HandFeed(const uint8_t* grey, uint32_t w, uint32_t h, const uint8_t* header)
+{
+    if (g_handOn == 0 || g_handNets.hand == nullptr)
+        return;
+
+    // Not every frame: the game needs the processor more than a hand needs sixty looks a second.
+    if (++g_handSince < (uint32_t) (g_handEvery < 1 ? 1 : g_handEvery))
+        return;
+
+    float cfg[kCamFloats];
+    AcquireSRWLockExclusive(&g_camLock);
+    const bool configured = g_camConfigured;
+    memcpy(cfg, g_camConfig, sizeof(cfg));
+    ReleaseSRWLockExclusive(&g_camLock);
+
+    if (!configured)
+        return;
+
+    if (g_handThread == nullptr)
+    {
+        InterlockedExchange(&g_handQuit, 0);
+        InterlockedExchange(&g_handBusy, 0);
+        g_handWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        g_handThread = g_handWake != nullptr ? CreateThread(nullptr, 0, HandThread, nullptr, 0, nullptr) : nullptr;
+
+        if (g_handThread == nullptr)
+            return;
+
+        // Below the game's own threads: it must never be what a frame waits for.
+        SetThreadPriority(g_handThread, THREAD_PRIORITY_BELOW_NORMAL);
+    }
+
+    if (InterlockedCompareExchange(&g_handBusy, 1, 0) != 0)
+        return;
+
+    g_handSince = 0;
+
+    if (g_handIn == nullptr || g_handW != w || g_handH != h)
+    {
+        delete[] g_handIn;
+        g_handIn = new uint8_t[(size_t) w * h];
+        g_handW = w;
+        g_handH = h;
+    }
+
+    memcpy(g_handIn, grey, (size_t) w * h);
+    memcpy(g_handCfg, cfg, sizeof(g_handCfg));
+
+    // A frame without a pose: the head is taken to be where it last was.
+    if (header[96] != 0)
+    {
+        float framePose[12];
+        memcpy(framePose, header + 20, sizeof(framePose));
+        const Rigid head = HeadAt(framePose, cfg);
+
+        for (int i = 0; i < 12; ++i)
+            g_handHead[i] = (float) head.m[i];
+
+        g_handHeadKnown = true;
+    }
+
+    g_handAt = Seconds();
+    SetEvent(g_handWake);
+}
+
+void HandStop()
+{
+    if (g_handThread == nullptr)
+        return;
+
+    InterlockedExchange(&g_handQuit, 1);
+    SetEvent(g_handWake);
+
+    if (WaitForSingleObject(g_handThread, 3000) == WAIT_OBJECT_0)
+    {
+        delete[] g_handIn;
+        g_handIn = nullptr;
+        g_handW = g_handH = 0;
+    }
+
+    CloseHandle(g_handThread);
+    CloseHandle(g_handWake);
+    g_handThread = g_handWake = nullptr;
+
+    AcquireSRWLockExclusive(&g_handLock);
+    memset(g_handOut, 0, sizeof(g_handOut));
+    ReleaseSRWLockExclusive(&g_handLock);
+    InterlockedIncrement(&g_handSerial);
+}
 
 struct VrTexture
 {
@@ -1215,6 +1784,13 @@ struct OverlayRig
     ID3D11RenderTargetView* outRtv[2] = {};
     uint32_t outW = 0, outH = 0;
     ID3D11Query* done = nullptr;
+    // the room's depth, as the depth thread last had it
+    ID3D11Texture2D* grid = nullptr;
+    ID3D11ShaderResourceView* gridSrv = nullptr;
+    ID3D11Texture2D* probe = nullptr;
+    LONG gridSerial = 0;
+    bool depthFailed = false;
+    uint32_t depthTicks = 0;
     void** vr = nullptr;
     bool vrAsked = false;
     uint64_t overlay[2] = {};
@@ -1227,6 +1803,14 @@ struct OverlayRig
 template <typename F> F VrFn(void** table, int slot)
 {
     return (F) table[slot];
+}
+
+void DepthRelease(OverlayRig& r)
+{
+    SafeRelease(r.probe);
+    SafeRelease(r.gridSrv);
+    SafeRelease(r.grid);
+    r.gridSerial = 0;
 }
 
 void OverlayHide(OverlayRig& r)
@@ -1258,6 +1842,7 @@ void OverlayClose(OverlayRig& r)
     }
 
     SafeRelease(r.done);
+    DepthRelease(r);
     SafeRelease(r.matteSrv);
     SafeRelease(r.matte);
     SafeRelease(r.camSrv);
@@ -1287,6 +1872,7 @@ void OverlayLost(OverlayRig& r, HRESULT hr, const char* where)
     }
 
     SafeRelease(r.done);
+    DepthRelease(r);
     SafeRelease(r.matteSrv);
     SafeRelease(r.matte);
     SafeRelease(r.camSrv);
@@ -1446,6 +2032,48 @@ bool OverlayVr(OverlayRig& r)
 }
 
 // One camera frame onto the overlay. `header` is SteamVR's, with the head's pose at the frame's moment.
+// The texture the room's depth is handed to the card in, made when first wanted. False, and for
+// good, when the card will not have it: the overlay then goes on without the room's depth.
+bool DepthReady(OverlayRig& r)
+{
+    if (r.grid != nullptr)
+        return true;
+
+    D3D11_TEXTURE2D_DESC td {};
+    td.Width = td.Height = kGridN;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    const uint8_t* nothing = new uint8_t[kGridN * kGridN * 4]();
+    const D3D11_SUBRESOURCE_DATA first = { nothing, kGridN * 4, 0 };
+    HRESULT hr = r.dev->CreateTexture2D(&td, &first, &r.grid);
+    delete[] nothing;
+
+    if (SUCCEEDED(hr))
+        hr = r.dev->CreateShaderResourceView(r.grid, nullptr, &r.gridSrv);
+
+    if (SUCCEEDED(hr))
+    {
+        td.Width = td.Height = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.BindFlags = 0;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        hr = r.dev->CreateTexture2D(&td, nullptr, &r.probe);
+    }
+
+    if (SUCCEEDED(hr))
+        return true;
+
+    Log("passthrough overlay: no texture for the room's depth (hr=0x%08X) -- going on without it", (unsigned) hr);
+    DepthRelease(r);
+    r.depthFailed = true;
+    return false;
+}
+
 void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, double* waited)
 {
     float cfg[kCamFloats];
@@ -1498,9 +2126,8 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
         td.ArraySize = 1;
         td.Format = DXGI_FORMAT_R8_UNORM;
         td.SampleDesc.Count = 1;
-        td.Usage = D3D11_USAGE_DYNAMIC;
+        td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
         hr = r.dev->CreateTexture2D(&td, nullptr, &r.cam);
 
         if (SUCCEEDED(hr))
@@ -1570,18 +2197,27 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
     }
 
     D3D11_MAPPED_SUBRESOURCE mapped {};
-    hr = r.ctx->Map(r.cam, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    r.ctx->UpdateSubresource(r.cam, 0, nullptr, grey, w, 0);
 
-    if (FAILED(hr))
+    // The room's depth: this frame to the depth thread if it is free, and whatever it has
+    // finished since into the texture the picture is drawn with.
+    const bool depth = cfg[kCfgDepth] > 0.5f && !r.depthFailed && DepthReady(r);
+
+    if (depth)
     {
-        OverlayLost(r, hr, "taking the camera's frame");
-        return;
+        // Every other frame: thirty times a second is plenty for a hand, and it leaves the
+        // processor to the game.
+        if ((r.depthTicks & 1) == 0)
+            DepthFeed(grey, w, h, cfg);
+
+        if (r.gridSerial != g_depthSerial)
+        {
+            r.gridSerial = g_depthSerial;
+            AcquireSRWLockExclusive(&g_depthLock);
+            r.ctx->UpdateSubresource(r.grid, 0, nullptr, g_depthOut, kGridN * 4, 0);
+            ReleaseSRWLockExclusive(&g_depthLock);
+        }
     }
-
-    for (uint32_t y = 0; y < h; ++y)
-        memcpy((uint8_t*) mapped.pData + (size_t) y * mapped.RowPitch, grey + (size_t) y * w, w);
-
-    r.ctx->Unmap(r.cam, 0);
 
     float framePose[12], headThen[12];
     memcpy(framePose, header + 20, sizeof(framePose));
@@ -1629,6 +2265,12 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
     op.rot[0][3] = headThenValid ? 1.0f : 0.0f;
     op.matte[0] = (float) kMatteH / (float) kMatteTexH;
     op.matte[1] = (float) kMattePoseRow;
+    op.matte[2] = kGridTan;
+    op.depth[0] = depth ? 1.0f : 0.0f;
+    op.depth[1] = cfg[kCfgDepthMargin];
+    op.depth[2] = cfg[kCfgDepthSoft];
+    op.grid[0] = (float) kGridN;
+    op.grid[3] = kGridMost;
 
     SetSize(op.out, outW, outH);
 
@@ -1646,23 +2288,25 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
     ID3D11DeviceContext* c = r.ctx;
     ID3D11ShaderResourceView* none[3] {};
     c->PSSetShaderResources(0, 3, none);
-    c->OMSetRenderTargets(1, &r.outRtv[next], nullptr);
-
-    D3D11_VIEWPORT vp {};
-    vp.Width = (float) outW;
-    vp.Height = (float) outH;
-    vp.MaxDepth = 1.0f;
-    c->RSSetViewports(1, &vp);
     c->RSSetState(r.raster);
     c->IASetInputLayout(nullptr);
     c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    c->VSSetShader(r.vs, nullptr, 0);
-    c->PSSetShader(r.ps, nullptr, 0);
     c->PSSetConstantBuffers(1, 1, &r.cb);
     c->VSSetConstantBuffers(1, 1, &r.cb);
     c->PSSetSamplers(0, 1, &r.sampler);
 
-    ID3D11ShaderResourceView* inputs[3] = { nullptr, r.camSrv, r.matteSrv };
+    D3D11_VIEWPORT vp {};
+    vp.MaxDepth = 1.0f;
+
+    r.depthTicks++;
+    c->OMSetRenderTargets(1, &r.outRtv[next], nullptr);
+    vp.Width = (float) outW;
+    vp.Height = (float) outH;
+    c->RSSetViewports(1, &vp);
+    c->VSSetShader(r.vs, nullptr, 0);
+    c->PSSetShader(r.ps, nullptr, 0);
+
+    ID3D11ShaderResourceView* inputs[3] = { depth ? r.gridSrv : nullptr, r.camSrv, r.matteSrv };
     c->PSSetShaderResources(0, 3, inputs);
     c->VSSetShaderResources(0, 3, inputs);
     c->Draw(3, 0);
@@ -1681,6 +2325,37 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
     }
 
     InterlockedIncrement(&g_ovFrames);
+
+    // Now and then, how near the room and the scene are taken to be straight ahead: for the
+    // status line, which is the only way to see from outside whether either is being read at all.
+    if (depth && r.probe != nullptr && r.depthTicks % 45 == 0)
+    {
+        AcquireSRWLockExclusive(&g_depthLock);
+        const uint8_t room = g_depthOut[((size_t) (kGridN / 2) * kGridN + kGridN / 2) * 4 + 2];
+        ReleaseSRWLockExclusive(&g_depthLock);
+        InterlockedExchange(&g_ovDepthRoom, g_depthSerial != 0 ? (LONG) lroundf(room / 255.0f * kGridMost * 1000.0f) : -1);
+
+        LONG scene = -1;
+
+        if (r.matte != nullptr)
+        {
+            const D3D11_BOX box = { kMatteW / 4, kMatteH / 2, 0, kMatteW / 4 + 1, kMatteH / 2 + 1, 1 };
+            c->CopySubresourceRegion(r.probe, 0, 0, 0, 0, r.matte, 0, &box);
+
+            if (SUCCEEDED(c->Map(r.probe, 0, D3D11_MAP_READ, 0, &mapped)))
+            {
+                scene = (LONG) lroundf(((const uint8_t*) mapped.pData)[1] / 255.0f * 4.0f * 1000.0f);
+                c->Unmap(r.probe, 0);
+            }
+        }
+
+        InterlockedExchange(&g_ovDepthScene, scene);
+    }
+    else if (!depth)
+    {
+        InterlockedExchange(&g_ovDepthRoom, -1);
+        InterlockedExchange(&g_ovDepthScene, -1);
+    }
 
     // For the offline checks: the picture as bytes.
     if (InterlockedCompareExchange(&g_ovDebugWant, 0, 1) == 1)
@@ -1917,6 +2592,8 @@ DWORD WINAPI CamThread(void* param)
                     memcpy(grey, rgba, pixels);
                 }
 
+                HandFeed(grey, g_camW, g_camH, header);
+
                 double waited = 0.0;
                 const double tickStart = Seconds();
                 OverlayTick(rig, grey, header, &waited);
@@ -1963,6 +2640,8 @@ DWORD WINAPI CamThread(void* param)
     }
 
     OverlayClose(rig);
+    DepthStop();
+    HandStop();
     delete[] rgba;
     delete[] grey;
     return 0;
@@ -2165,7 +2844,9 @@ void Passthrough(const VwsCmd& cmd)
     pp.cam[0] = (float) w;
     pp.cam[1] = (float) h;
     pp.cam[2] = (float) (w / 2);
-    pp.cam[3] = cfg[kCfgView] + (cfg[kCfgMode] > 0.5f ? 8.0f : 0.0f); // +8: say in the frame's alpha where the room is
+    // +8: say in the frame's alpha where the room is; +16: with a half for the game's own picture,
+    // so that what is drawn over the frame afterwards can be told from it (see PSMatte)
+    pp.cam[3] = cfg[kCfgView] + (cfg[kCfgMode] > 0.5f ? 8.0f : 0.0f) + (cfg[kCfgMode] > 0.5f && cfg[kCfgDepth] > 0.5f ? 16.0f : 0.0f);
     memcpy(pp.tangents, cfg + kCfgTan + eye * 4, sizeof(pp.tangents));
 
     for (int j = 0; j < 4; ++j)
@@ -2328,6 +3009,32 @@ void Matte(const VwsCmd& cmd)
     pp.key[3] = cfg[kCfgTolerance];
     pp.tune[0] = cfg[kCfgSoftness];
     pp.cam[3] = cmd.strength > 0.5f ? 1.0f : 0.0f; // 1: the frame's alpha already says where the room is
+    pp.centre[0] = cmd.strength > 0.5f && cfg[kCfgDepth] > 0.5f ? 1.0f : 0.0f; // ...with a half for the game's own picture
+
+    // The scene's depth, where the game handed its buffer over with the frame (see PSMatte).
+    Surface depth;
+    const uint32_t depthFlags = (uint32_t) cmd.prev[7];
+
+    if (cmd.proxy != nullptr && cmd.proxy != g_depthRefused && cmd.prev[4] > 0.0f && cmd.prev[5] > cmd.prev[4] && cmd.prev[6] > 0.0f)
+    {
+        HRESULT dhr = S_OK;
+
+        if (OpenSurface(depth, cmd.proxy, false, true, false, "the scene's depth for the matte", &dhr) == ErrNone)
+        {
+            pp.tune[1] = cmd.prev[4]; // the near plane
+            pp.tune[2] = cmd.prev[5]; // the far one
+            pp.tune[3] = cmd.prev[6]; // the scene's units to a metre
+            pp.k[0] = 1.0f;
+            pp.k[1] = (depthFlags & 1) != 0 ? 1.0f : 0.0f; // its first row is the top
+            pp.k[2] = (depthFlags & 2) != 0 ? 2.0f : 1.0f; // it holds both eyes
+            pp.k[3] = (depthFlags & 4) != 0 ? 1.0f : 0.0f; // 1 at the near plane
+            memcpy(pp.tangents, cfg + kCfgTan + eye * 4, sizeof(pp.tangents));
+        }
+        else
+        {
+            g_depthRefused = cmd.proxy;
+        }
+    }
     pp.misc[0] = (float) eye;
     pp.misc[1] = cmd.eyes == 2 ? 2.0f : 1.0f;
     pp.misc[2] = source.Encoded() ? 1.0f : 0.0f;
@@ -2338,6 +3045,7 @@ void Matte(const VwsCmd& cmd)
 
     if (FAILED(hr))
     {
+        depth.Release();
         source.Release();
         return;
     }
@@ -2375,7 +3083,7 @@ void Matte(const VwsCmd& cmd)
     c->PSSetConstantBuffers(1, 1, &g_cbPass);
     c->PSSetSamplers(0, 1, &g_sampler);
 
-    ID3D11ShaderResourceView* inputs[3] = { source.srv, nullptr, nullptr };
+    ID3D11ShaderResourceView* inputs[3] = { source.srv, depth.srv, nullptr };
     c->PSSetShaderResources(0, 3, inputs);
 
     c->Draw(3, 0);
@@ -2412,6 +3120,7 @@ void Matte(const VwsCmd& cmd)
     c->PSSetConstantBuffers(1, 1, &second);
     SafeRelease(second);
     backup.Restore(c);
+    depth.Release();
     source.Release();
 
     if (eye == 1)
@@ -2618,6 +3327,17 @@ void Execute(const VwsCmd& cmd)
 
 void __stdcall OnRenderEvent(int eventId)
 {
+    // The two that a camera raises itself, every frame, with nothing queued for them.
+    if ((eventId & kEventMask) == kEventFovea)
+    {
+        if ((eventId & 0xFFFF) == 1)
+            FoveaOn();
+        else
+            FoveaOff();
+
+        return;
+    }
+
     if ((eventId & kEventMask) != kEventMagic)
         return;
 
@@ -2746,12 +3466,24 @@ VWS_EXPORT void vws_cam_inject(const uint8_t* grey, uint32_t width, uint32_t hei
 // 2 when it holds both eyes side by side. `headPose`, twelve numbers or null, is the head in the
 // room as that frame was rendered. `fromAlpha`: the room has already been drawn into the frame and
 // the frame's alpha says where (1 = the game's own picture), so the key colour is not looked for.
-VWS_EXPORT int vws_push_matte(void* source, uint32_t eyes, uint32_t eye, uint32_t srgb, uint32_t topDown, const float* headPose, uint32_t fromAlpha)
+// `depth`, or null, is the scene's depth buffer for the same frame as the card keeps it, and
+// `depthInfo` four numbers about it: the near plane and the far one in the scene's units, how many
+// of those units make a metre, and flags (1 its first row is the top of the picture, 2 it holds
+// both eyes side by side, 4 it runs from 1 at the near plane to 0 at the far one).
+VWS_EXPORT int vws_push_matte(void* source, uint32_t eyes, uint32_t eye, uint32_t srgb, uint32_t topDown, const float* headPose, uint32_t fromAlpha,
+                              void* depth, const float* depthInfo)
 {
     VwsCmd cmd {};
     cmd.op = OpMatte;
     cmd.strength = fromAlpha != 0 ? 1.0f : 0.0f;
     cmd.frame = source;
+
+    if (depth != nullptr && depthInfo != nullptr)
+    {
+        cmd.proxy = depth;
+        memcpy(cmd.prev + 4, depthInfo, 4 * sizeof(float));
+    }
+
     cmd.eyes = eyes;
     cmd.which = eye;
     cmd.srgbMask = srgb != 0 ? kFrame : 0;
@@ -2779,6 +3511,287 @@ VWS_EXPORT void vws_overlay_status(int32_t* state, uint32_t* frames, int32_t* er
 
     if (error != nullptr)
         *error = (int32_t) g_ovError;
+}
+
+// How near the room and the scene are taken to be straight ahead, in 1/metres; below zero when
+// that one is not being read.
+VWS_EXPORT void vws_overlay_depth(float* room, float* scene)
+{
+    if (room != nullptr)
+        *room = g_ovDepthRoom / 1000.0f;
+
+    if (scene != nullptr)
+        *scene = g_ovDepthScene / 1000.0f;
+}
+
+// The room's depth grid as bytes (RGBA, `side` x `side`; see vwsdepth::Solver::Solve), as last
+// worked out. 1 when `out` was filled; `micros`, how long working it out took.
+VWS_EXPORT int vws_depth_read(uint8_t* out, uint32_t capacity, uint32_t* side, uint32_t* micros)
+{
+    int filled = 0;
+
+    if (g_depthSerial != 0 && out != nullptr && capacity >= sizeof(g_depthOut))
+    {
+        AcquireSRWLockExclusive(&g_depthLock);
+        memcpy(out, g_depthOut, sizeof(g_depthOut));
+        ReleaseSRWLockExclusive(&g_depthLock);
+        filled = 1;
+    }
+
+    if (side != nullptr)
+        *side = kGridN;
+
+    if (micros != nullptr)
+        *micros = (uint32_t) g_depthMicros;
+
+    return filled;
+}
+
+// The same worked out here and now from a frame handed in (grey, both lenses side by side) and
+// the passthrough's numbers, `times` times over as if the frame stood still. Returns the
+// microseconds one took. For the offline checks, and for trying it on a saved frame.
+VWS_EXPORT uint32_t vws_depth_solve(const uint8_t* grey, uint32_t width, uint32_t height, const float* cfg, uint8_t* out, uint32_t times)
+{
+    if (grey == nullptr || cfg == nullptr || out == nullptr || width < 64 || height < 64)
+        return 0;
+
+    vwsdepth::Solver* solver = new vwsdepth::Solver();
+    solver->Solve(grey, width, height, cfg, out);
+    const double start = Seconds();
+
+    for (uint32_t i = 1; i < (times < 2 ? 2u : times); ++i)
+        solver->Solve(grey, width, height, cfg, out);
+
+    const double took = (Seconds() - start) / ((times < 2 ? 2u : times) - 1);
+    delete solver;
+    return (uint32_t) (took * 1e6);
+}
+
+// ---- foveated shading -----------------------------------------------------------------------------
+
+// The event a camera raises (through vws_event_func) to have what it draws next shaded by where
+// the eyes look, and the one that ends that.
+VWS_EXPORT int vws_fovea_event(uint32_t on)
+{
+    return kEventFovea | (on != 0 ? 1 : 2);
+}
+
+// What "on" works from (FovField), and any texture of the game's device. Main thread, every frame.
+VWS_EXPORT void vws_fovea_configure(const float* values, uint32_t count, void* anyTexture)
+{
+    if (values == nullptr)
+        return;
+
+    AcquireSRWLockExclusive(&g_fovLock);
+    memcpy(g_fovCfg, values, sizeof(float) * (count < kFovFloats ? count : kFovFloats));
+    g_fovAnyTexture = anyTexture;
+    ReleaseSRWLockExclusive(&g_fovLock);
+}
+
+// `state`: 0 off, 1 at work, 2 this card cannot, 3 it failed. The target it last worked on, its
+// samples a pixel, how many in a hundred of its tiles are shaded coarsely, and how often it was
+// switched on.
+VWS_EXPORT void vws_fovea_status(int32_t* state, uint32_t* width, uint32_t* height, uint32_t* samples, uint32_t* coarse, uint32_t* ons)
+{
+    if (state != nullptr)
+        *state = (int32_t) g_fovState;
+
+    if (width != nullptr)
+        *width = (uint32_t) g_fovW;
+
+    if (height != nullptr)
+        *height = (uint32_t) g_fovH;
+
+    if (samples != nullptr)
+        *samples = (uint32_t) g_fovSamples;
+
+    if (coarse != nullptr)
+        *coarse = (uint32_t) g_fovCoarse;
+
+    if (ons != nullptr)
+        *ons = (uint32_t) g_fovOns;
+}
+
+// ---- the wearer's hands ---------------------------------------------------------------------------
+
+// Loads ONNX Runtime and the two hand models from `folder` (ending in a backslash), or from beside
+// this DLL when it is null. 1 when they are ready; vws_hand_error says why not.
+VWS_EXPORT int vws_hand_load(const wchar_t* folder)
+{
+    wchar_t own[MAX_PATH * 2] = {};
+
+    if (folder == nullptr)
+    {
+        HMODULE me = nullptr;
+
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR) &g_handNets, &me) ||
+            GetModuleFileNameW(me, own, MAX_PATH * 2 - 1) == 0)
+            return 0;
+
+        wchar_t* slash = wcsrchr(own, L'\\');
+
+        if (slash == nullptr)
+            return 0;
+
+        slash[1] = 0;
+        folder = own;
+    }
+
+    AcquireSRWLockExclusive(&g_handLock);
+    const bool ok = g_handNets.Load(folder);
+    ReleaseSRWLockExclusive(&g_handLock);
+
+    if (!ok)
+        Log("hands: %s", g_handNets.error);
+
+    return ok ? 1 : 0;
+}
+
+VWS_EXPORT void vws_hand_error(char* out, uint32_t capacity)
+{
+    if (out != nullptr && capacity > 0)
+        snprintf(out, capacity, "%s", g_handNets.error);
+}
+
+// Whether the hands are looked for (in the camera frames vws_cam_start brings), on every how many
+// of them, and the tracker's numbers (vwshand::Setting; null leaves them as they are).
+VWS_EXPORT void vws_hand_configure(uint32_t on, uint32_t every, const float* values, uint32_t count)
+{
+    AcquireSRWLockExclusive(&g_handLock);
+
+    if (values != nullptr)
+    {
+        if (!g_handSetGiven)
+            vwshand::Defaults(g_handSet);
+
+        memcpy(g_handSet, values, sizeof(float) * (count < (uint32_t) vwshand::kSettings ? count : (uint32_t) vwshand::kSettings));
+        g_handSetGiven = true;
+    }
+
+    if (on == 0)
+        memset(g_handOut, 0, sizeof(g_handOut));
+
+    ReleaseSRWLockExclusive(&g_handLock);
+    InterlockedExchange(&g_handEvery, every < 1 ? 1 : (LONG) every);
+    InterlockedExchange(&g_handOn, on != 0 ? 1 : 0);
+}
+
+// The hands as last worked out: vwshand::kHands times 67 floats (see vwshand::HandOut). 1 when
+// `out` was filled. `serial` counts the frames worked out, `micros` is how long the last took,
+// `ageMs` how long ago its camera frame arrived, `inRoom` whether the points are in the room (0: in
+// the head's space, the head's place never having been known).
+VWS_EXPORT int vws_hand_read(float* out, uint32_t capacity, uint32_t* serial, uint32_t* micros, float* ageMs, uint32_t* inRoom)
+{
+    const uint32_t floats = sizeof(g_handOut) / sizeof(float);
+    int filled = 0;
+    AcquireSRWLockShared(&g_handLock);
+
+    if (out != nullptr && capacity >= floats)
+    {
+        memcpy(out, g_handOut, sizeof(g_handOut));
+        filled = 1;
+    }
+
+    if (ageMs != nullptr)
+        *ageMs = g_handOutAt > 0.0 ? (float) ((Seconds() - g_handOutAt) * 1000.0) : -1.0f;
+
+    if (inRoom != nullptr)
+        *inRoom = g_handOutInRoom ? 1u : 0u;
+
+    ReleaseSRWLockShared(&g_handLock);
+
+    if (serial != nullptr)
+        *serial = (uint32_t) g_handSerial;
+
+    if (micros != nullptr)
+        *micros = (uint32_t) g_handMicros;
+
+    return filled;
+}
+
+// The same worked out here and now from a frame handed in (grey, both lenses side by side), the
+// passthrough's numbers, the tracker's (or null) and the head's pose (3x4, or null): `times` times
+// over, a sixtieth of a second apart, as if the frame stood still -- the first finds the hands,
+// the rest follow them. Returns the microseconds a following frame took. For the offline checks,
+// and for trying it on a saved frame.
+VWS_EXPORT uint32_t vws_hand_solve(const uint8_t* grey, uint32_t width, uint32_t height, const float* cfg, const float* settings,
+                                   const float* head, uint32_t times, float* out)
+{
+    if (grey == nullptr || cfg == nullptr || out == nullptr || g_handNets.hand == nullptr)
+        return 0;
+
+    vwshand::Tracker* tracker = new vwshand::Tracker();
+    tracker->nets = &g_handNets;
+
+    if (settings != nullptr)
+        memcpy(tracker->set, settings, sizeof(tracker->set));
+
+    vwshand::HandOut hands[vwshand::kHands];
+    const uint32_t runs = times < 3 ? 3u : times;
+    double following = 0.0;
+
+    for (uint32_t i = 0; i < runs; ++i)
+    {
+        const double start = Seconds();
+        tracker->Track(grey, width, height, cfg, head, (double) i / 60.0, hands);
+
+        if (i >= 2)
+            following += Seconds() - start;
+    }
+
+    memcpy(out, hands, sizeof(hands));
+    delete tracker;
+    return (uint32_t) (following / (runs - 2) * 1e6);
+}
+
+// One frame of a run of frames, through a tracker that is kept from call to call (`fresh` starts
+// it anew): a recording played back as the camera would have given it. Returns the microseconds
+// the frame took. For trying the tracker on recorded frames.
+VWS_EXPORT uint32_t vws_hand_step(const uint8_t* grey, uint32_t width, uint32_t height, const float* cfg, const float* settings, const float* head,
+                                  double time, uint32_t fresh, float* out)
+{
+    static vwshand::Tracker* tracker = nullptr;
+
+    if (grey == nullptr || cfg == nullptr || out == nullptr || g_handNets.hand == nullptr)
+        return 0;
+
+    if (tracker == nullptr || fresh != 0)
+    {
+        delete tracker;
+        tracker = new vwshand::Tracker();
+        tracker->nets = &g_handNets;
+    }
+
+    if (settings != nullptr)
+        memcpy(tracker->set, settings, sizeof(tracker->set));
+
+    vwshand::HandOut hands[vwshand::kHands];
+    const double start = Seconds();
+    tracker->Track(grey, width, height, cfg, head, time, hands);
+    memcpy(out, hands, sizeof(hands));
+    return (uint32_t) ((Seconds() - start) * 1e6);
+}
+
+// The newest camera frame as bytes (grey, both lenses side by side). 1 when `out` was filled.
+VWS_EXPORT int vws_cam_read(uint8_t* out, uint32_t capacity, uint32_t* width, uint32_t* height)
+{
+    int filled = 0;
+    AcquireSRWLockExclusive(&g_camLock);
+
+    if (g_camFront != nullptr && out != nullptr && capacity >= g_camW * g_camH)
+    {
+        memcpy(out, g_camFront, (size_t) g_camW * g_camH);
+        filled = 1;
+    }
+
+    if (width != nullptr)
+        *width = g_camW;
+
+    if (height != nullptr)
+        *height = g_camH;
+
+    ReleaseSRWLockExclusive(&g_camLock);
+    return filled;
 }
 
 // The overlay's picture as bytes (RGBA), for the offline checks: asks for the next one drawn and
@@ -3007,6 +4020,8 @@ VWS_EXPORT int vws_drain_log(char* buffer, int capacity)
 
     return (int) n;
 }
+
+#include "vws_flip.h"
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {

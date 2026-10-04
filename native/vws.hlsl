@@ -441,8 +441,13 @@ float4 PSPassthrough(float4 pos : SV_Position) : SV_Target
 
     // With an overlay to be cut by this frame, its alpha is made to say where the room went: 1 for
     // the game's own picture, 0 for the room.
-    const bool mark = pCam.w >= 7.5;
-    const int view = (int) (mark ? pCam.w - 8.0 : pCam.w);
+    // With the room's depth in use the game's own picture is marked with a half: what is drawn
+    // over the frame afterwards -- the interface -- raises that to 1, and can so be told from it.
+    const bool halved = pCam.w >= 15.5;
+    const float asked = halved ? pCam.w - 16.0 : pCam.w;
+    const bool mark = asked >= 7.5;
+    const int view = (int) (mark ? asked - 8.0 : asked);
+    const float own = halved ? 0.5 : 1.0;
 
     const float3 seen = encoded ? saturate(c.rgb) : LinearToSrgb(saturate(c.rgb));
     float matte = 1.0 - smoothstep(pKey.a, pKey.a + max(pTune.x, 1e-4), length(seen - pKey.rgb));
@@ -451,10 +456,10 @@ float4 PSPassthrough(float4 pos : SV_Position) : SV_Target
         matte = 1.0;
 
     if (matte <= 0.0)
-        return float4(c.rgb, mark ? 1.0 : c.a);
+        return float4(c.rgb, mark ? own : c.a);
 
     if (view == 1)
-        return float4(encoded ? matte.xxx : SrgbToLinear(matte.xxx), mark ? 1.0 - matte : c.a);
+        return float4(encoded ? matte.xxx : SrgbToLinear(matte.xxx), mark ? own * (1.0 - matte) : c.a);
 
     // Where this pixel is in its eye's picture, from the top left.
     const bool wide = pMisc.y > 1.5;
@@ -486,7 +491,7 @@ float4 PSPassthrough(float4 pos : SV_Position) : SV_Target
     const float grey = saturate(tProxy.SampleLevel(sLinear, uv, 0).r * pTune.y) * inside;
     const float3 room = encoded ? grey.xxx : SrgbToLinear(grey.xxx);
 
-    return float4(lerp(c.rgb, room, matte), mark ? 1.0 - matte : c.a);
+    return float4(lerp(c.rgb, room, matte), mark ? own * (1.0 - matte) : c.a);
 }
 
 // ---- PSMatte -----------------------------------------------------------------------------------
@@ -505,8 +510,12 @@ float4 PSMatte(float4 pos : SV_Position) : SV_Target
     {
         const int i = (int) pos.x;
 
+        // After the pose: whether it is known, and whether the matte carries the scene's depth.
         if (i >= 12)
-            return float4(pMisc.x, pMisc.x, pMisc.x, 1.0);
+        {
+            const float flag = i == 13 ? pK.x : pMisc.x;
+            return float4(flag, flag, flag, 1.0);
+        }
 
         const float4 rows[3] = { pRow0, pRow1, pRow2 };
         const float n = round(saturate(rows[i / 4][i % 4] * 0.5 + 0.5) * 16777215.0);
@@ -526,10 +535,41 @@ float4 PSMatte(float4 pos : SV_Position) : SV_Target
     float matte = 1.0 - smoothstep(pKey.a, pKey.a + max(pTune.x, 1e-4), length(seen - pKey.rgb));
 
     // Where the room has been drawn into the frame already, its alpha says so (see PSPassthrough).
-    if (pCam.w > 0.5)
-        matte = 1.0 - saturate(c.a);
+    // (pCentre.x: the game's own picture was marked with a half, and more than that is the
+    // interface, drawn over the frame since.)
+    bool menu = false;
 
-    return float4(matte, matte, matte, 1.0);
+    if (pCam.w > 0.5)
+    {
+        const bool halved = pCentre.x > 0.5;
+        matte = 1.0 - saturate(halved ? c.a * 2.0 : c.a);
+        menu = halved && c.a > 0.75;
+    }
+
+    // Beside the matte, how near the scene is along this line of sight: one over its distance in
+    // metres, four per metre being the most that fits. The overlay sets the room's own against it.
+    // tProxy is the scene's depth buffer as the card keeps it (pK: there is one, its first row is
+    // the top, it holds both eyes, it runs from 1 at the near plane to 0 at the far one).
+    float nearness = 0.0;
+
+    if (pK.x > 0.5)
+    {
+        uint dw, dh;
+        tProxy.GetDimensions(dw, dh);
+        const float2 where = float2(pK.z > 1.5 ? (pMisc.x + u) * 0.5 : u, pK.y > 0.5 ? v : 1.0 - v);
+        const float stored = tProxy.Load(int3(min((int2) (where * float2(dw, dh)), int2(dw, dh) - 1), 0)).r;
+        const float closest = pTune.y, farthest = pTune.z;
+        const float z = pK.w > 0.5 ? closest * farthest / (closest + stored * (farthest - closest))
+                                   : closest * farthest / (farthest - stored * (farthest - closest));
+        const float2 t = float2(lerp(pTan.x, pTan.y, u), lerp(pTan.z, pTan.w, v));
+        nearness = saturate(0.25 * max(pTune.w, 1e-6) / (z * sqrt(1.0 + dot(t, t))));
+    }
+
+    // Nothing of the room comes before the interface: the depth buffer knows nothing of it.
+    if (menu)
+        nearness = 1.0;
+
+    return float4(matte, nearness, matte, 1.0);
 }
 
 // ---- PSOverlay ---------------------------------------------------------------------------------
@@ -551,8 +591,48 @@ cbuffer OverlayParams : register(b1)
     float4 oCamRows[6]; // the head's space -> each camera's, three rows apiece
     float4 oRot[3];     // the head at the camera frame's moment, in the room (rotation); [0].w = it is known
     float4 oOut;        // texture width, height, 1/width, 1/height
-    float4 oMatte;      // x = how much of the matte texture's height is matte, y = the row its pose is in
+    float4 oMatte;      // x = how much of the matte texture's height is matte, y = the row its pose is in, z = how far the depth grid reaches to each side, as a tangent
+    float4 oDepth;      // x = the room's depth is used, y = how much nearer (per metre) the room must be than the scene to show in front of it, z = over how much more it fades in
+    float4 oGrid;       // the depth grid: cells per side, -, -, the most 1/distance
 };
+
+// A point of the head's space in a lens's picture: its texel, and how far from the lens's centre
+// that is. The camera looks down -z; its lens lays an angle from the axis down as a radius.
+float3 LensTexel(float3 p, int lens)
+{
+    const float4 r0 = oCamRows[lens * 3], r1 = oCamRows[lens * 3 + 1], r2 = oCamRows[lens * 3 + 2];
+    const float3 q = float3(dot(r0.xyz, p) + r0.w, dot(r1.xyz, p) + r1.w, dot(r2.xyz, p) + r2.w);
+    const float across = max(length(q.xy), 1e-9);
+    const float angle = atan2(across, -q.z);
+    const float a2 = angle * angle;
+    const float radius = oLens.x * angle * (1.0 + a2 * (oK.x + a2 * (oK.y + a2 * (oK.z + a2 * oK.w))));
+    const float2 centre = lens == 0 ? oCentre.xy : oCentre.zw;
+    return float3(centre + radius * float2(q.x, -q.y) / across, radius);
+}
+
+// How near the room is along a line of sight from the middle of the head: one over its distance,
+// per metre; 0 where it is not known. tFrame is the depth grid, worked out on the processor from
+// the two lenses (see vws_depth.h) -- its blue is the value to use.
+float GridNearness(float3 dir)
+{
+    if (dir.z > -1e-3)
+        return 0.0;
+
+    const float2 uv = float2(dir.x, -dir.y) / (-dir.z * oMatte.z) * 0.5 + 0.5;
+
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
+        return 0.0;
+
+    return tFrame.SampleLevel(sLinear, uv, 0).b * oGrid.w;
+}
+
+// The same along an eye's line of sight: the eye is beside the middle of the head, so the point
+// found is looked up once more from there.
+float RoomNearness(float3 from, float3 ray)
+{
+    const float first = GridNearness(ray);
+    return first > 0.0 ? GridNearness(normalize(from + ray / first)) : 0.0;
+}
 
 struct OverlayVertex
 {
@@ -602,27 +682,18 @@ float4 PSOverlay(OverlayVertex vertex) : SV_Target
     const float3 onQuad = float3((2.0 * u - 1.0) * oQuad.x, (1.0 - 2.0 * v) * oQuad.y, -oQuad.z);
     const float3 from = float3(eye == 0 ? -oCam.w : oCam.w, 0.0, 0.0);
     const float3 ray = normalize(onQuad - from);
-    const float3 at = from + ray * oQuad.w;
-
-    const float4 r0 = oCamRows[eye * 3], r1 = oCamRows[eye * 3 + 1], r2 = oCamRows[eye * 3 + 2];
-    const float3 q = float3(dot(r0.xyz, at) + r0.w, dot(r1.xyz, at) + r1.w, dot(r2.xyz, at) + r2.w);
-
-    const float across = max(length(q.xy), 1e-9);
-    const float angle = atan2(across, -q.z);
-    const float a2 = angle * angle;
-    const float radius = oLens.x * angle * (1.0 + a2 * (oK.x + a2 * (oK.y + a2 * (oK.z + a2 * oK.w))));
-
     const float lensW = oLens.z;
-    const float2 centre = eye == 0 ? oCentre.xy : oCentre.zw;
-    float2 texel = centre + radius * float2(q.x, -q.y) / across;
-    const float inside = saturate((lensW * 0.5 - 6.0 - radius) / 40.0);
-    texel = clamp(texel, 0.0, float2(lensW, oCam.y) - 1.0);
+    const int view = (int) oLens.w;
 
-    const float2 uv = float2((texel.x + 0.5 + eye * lensW) / oCam.x, (texel.y + 0.5) / oCam.y);
-    const float grey = saturate(tProxy.SampleLevel(sLinear, uv, 0).r * oLens.y);
+    const float3 shown = from + ray * oQuad.w;
+    const float3 lens = LensTexel(shown, eye);
+    const float inside = saturate((lensW * 0.5 - 6.0 - lens.z) / 40.0);
+    const float2 texel = clamp(lens.xy, 0.0, float2(lensW, oCam.y) - 1.0);
+    const float grey = saturate(tProxy.SampleLevel(sLinear, float2((texel.x + 0.5 + eye * lensW) / oCam.x, (texel.y + 0.5) / oCam.y), 0).r * oLens.y);
 
     // The same line of sight in the game's picture.
-    float alpha = 0.0;
+    float alpha = 0.0, scene = 0.0;
+    bool inPicture = false;
     const float3 g = float3(dot(vertex.turn0, ray), dot(vertex.turn1, ray), dot(vertex.turn2, ray));
 
     if (oCam.z > 0.5 && g.z < -1e-3)
@@ -631,11 +702,42 @@ float4 PSOverlay(OverlayVertex vertex) : SV_Target
         const float2 m = float2((g.x / -g.z - tn.x) / (tn.y - tn.x), (-g.y / -g.z - tn.z) / (tn.w - tn.z));
 
         if (m.x >= 0.0 && m.x <= 1.0 && m.y >= 0.0 && m.y <= 1.0)
-            alpha = tModel.SampleLevel(sLinear, float2((eye + m.x) * 0.5, m.y * oMatte.x), 0).r;
+        {
+            const float4 cut = tModel.SampleLevel(sLinear, float2((eye + m.x) * 0.5, m.y * oMatte.x), 0);
+            alpha = cut.r;
+            scene = cut.g * 4.0;
+            inPicture = true;
+        }
     }
 
-    if ((int) oLens.w == 2)
+    // Where the room is nearer than what the game drew there, the room is in front: a hand held
+    // out before a figure that stands further off covers it, and one behind it does not.
+    //
+    // The picture itself is left as it is. What this texel shows is whatever its lens saw along
+    // the lens's own line to the point the room is taken to be at -- wherever along that line the
+    // thing really is -- so that is the line the room's depth is asked along: the cut then falls
+    // on the hand as it is pictured, in each eye, and not beside it.
+    float room = 0.0;
+
+    if (oDepth.x > 0.5 && (view == 3 || (inPicture && alpha < 1.0)))
+    {
+        const float4 r0 = oCamRows[eye * 3], r1 = oCamRows[eye * 3 + 1], r2 = oCamRows[eye * 3 + 2];
+        const float3 lensAt = -(r0.xyz * r0.w + r1.xyz * r1.w + r2.xyz * r2.w);
+        room = RoomNearness(lensAt, normalize(shown - lensAt));
+
+        if (inPicture && room > 0.0 && tModel.Load(int3(13, (int) oMatte.y, 0)).r > 0.5)
+            alpha += (1.0 - alpha) * smoothstep(oDepth.y, oDepth.y + max(oDepth.z, 1e-4), room - scene);
+    }
+
+    if (view == 2)
         alpha = 1.0;
+
+    // For looking at what the depth is taken to be: the room's, then the scene's (near is bright).
+    if (view == 3)
+        return float4(sqrt(saturate(room / oGrid.w)).xxx, 1.0);
+
+    if (view == 4)
+        return float4(sqrt(saturate(scene * 0.25)).xxx, inPicture ? 1.0 : 0.0);
 
     return float4(grey, grey, grey, alpha * inside);
 }

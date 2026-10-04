@@ -2,6 +2,7 @@
 #
 #   BepInEx\plugins\VamDlssNrWorkScale\VamDlssNrWorkScale.dll        the plugin
 #   BepInEx\plugins\VamDlssNrWorkScale\VamDlssNrWorkScaleNative.dll  its D3D11 half
+#   BepInEx\patchers\VamDlssNrWorkScale.Early.dll                    the part that runs before the game has a window
 #   AddonPackages\jeahbwoi720.VaMVrNrControl.<n>.var                 the in-headset panel's session script
 #
 #   pwsh build.ps1 [-VamDir D:\Games\VaM_Updater] [-Zip]
@@ -26,6 +27,12 @@ if (Test-Path $dist) { Remove-Item $dist -Recurse -Force -Confirm:$false }
 New-Item -ItemType Directory -Force $plugin | Out-Null
 
 Copy-Item (Join-Path $here 'managed\out\VamDlssNrWorkScale.dll'), (Join-Path $here 'native\out\VamDlssNrWorkScaleNative.dll') $plugin
+$patchers = Join-Path $dist 'BepInEx\patchers'
+New-Item -ItemType Directory -Force $patchers | Out-Null
+Copy-Item (Join-Path $here 'managed\out\VamDlssNrWorkScale.Early.dll') $patchers
+# The hand tracker's outside parts, beside the native DLL that loads them, with their licences.
+Copy-Item (Join-Path $here 'native\out\onnxruntime.dll'), (Join-Path $here 'native\out\hand-palm.onnx'), (Join-Path $here 'native\out\hand-points.onnx') $plugin
+Copy-Item (Join-Path $here 'THIRD-PARTY.md') (Join-Path $dist 'VamDlssNrWorkScale-THIRD-PARTY.md')
 Copy-Item (Join-Path $here 'README.md') (Join-Path $dist 'VamDlssNrWorkScale-README.md')
 Copy-Item (Join-Path $here 'LICENSE') (Join-Path $dist 'VamDlssNrWorkScale-LICENSE.txt')
 

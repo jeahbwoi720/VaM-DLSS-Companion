@@ -40,6 +40,11 @@ namespace VamDlssNrWorkScale
         internal static ConfigEntry<bool> CfgRoomBehind;
         internal static ConfigEntry<int> CfgPoseSource;
         internal static ConfigEntry<float> CfgPoseTiming;
+        internal static ConfigEntry<bool> CfgDepth, CfgDepthFlip;
+        internal static ConfigEntry<float> CfgDepthMargin, CfgDepthSoftness;
+
+        // The component of the camera the frame in hand was rendered by (HeadsetUi sets it before Run).
+        internal static Component SceneCamera;
 
         internal static string Status = "";
 
@@ -109,9 +114,9 @@ namespace VamDlssNrWorkScale
         private const uint TagInt32 = 2, TagDouble = 7, TagMatrix34 = 20;
 
         // The native half's block of numbers (CamField in vws.cpp).
-        private const int FKey = 0, FTolerance = 3, FSoftness = 4, FGain = 5, FDistance = 6, FFocal = 7, FK = 8, FCentre = 12, FTan = 16, FCamToHead = 24, FEyeToHead = 48, FFollow = 72, FView = 73, FMode = 74, FQuadTan = 75, FQuadDistance = 76, FStereoRule = 77, FSpace = 78, FPoseIsCamera = 79;
+        private const int FKey = 0, FTolerance = 3, FSoftness = 4, FGain = 5, FDistance = 6, FFocal = 7, FK = 8, FCentre = 12, FTan = 16, FCamToHead = 24, FEyeToHead = 48, FFollow = 72, FView = 73, FMode = 74, FQuadTan = 75, FQuadDistance = 76, FStereoRule = 77, FSpace = 78, FPoseIsCamera = 79, FDepth = 80, FDepthMargin = 81, FDepthSoft = 82;
 
-        private static readonly float[] _config = new float[80];
+        private static readonly float[] _config = new float[96];
         private static readonly float[] _eyeToRoom = new float[12];
         private static readonly float[] _head = new float[12];
         private static IntPtr _compositor = IntPtr.Zero;
@@ -133,6 +138,11 @@ namespace VamDlssNrWorkScale
         private static bool _started;
         private static bool _failed;
         private static float _retryAt, _lastRun, _statusAt, _ipdAt;
+
+        // When the camera was last asked for by something other than the room's picture, and what
+        // stood in the way.
+        private static float _heldAt = -100f;
+        private static string _holdProblem;
         private static uint _lastFrames;
         private static float _ipd = 0.064f;
         private static uint _width, _height;
@@ -371,10 +381,91 @@ namespace VamDlssNrWorkScale
             _handle = 0;
         }
 
+        // The camera for something other than the room's picture (the hands, see Hands): taken if
+        // passthrough has not taken it, given its numbers while passthrough is not doing that, and
+        // kept for as long as this goes on being called. Null, or what stands in the way.
+        internal static string Hold(float now)
+        {
+            if (!Native.Loaded)
+            {
+                return "the native half is not loaded";
+            }
+
+            if (_failed)
+            {
+                return "the camera failed (" + Status + ")";
+            }
+
+            _heldAt = now;
+
+            // Passthrough is running it, and says what there is to say.
+            if (CfgOn != null && CfgOn.Value && now - _lastRun < 1f)
+            {
+                return _started ? null : (Status.Length != 0 ? Status : "waiting for the camera");
+            }
+
+            if (!_started)
+            {
+                if (now < _retryAt)
+                {
+                    return _holdProblem ?? "waiting for the camera";
+                }
+
+                _holdProblem = Start();
+
+                if (_holdProblem != null)
+                {
+                    _retryAt = now + 5f;
+                    return _holdProblem;
+                }
+            }
+
+            // Only what says where a point in the room falls in a frame: nothing is drawn.
+            _config[FFocal] = CfgFocal.Value * (_width * 0.5f / 1016f);
+            _config[FMode] = 0f;
+            _config[FDepth] = 0f;
+            _config[FSpace] = _space;
+            _config[FPoseIsCamera] = _poseIsCamera ? 1f : 0f;
+            Native.CamConfigure(_config);
+
+            if (now >= _statusAt)
+            {
+                uint frames, uploads;
+                int error;
+                Native.CamStatus(out frames, out uploads, out error);
+
+                // As in Run: a stream that has stopped giving frames is taken afresh.
+                if (frames != 0 && frames == _lastFrames)
+                {
+                    if (++_stalled >= 2)
+                    {
+                        Stop();
+                        _retryAt = now;
+                        _statusAt = now + 1f;
+                        return "the camera's stream stopped -- taking it again";
+                    }
+                }
+                else
+                {
+                    _stalled = 0;
+                }
+
+                if (frames != 0 && !_poseKindKnown)
+                {
+                    DetectPoseKind();
+                }
+
+                _lastFrames = frames;
+                _statusAt = now + 1f;
+            }
+
+            return null;
+        }
+
         // From the plugin, every frame: gives the camera back once nothing has asked for it for a while.
         internal static void Tick(float now)
         {
-            if (_started && now - _lastRun > 3f)
+            if (_started && now - _lastRun > 3f && now - _heldAt > 3f)
             {
                 Stop();
                 Status = "";
@@ -456,8 +547,71 @@ namespace VamDlssNrWorkScale
             }
         }
 
+        // The camera's newest frame as it came (both lenses side by side, a byte a pixel), into a
+        // buffer that is made to fit. False when there is none.
+        internal static bool ReadCamera(ref byte[] grey, out uint width, out uint height)
+        {
+            width = _width;
+            height = _height;
+
+            if (_width == 0 || _height == 0)
+            {
+                return false;
+            }
+
+            if (grey == null || grey.Length != _width * _height)
+            {
+                grey = new byte[_width * _height];
+            }
+
+            uint cw, ch;
+            return Native.CamRead(grey, out cw, out ch) && cw == _width && ch == _height;
+        }
+
+        // The camera's newest frame as it came (both lenses side by side), as a PNG. False when there
+        // is none.
+        internal static bool SaveCamera(string path)
+        {
+            if (_width == 0 || _height == 0)
+            {
+                return false;
+            }
+
+            byte[] grey = new byte[_width * _height];
+            uint cw, ch;
+
+            if (!Native.CamRead(grey, out cw, out ch) || cw != _width || ch != _height)
+            {
+                return false;
+            }
+
+            byte[] rgb = new byte[cw * ch * 3];
+
+            for (uint y = 0; y < ch; y++)
+            {
+                uint from = y * cw, to = (ch - 1 - y) * cw * 3;
+
+                for (uint x = 0; x < cw; x++)
+                {
+                    byte value = grey[from + x];
+                    rgb[to + x * 3] = value;
+                    rgb[to + x * 3 + 1] = value;
+                    rgb[to + x * 3 + 2] = value;
+                }
+            }
+
+            Texture2D camera = new Texture2D((int)cw, (int)ch, TextureFormat.RGB24, false);
+            camera.LoadRawTextureData(rgb);
+            camera.Apply(false);
+            System.IO.File.WriteAllBytes(path, ImageConversion.EncodeToPNG(camera));
+            UnityEngine.Object.Destroy(camera);
+            return true;
+        }
+
         // The overlay's own picture, saved beside the plugin: the room as drawn on the quad, left
         // eye's half first, and in its alpha where the game lets it show.
+        private static byte[] _captureGrid;
+
         private static void SaveCapture()
         {
             try
@@ -469,6 +623,14 @@ namespace VamDlssNrWorkScale
                 }
 
                 uint w, h;
+
+                if (_captureGrid == null)
+                {
+                    _captureGrid = new byte[256 * 256 * 4];
+                }
+
+                uint side, micros;
+                bool haveGrid = Native.DepthRead(_captureGrid, out side, out micros) && side >= 16 && side <= 256;
 
                 if (!Native.OverlayRead(_capture, out w, out h) || w == 0 || h == 0)
                 {
@@ -512,9 +674,31 @@ namespace VamDlssNrWorkScale
                 UnityEngine.Object.Destroy(picture);
                 _capture = null;
 
+                // Beside it, what it was made from: the camera's frame as it came (both lenses),
+                // and the depth worked out from it (red: how near, green: believed, blue: held).
+                string folder = System.IO.Path.GetDirectoryName(path);
+                SaveCamera(System.IO.Path.Combine(folder, "passthrough-camera-capture.png"));
+
+                if (haveGrid)
+                {
+                    int n = (int)side;
+                    byte[] turned = new byte[n * n * 4];
+
+                    for (int y = 0; y < n; y++)
+                    {
+                        Buffer.BlockCopy(_captureGrid, y * n * 4, turned, (n - 1 - y) * n * 4, n * 4);
+                    }
+
+                    Texture2D grid = new Texture2D(n, n, TextureFormat.RGBA32, false);
+                    grid.LoadRawTextureData(turned);
+                    grid.Apply(false);
+                    System.IO.File.WriteAllBytes(System.IO.Path.Combine(folder, "passthrough-depth-capture.png"), ImageConversion.EncodeToPNG(grid));
+                    UnityEngine.Object.Destroy(grid);
+                }
+
                 if (Hooks.Info != null)
                 {
-                    Hooks.Info("passthrough: the overlay's picture is in " + path);
+                    Hooks.Info("passthrough: the overlay's picture is in " + path + (haveGrid ? ", with the camera's frame and the depth beside it" : ", with the camera's frame beside it"));
                 }
             }
             catch (Exception ex)
@@ -530,6 +714,89 @@ namespace VamDlssNrWorkScale
         }
 
         private static bool _mattePending, _mattePosed, _matteFromAlpha;
+
+        private static readonly int DepthTextureId = Shader.PropertyToID("_CameraDepthTexture");
+        private static readonly float[] _depthInfo = new float[4];
+        private static RenderTexture _sceneDepth;
+        private static IntPtr _depthPtr = IntPtr.Zero;
+        private static string _depthNote = "";
+
+        // The scene's depth for the frame in hand, in a texture the native half can read: the
+        // card's own depth buffer copied as plain numbers. With it go the near and far planes, how
+        // many of the scene's units make a metre (the game can scale the player), and how the
+        // buffer lies. Zero when there is none this frame.
+        private static IntPtr SceneDepth()
+        {
+            _depthPtr = IntPtr.Zero;
+
+            if (CfgDepth == null || !CfgDepth.Value)
+            {
+                _depthNote = "";
+                return _depthPtr;
+            }
+
+            Camera camera = (object)SceneCamera != null && SceneCamera != null ? SceneCamera.GetComponent<Camera>() : null;
+
+            if (camera == null)
+            {
+                _depthNote = "no camera";
+                return _depthPtr;
+            }
+
+            // Asked for here if nobody has: it is there from the next frame, and it stays -- taking
+            // it away again could take it from whoever else has come to rely on it meanwhile.
+            if ((camera.depthTextureMode & DepthTextureMode.Depth) == 0)
+            {
+                camera.depthTextureMode |= DepthTextureMode.Depth;
+                _depthNote = "asked the game for its depth";
+                return _depthPtr;
+            }
+
+            Texture depth = Shader.GetGlobalTexture(DepthTextureId);
+
+            if (depth == null || depth.width < 16 || depth.height < 16)
+            {
+                _depthNote = "the game has no depth texture";
+                return _depthPtr;
+            }
+
+            if (_sceneDepth == null || _sceneDepth.width != depth.width || _sceneDepth.height != depth.height)
+            {
+                if (_sceneDepth != null)
+                {
+                    _sceneDepth.Release();
+                    UnityEngine.Object.Destroy(_sceneDepth);
+                }
+
+                RenderTexture source = depth as RenderTexture;
+                RenderTextureDescriptor d = source != null ? source.descriptor : new RenderTextureDescriptor(depth.width, depth.height);
+                d.colorFormat = RenderTextureFormat.RFloat;
+                d.depthBufferBits = 0;
+                d.msaaSamples = 1;
+                d.sRGB = false;
+                d.useMipMap = false;
+                d.autoGenerateMips = false;
+                _sceneDepth = new RenderTexture(d);
+                _sceneDepth.filterMode = FilterMode.Point;
+                _sceneDepth.Create();
+            }
+
+            RenderTexture active = RenderTexture.active;
+            Graphics.Blit(depth, _sceneDepth);
+            RenderTexture.active = active;
+
+            Vector4 left = camera.GetStereoViewMatrix(Camera.StereoscopicEye.Left).inverse.GetColumn(3);
+            Vector4 right = camera.GetStereoViewMatrix(Camera.StereoscopicEye.Right).inverse.GetColumn(3);
+            float apart = ((Vector3)left - (Vector3)right).magnitude;
+
+            _depthInfo[0] = camera.nearClipPlane;
+            _depthInfo[1] = camera.farClipPlane;
+            _depthInfo[2] = _ipd > 0.01f && apart > 1e-5f ? apart / _ipd : 1f;
+            _depthInfo[3] = ((CfgDepthFlip != null && CfgDepthFlip.Value) ? 1f : 0f) + (depth.width > depth.height * 3 / 2 ? 2f : 0f) + (SystemInfo.usesReversedZBuffer ? 4f : 0f);
+            _depthNote = "";
+            _depthPtr = _sceneDepth.GetNativeTexturePtr();
+            return _depthPtr;
+        }
         private static int _loggedState = -1;
 
         // The matte, once the interface has been drawn: `eyes` the two reconstructed eyes, else
@@ -552,11 +819,11 @@ namespace VamDlssNrWorkScale
             {
                 if (eyes != null)
                 {
-                    Native.IssuePass(Native.PushMatte(eyes[eye].GetNativeTexturePtr(), 1, eye, false, topDown, _mattePosed ? _head : null, _matteFromAlpha));
+                    Native.IssuePass(Native.PushMatte(eyes[eye].GetNativeTexturePtr(), 1, eye, false, topDown, _mattePosed ? _head : null, _matteFromAlpha, _depthPtr, _depthInfo));
                 }
                 else
                 {
-                    Native.IssuePass(Native.PushMatte(wide.GetNativeTexturePtr(), 2, eye, wide.sRGB, topDown, _mattePosed ? _head : null, _matteFromAlpha));
+                    Native.IssuePass(Native.PushMatte(wide.GetNativeTexturePtr(), 2, eye, wide.sRGB, topDown, _mattePosed ? _head : null, _matteFromAlpha, _depthPtr, _depthInfo));
                 }
             }
         }
@@ -669,7 +936,8 @@ namespace VamDlssNrWorkScale
         {
             if (CfgOn == null || !CfgOn.Value || !Native.Loaded || _failed)
             {
-                if (_started)
+                // ...unless the hands are using the camera.
+                if (_started && (_failed || now - _heldAt > 1f))
                 {
                     Stop();
                 }
@@ -732,6 +1000,9 @@ namespace VamDlssNrWorkScale
             _config[FStereoRule] = CfgOverlayShape != null && CfgOverlayShape.Value ? 1f : 0f;
             _config[FSpace] = _space;
             _config[FPoseIsCamera] = _poseIsCamera ? 1f : 0f;
+            _config[FDepth] = overlay && CfgDepth != null && CfgDepth.Value ? 1f : 0f;
+            _config[FDepthMargin] = CfgDepthMargin != null ? CfgDepthMargin.Value : 0.25f;
+            _config[FDepthSoft] = CfgDepthSoftness != null ? CfgDepthSoftness.Value : 0.1f;
 
             for (int eye = 0; eye < 2; eye++)
             {
@@ -755,6 +1026,15 @@ namespace VamDlssNrWorkScale
             bool posed = LastPose();
             bool drew = false;
 
+            if (overlay)
+            {
+                SceneDepth();
+            }
+            else
+            {
+                _depthPtr = IntPtr.Zero;
+            }
+
             // Under an overlay the room can be in the game's frame as well: whatever the overlay's
             // cut-out leaves uncovered beside the person is then the room, not the key colour. The
             // pass marks what it replaced in the frame's alpha, and the matte is read from there.
@@ -775,7 +1055,7 @@ namespace VamDlssNrWorkScale
                     // The game only says where the room shows; the overlay draws it.
                     if (!_mattePending)
                     {
-                        Native.IssuePass(Native.PushMatte(target, held, eye, srgb, topDown, posed ? _head : null, false));
+                        Native.IssuePass(Native.PushMatte(target, held, eye, srgb, topDown, posed ? _head : null, false, _depthPtr, _depthInfo));
                     }
 
                     continue;
@@ -797,7 +1077,7 @@ namespace VamDlssNrWorkScale
                 for (int eye = 0; eye < 2; eye++)
                 {
                     IntPtr target = eyes != null ? eyes[eye].GetNativeTexturePtr() : frame.GetNativeTexturePtr();
-                    Native.IssuePass(Native.PushMatte(target, eyes != null ? 1 : 2, eye, eyes == null && frame.sRGB, topDown, posed ? _head : null, true));
+                    Native.IssuePass(Native.PushMatte(target, eyes != null ? 1 : 2, eye, eyes == null && frame.sRGB, topDown, posed ? _head : null, true, _depthPtr, _depthInfo));
                 }
             }
 
@@ -880,6 +1160,18 @@ namespace VamDlssNrWorkScale
                         state == 3 ? "this SteamVR has no overlay interface the plugin knows -- try Mode 1" :
                         state == 4 ? "SteamVR refused the overlay (error " + overlayError + ") -- try Mode 1" :
                         "overlay starting") + (posed ? "" : ", no head pose");
+
+                    // How far the room and the scene are taken to be, straight ahead: the one way
+                    // to see from inside the headset whether either is being read.
+                    if (state == 5 && CfgDepth != null && CfgDepth.Value)
+                    {
+                        float room, scene;
+                        Native.OverlayDepth(out room, out scene);
+                        uint side, micros;
+                        Native.DepthRead(null, out side, out micros);
+                        Status += "\ndepth ahead: room " + (room < 0f ? "not worked out" : room < 0.06f ? "not known" : (1f / room).ToString("0.00") + " m") +
+                            ", scene " + (_depthNote.Length != 0 ? "(" + _depthNote + ")" : scene < 0f ? "not arriving" : scene < 0.02f ? "far" : (1f / scene).ToString("0.00") + " m") + " (" + (micros / 1000f).ToString("0") + " ms)";
+                    }
                 }
                 else
                 {

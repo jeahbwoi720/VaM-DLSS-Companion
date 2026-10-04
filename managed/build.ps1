@@ -48,7 +48,7 @@ $refs = $vamRefs + @(
     (Join-Path $core '0Harmony.dll'),
     $ModDll
 )
-$sources = @((Join-Path $here 'WorkScale.cs'), (Join-Path $here 'ControlPanel.cs'), (Join-Path $here 'HeadsetUi.cs'), (Join-Path $here 'CameraProbe.cs'), (Join-Path $here 'Passthrough.cs'))
+$sources = @((Join-Path $here 'WorkScale.cs'), (Join-Path $here 'ControlPanel.cs'), (Join-Path $here 'HeadsetUi.cs'), (Join-Path $here 'CameraProbe.cs'), (Join-Path $here 'Passthrough.cs'), (Join-Path $here 'Hands.cs'), (Join-Path $here 'HandDrive.cs'), (Join-Path $here 'HandUi.cs'), (Join-Path $here 'Foveation.cs'), (Join-Path $here 'Presentation.cs'))
 $defines = @()
 
 if ($SelfTest) {
@@ -60,6 +60,12 @@ if ($SelfTest) {
 & dotnet exec $csc -nologo -target:library -nostdlib+ -noconfig -langversion:7.3 -optimize+ -debug- -deterministic `
     -warnaserror- -nowarn:1701,1702 "-out:$(Join-Path $out 'VamDlssNrWorkScale.dll')" @defines @($refs | ForEach-Object { "-r:$_" }) @sources
 if ($LASTEXITCODE -ne 0) { throw 'managed build failed' }
+
+# The preloader patcher (BepInEx\patchers): the part that runs before the game has a window.
+$early = Join-Path $out 'VamDlssNrWorkScale.Early.dll'
+& dotnet exec $csc -nologo -target:library -nostdlib+ -noconfig -langversion:7.3 -optimize+ -debug- -deterministic -nowarn:1701,1702 "-out:$early" `
+    "-r:$(Join-Path $managed 'mscorlib.dll')" "-r:$(Join-Path $managed 'System.dll')" "-r:$(Join-Path $core 'BepInEx.dll')" "-r:$(Join-Path $core 'Mono.Cecil.dll')" (Join-Path $here 'Early.cs')
+if ($LASTEXITCODE -ne 0) { throw 'the preloader patcher does not compile' }
 
 # The session script, as VaM's own compiler would be asked to take it.
 $scripts = Get-ChildItem (Join-Path (Split-Path $here) 'vam\Custom\Scripts') -Recurse -Filter *.cs

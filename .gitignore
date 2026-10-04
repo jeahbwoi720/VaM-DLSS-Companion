@@ -24,3 +24,6 @@ VamDlssNr.dll
 nvngx_*.dll
 
 __pycache__/
+
+# fetched by native/fetch-deps.ps1: ONNX Runtime and the hand models
+native/deps/
