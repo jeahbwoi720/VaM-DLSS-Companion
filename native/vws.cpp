@@ -31,21 +31,28 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
+#include <dxgi.h>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 
 #include "vws_vs.h"
 #include "vws_ps_down.h"
 #include "vws_ps_resolve.h"
 #include "vws_ps_guide.h"
+#include "vws_ps_sharpen.h"
+#include "vws_ps_pass.h"
+#include "vws_ps_matte.h"
+#include "vws_ps_overlay.h"
+#include "vws_vs_overlay.h"
 
 #define VWS_EXPORT extern "C" __declspec(dllexport)
 
 namespace
 {
-const uint32_t kAbi = 5;
+const uint32_t kAbi = 12;
 const int kEventMagic = 0x57530000; // 'WS'
 const int kEventMask = 0x7FFF0000;
 const int kSlots = 64;
@@ -61,6 +68,9 @@ enum Op : uint32_t
     OpReleaseAll = 5,
     OpRegisterGuide = 6, // `which` = which guide; frame = its source, proxy = the model's copy
     OpGuide = 7,         // `which` = which guide
+    OpSharpen = 8,       // frame = the texture to sharpen where it lies; strength; eyes
+    OpPassthrough = 9,   // frame = the texture whose key colour becomes the camera's picture; see Passthrough
+    OpMatte = 10,        // frame = the texture whose key colour is written, as a matte, for the overlay; see Matte
 };
 
 enum Error : int
@@ -136,6 +146,7 @@ const uint32_t kFlagOutEncoded = 8;
 const uint32_t kFlagWindow = 16;
 const uint32_t kFlagMoved = 32;
 const uint32_t kFlagTopDown = 64;
+const uint32_t kFlagSquash = 128;
 
 enum Pass
 {
@@ -248,12 +259,18 @@ ID3D11VertexShader* g_vs = nullptr;
 ID3D11PixelShader* g_psDown = nullptr;
 ID3D11PixelShader* g_psResolve = nullptr;
 ID3D11PixelShader* g_psGuide = nullptr;
+ID3D11PixelShader* g_psSharpen = nullptr;
+ID3D11PixelShader* g_psPass = nullptr;
+ID3D11PixelShader* g_psMatte = nullptr;
+ID3D11Buffer* g_cbPass = nullptr;
+void* g_sharpenRefused = nullptr; // a texture the sharpening pass could not open, so it is not asked again
 ID3D11SamplerState* g_sampler = nullptr;
 ID3D11Buffer* g_cb = nullptr;
 ID3D11RasterizerState* g_raster = nullptr;
 ID3D11BlendState* g_blend = nullptr;
 ID3D11DepthStencilState* g_depth = nullptr;
 Set g_sets[kSets];
+Surface g_scratch; // the sharpening pass reads a copy of what it writes
 
 void Log(const char* fmt, ...)
 {
@@ -346,6 +363,119 @@ DXGI_FORMAT ViewFormat(DXGI_FORMAT f, bool* hardwareCodec)
     }
 }
 
+// ---- the headset's camera, for passthrough -------------------------------------------------------
+//
+// A worker thread asks SteamVR for the camera's newest frame and keeps one grey copy of it; the
+// render thread uploads that copy when it draws. The numbers the pass needs -- the key colour, the
+// lens, where the cameras sit in the head -- come from the managed side as one block of floats.
+typedef int(__stdcall* CamFrameFn)(uint64_t handle, int frameType, void* buffer, uint32_t bufferSize, void* header,
+                                   uint32_t headerSize);
+
+const uint32_t kCamFloats = 80;
+
+enum CamField : uint32_t
+{
+    kCfgKey = 0,        // 3: the key colour, sRGB-encoded 0..1
+    kCfgTolerance = 3,  // how far from it still counts as key
+    kCfgSoftness = 4,   // ...and how far beyond that the edge fades
+    kCfgGain = 5,       // camera brightness
+    kCfgDistance = 6,   // how far away the room is taken to be, metres
+    kCfgFocal = 7,      // the fisheye's pixels per radian
+    kCfgK = 8,          // 4: its polynomial
+    kCfgCentre = 12,    // 4: its centre in each lens's half of the frame, pixels
+    kCfgTan = 16,       // 8: each eye's left, right, top, bottom tangents (y down)
+    kCfgCamToHead = 24, // 24: each camera in the head, 3x4
+    kCfgEyeToHead = 48, // 24: each eye in the head, 3x4
+    kCfgCompensate = 72, // 1: follow the head from the camera frame's moment to the picture's
+    kCfgView = 73,      // 0 the picture, 1 the matte, 2 the camera everywhere
+    kCfgMode = 74,      // 0 the room is drawn into the game's frame, 1 it is a SteamVR overlay of its own
+    kCfgQuadTan = 75,   // overlay: how far the quad reaches to each side, as a tangent
+    kCfgQuadDistance = 76, // overlay: how far in front of the head the quad stands, metres
+    kCfgStereoRule = 77, // overlay: 0 SteamVR shapes a side-by-side overlay by one eye's picture, 1 by the whole texture
+    kCfgSpace = 78,     // the tracking universe the camera's poses are in
+    kCfgPoseIsCamera = 79, // 1: the pose a camera frame comes with is the first camera's, not the head's
+};
+
+struct PassParams
+{
+    float dst[4];    // target width, height, 1/width, 1/height
+    float key[4];    // rgb, tolerance
+    float tune[4];   // softness, gain, distance, focal
+    float k[4];
+    float centre[4];
+    float cam[4];    // camera frame width, height, lens width, view
+    float tangents[4];
+    float row0[4], row1[4], row2[4]; // a point in the eye's space -> the camera's
+    float misc[4];   // eye, eyes in the target (1|2), target holds encoded values, first row at the top
+};
+
+SRWLOCK g_camLock = SRWLOCK_INIT;
+float g_camConfig[kCamFloats] {};
+bool g_camConfigured = false;
+uint8_t* g_camFront = nullptr; // the newest frame, grey
+uint8_t* g_camSpare = nullptr; // the render thread's
+float g_camFrontPose[12] {};
+bool g_camFrontPoseValid = false;
+bool g_camFresh = false;
+uint32_t g_camW = 0, g_camH = 0;
+volatile LONG g_camGen = 0; // which start the camera thread belongs to: a thread of an earlier one ends itself
+HANDLE g_camThread = nullptr;
+CamFrameFn g_camFn = nullptr;
+uint64_t g_camHandle = 0;
+volatile LONG g_camFrames = 0, g_camUploads = 0, g_camError = 0;
+
+// render thread only
+ID3D11Texture2D* g_camTex = nullptr;
+ID3D11ShaderResourceView* g_camSrv = nullptr;
+float g_camPose[12] {};
+bool g_camPoseValid = false;
+bool g_camHave = false;
+void* g_passRefused = nullptr;
+
+// The game's side of the overlay: the matte, in a texture the overlay's device can open, and the
+// head's pose as the frame it was cut from was rendered.
+LUID g_gameAdapter {};
+bool g_gameAdapterKnown = false;
+HANDLE g_matteHandle = nullptr;
+uint32_t g_matteSerial = 0;
+float g_gamePose[12] {};
+bool g_gamePoseValid = false;
+volatile LONG g_matteFrames = 0;
+const uint32_t kMatteW = 2048, kMatteH = 1024;
+const uint32_t kMatteTexH = kMatteH + 8, kMattePoseRow = kMatteH + 4; // below the matte, the row its pose is written in
+
+// render thread only
+ID3D11Texture2D* g_matteTex = nullptr;
+ID3D11RenderTargetView* g_matteRtv = nullptr;
+void* g_matteRefused = nullptr;
+
+// the overlay's own thread
+volatile LONG g_ovState = 0, g_ovFrames = 0, g_ovError = 0;
+volatile LONG g_ovDebugWant = 0;
+uint8_t* g_ovDebug = nullptr;
+uint32_t g_ovDebugW = 0, g_ovDebugH = 0;
+
+void ReleaseMatte()
+{
+    SafeRelease(g_matteRtv);
+    SafeRelease(g_matteTex);
+    g_matteRefused = nullptr;
+
+    AcquireSRWLockExclusive(&g_camLock);
+    g_matteHandle = nullptr;
+    g_matteSerial++;
+    g_gameAdapterKnown = false;
+    ReleaseSRWLockExclusive(&g_camLock);
+}
+
+void ReleaseCamera()
+{
+    SafeRelease(g_camSrv);
+    SafeRelease(g_camTex);
+    g_camHave = false;
+    g_passRefused = nullptr;
+}
+
 void ReleaseDevice()
 {
     for (Set& s : g_sets)
@@ -356,6 +486,14 @@ void ReleaseDevice()
     SafeRelease(g_raster);
     SafeRelease(g_cb);
     SafeRelease(g_sampler);
+    g_scratch.Release();
+    g_sharpenRefused = nullptr;
+    ReleaseCamera();
+    ReleaseMatte();
+    SafeRelease(g_cbPass);
+    SafeRelease(g_psMatte);
+    SafeRelease(g_psPass);
+    SafeRelease(g_psSharpen);
     SafeRelease(g_psGuide);
     SafeRelease(g_psResolve);
     SafeRelease(g_psDown);
@@ -394,6 +532,45 @@ HRESULT EnsureDevice(ID3D11Device* device)
 
     if (SUCCEEDED(hr))
         hr = g_device->CreatePixelShader(g_vwsPsGuide, sizeof(g_vwsPsGuide), nullptr, &g_psGuide);
+
+    if (SUCCEEDED(hr))
+        hr = g_device->CreatePixelShader(g_vwsPsSharpen, sizeof(g_vwsPsSharpen), nullptr, &g_psSharpen);
+
+    if (SUCCEEDED(hr))
+        hr = g_device->CreatePixelShader(g_vwsPsPass, sizeof(g_vwsPsPass), nullptr, &g_psPass);
+
+    if (SUCCEEDED(hr))
+        hr = g_device->CreatePixelShader(g_vwsPsMatte, sizeof(g_vwsPsMatte), nullptr, &g_psMatte);
+
+    // Which adapter this is: the overlay's own device has to be on the same one to share a texture.
+    if (SUCCEEDED(hr))
+    {
+        IDXGIDevice* dxgi = nullptr;
+        IDXGIAdapter* adapter = nullptr;
+        DXGI_ADAPTER_DESC ad {};
+
+        if (SUCCEEDED(g_device->QueryInterface(__uuidof(IDXGIDevice), (void**) &dxgi)) && SUCCEEDED(dxgi->GetAdapter(&adapter)) &&
+            SUCCEEDED(adapter->GetDesc(&ad)))
+        {
+            AcquireSRWLockExclusive(&g_camLock);
+            g_gameAdapter = ad.AdapterLuid;
+            g_gameAdapterKnown = true;
+            ReleaseSRWLockExclusive(&g_camLock);
+        }
+
+        SafeRelease(adapter);
+        SafeRelease(dxgi);
+    }
+
+    if (SUCCEEDED(hr))
+    {
+        D3D11_BUFFER_DESC bd {};
+        bd.ByteWidth = sizeof(PassParams);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = g_device->CreateBuffer(&bd, nullptr, &g_cbPass);
+    }
 
     if (SUCCEEDED(hr))
     {
@@ -936,8 +1113,1459 @@ void DrawPass(Set& set, Pass pass, const VwsCmd& cmd)
         set.status.downsamples++;
 }
 
+// A rigid transform, rows of a 3x4.
+struct Rigid
+{
+    double m[12];
+};
+
+Rigid FromFloats(const float* f)
+{
+    Rigid r;
+
+    for (int i = 0; i < 12; ++i)
+        r.m[i] = f[i];
+
+    return r;
+}
+
+Rigid Inverse(const Rigid& a)
+{
+    Rigid r;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = 0; j < 3; ++j)
+            r.m[i * 4 + j] = a.m[j * 4 + i];
+
+        r.m[i * 4 + 3] = -(a.m[0 * 4 + i] * a.m[3] + a.m[1 * 4 + i] * a.m[7] + a.m[2 * 4 + i] * a.m[11]);
+    }
+
+    return r;
+}
+
+Rigid Mul(const Rigid& a, const Rigid& b)
+{
+    Rigid r;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = 0; j < 4; ++j)
+        {
+            r.m[i * 4 + j] = a.m[i * 4 + 0] * b.m[0 * 4 + j] + a.m[i * 4 + 1] * b.m[1 * 4 + j] + a.m[i * 4 + 2] * b.m[2 * 4 + j] +
+                             (j == 3 ? a.m[i * 4 + 3] : 0.0);
+        }
+    }
+
+    return r;
+}
+
+Rigid HeadAt(const float* framePose, const float* cfg);
+double Seconds();
+
+// ---- the room as a SteamVR overlay -------------------------------------------------------------
+//
+// Drawn into the game's frame, the room moves at the game's frame rate. As an overlay it does not:
+// the camera's thread has a device of its own, and for every camera frame draws the room onto a
+// stereo quad that is stood in the world where the head was when the frame was taken. SteamVR then
+// shows that quad from wherever the head is now, at the headset's own rate. Where the quad is
+// opaque is the game's doing: each frame it writes a matte (white where its picture is the key
+// colour) into a texture both devices can open, with the head's pose that frame was rendered at.
+struct OverlayParams
+{
+    float quad[4];    // half-width, half-height, distance of the quad; distance the room is taken to be at
+    float lens[4];    // fisheye pixels per radian, gain, lens width, view
+    float k[4];
+    float centre[4];
+    float cam[4];     // camera frame width, height, matte usable, half the distance between the eyes
+    float tangents[2][4];
+    float camRows[2][3][4]; // the head's space -> each camera's
+    float rot[3][4];  // the head at the camera frame's moment, in the room (rotation); [0][3] = it is known
+    float out[4];     // texture width, height, 1/width, 1/height
+    float matte[4];   // how much of the matte texture's height is matte; the row its pose is in
+};
+
+struct VrTexture
+{
+    void* handle;
+    int type;
+    int colorSpace;
+};
+
+struct OverlayRig
+{
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11PixelShader* ps = nullptr;
+    ID3D11Buffer* cb = nullptr;
+    ID3D11SamplerState* sampler = nullptr;
+    ID3D11RasterizerState* raster = nullptr;
+    ID3D11Texture2D* cam = nullptr;
+    ID3D11ShaderResourceView* camSrv = nullptr;
+    uint32_t camW = 0, camH = 0;
+    ID3D11Texture2D* matte = nullptr;
+    ID3D11ShaderResourceView* matteSrv = nullptr;
+    uint32_t matteSerial = 0xFFFFFFFFu;
+    // Two of everything SteamVR sees. A picture and the place it belongs to cannot be handed over
+    // in one step, and a picture shown for even one refresh at the next picture's place jumps by
+    // however far the head turned in between. So the overlay that is showing is never touched:
+    // the hidden one is given its picture and its place, and then the two change over.
+    ID3D11Texture2D* out[2] = {};
+    ID3D11RenderTargetView* outRtv[2] = {};
+    uint32_t outW = 0, outH = 0;
+    ID3D11Query* done = nullptr;
+    void** vr = nullptr;
+    bool vrAsked = false;
+    uint64_t overlay[2] = {};
+    int front = -1; // which of the two is showing
+    float width[2] = {};
+    bool failed = false;
+    int lost = 0;
+};
+
+template <typename F> F VrFn(void** table, int slot)
+{
+    return (F) table[slot];
+}
+
+void OverlayHide(OverlayRig& r)
+{
+    if (r.vr != nullptr && r.front >= 0)
+    {
+        for (int i = 0; i < 2; ++i)
+        {
+            if (r.overlay[i] != 0)
+                VrFn<int(__stdcall*)(uint64_t)>(r.vr, 44)(r.overlay[i]);
+        }
+    }
+
+    r.front = -1;
+}
+
+void OverlayClose(OverlayRig& r)
+{
+    OverlayHide(r);
+
+    for (int i = 0; i < 2; ++i)
+    {
+        if (r.vr != nullptr && r.overlay[i] != 0)
+            VrFn<int(__stdcall*)(uint64_t)>(r.vr, 3)(r.overlay[i]);
+
+        r.overlay[i] = 0;
+        SafeRelease(r.outRtv[i]);
+        SafeRelease(r.out[i]);
+    }
+
+    SafeRelease(r.done);
+    SafeRelease(r.matteSrv);
+    SafeRelease(r.matte);
+    SafeRelease(r.camSrv);
+    SafeRelease(r.cam);
+    SafeRelease(r.raster);
+    SafeRelease(r.sampler);
+    SafeRelease(r.cb);
+    SafeRelease(r.ps);
+    SafeRelease(r.vs);
+    SafeRelease(r.ctx);
+    SafeRelease(r.dev);
+    InterlockedExchange(&g_ovState, 0);
+}
+
+// The overlay's device has stopped answering: say why, let go of everything made on it, and have
+// the next camera frame make another. The overlays themselves are SteamVR's and stay.
+void OverlayLost(OverlayRig& r, HRESULT hr, const char* where)
+{
+    const HRESULT reason = r.dev != nullptr ? r.dev->GetDeviceRemovedReason() : S_OK;
+    Log("passthrough overlay: its device failed at %s (hr=0x%08X, removed for 0x%08X) -- %s", where, (unsigned) hr, (unsigned) reason,
+        r.lost < 5 ? "making another" : "giving up");
+
+    for (int i = 0; i < 2; ++i)
+    {
+        SafeRelease(r.outRtv[i]);
+        SafeRelease(r.out[i]);
+    }
+
+    SafeRelease(r.done);
+    SafeRelease(r.matteSrv);
+    SafeRelease(r.matte);
+    SafeRelease(r.camSrv);
+    SafeRelease(r.cam);
+    SafeRelease(r.raster);
+    SafeRelease(r.sampler);
+    SafeRelease(r.cb);
+    SafeRelease(r.ps);
+    SafeRelease(r.vs);
+    SafeRelease(r.ctx);
+    SafeRelease(r.dev);
+    r.camW = r.camH = r.outW = r.outH = 0;
+    r.matteSerial = 0xFFFFFFFFu;
+    r.failed = ++r.lost > 5;
+    InterlockedExchange(&g_ovError, (LONG) (reason != S_OK ? reason : hr));
+    InterlockedExchange(&g_ovState, 2);
+}
+
+bool OverlayDevice(OverlayRig& r, const LUID& luid)
+{
+    if (r.dev != nullptr)
+        return true;
+
+    if (r.failed)
+        return false;
+
+    IDXGIFactory1* factory = nullptr;
+    IDXGIAdapter1* adapter = nullptr;
+    HRESULT hr = CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**) &factory);
+
+    for (UINT i = 0; SUCCEEDED(hr) && factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i)
+    {
+        DXGI_ADAPTER_DESC1 ad {};
+        adapter->GetDesc1(&ad);
+
+        if (ad.AdapterLuid.LowPart == luid.LowPart && ad.AdapterLuid.HighPart == luid.HighPart)
+            break;
+
+        SafeRelease(adapter);
+    }
+
+    if (adapter == nullptr)
+        hr = E_FAIL;
+
+    const D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+
+    if (SUCCEEDED(hr))
+        hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, &level, 1, D3D11_SDK_VERSION, &r.dev, nullptr, &r.ctx);
+
+    SafeRelease(adapter);
+    SafeRelease(factory);
+
+    if (SUCCEEDED(hr))
+        hr = r.dev->CreateVertexShader(g_vwsVsOverlay, sizeof(g_vwsVsOverlay), nullptr, &r.vs);
+
+    if (SUCCEEDED(hr))
+        hr = r.dev->CreatePixelShader(g_vwsPsOverlay, sizeof(g_vwsPsOverlay), nullptr, &r.ps);
+
+    if (SUCCEEDED(hr))
+    {
+        D3D11_BUFFER_DESC bd {};
+        bd.ByteWidth = sizeof(OverlayParams);
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = r.dev->CreateBuffer(&bd, nullptr, &r.cb);
+    }
+
+    if (SUCCEEDED(hr))
+    {
+        D3D11_SAMPLER_DESC sd {};
+        sd.Filter = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+        sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+        sd.MaxAnisotropy = 1;
+        sd.MaxLOD = D3D11_FLOAT32_MAX;
+        hr = r.dev->CreateSamplerState(&sd, &r.sampler);
+    }
+
+    if (SUCCEEDED(hr))
+    {
+        D3D11_RASTERIZER_DESC rd {};
+        rd.FillMode = D3D11_FILL_SOLID;
+        rd.CullMode = D3D11_CULL_NONE;
+        rd.DepthClipEnable = TRUE;
+        hr = r.dev->CreateRasterizerState(&rd, &r.raster);
+    }
+
+    if (FAILED(hr))
+    {
+        Log("passthrough overlay: no device of its own (hr=0x%08X) -- the overlay is off", (unsigned) hr);
+        r.failed = true;
+        InterlockedExchange(&g_ovState, 2);
+        InterlockedExchange(&g_ovError, (LONG) hr);
+        return false;
+    }
+
+    return true;
+}
+
+// SteamVR's overlay interface, from the game's own openvr_api.dll.
+bool OverlayVr(OverlayRig& r)
+{
+    if (r.overlay[0] != 0 && r.overlay[1] != 0)
+        return true;
+
+    if (r.vrAsked && r.vr == nullptr)
+        return false;
+
+    r.vrAsked = true;
+
+    HMODULE module = GetModuleHandleW(L"openvr_api.dll");
+    typedef void* (*GetInterfaceFn)(const char*, int*);
+    GetInterfaceFn getInterface = module != nullptr ? (GetInterfaceFn) GetProcAddress(module, "VR_GetGenericInterface") : nullptr;
+    int error = 0;
+    r.vr = getInterface != nullptr ? (void**) getInterface("FnTable:IVROverlay_028", &error) : nullptr;
+
+    if (r.vr == nullptr)
+    {
+        InterlockedExchange(&g_ovState, 3);
+        return false;
+    }
+
+    typedef int(__stdcall* KeyFn)(char*, uint64_t*);
+    typedef int(__stdcall* CreateFn)(char*, char*, uint64_t*);
+
+    for (int i = 0; i < 2; ++i)
+    {
+        char key[64], name[64];
+        snprintf(key, sizeof(key), "jeahbwoi720.vamdlss.passthrough.%d", i);
+        snprintf(name, sizeof(name), "VaM DLSS passthrough %d", i);
+
+        // One left over from a session that did not end tidily is taken up again.
+        if (VrFn<KeyFn>(r.vr, 0)(key, &r.overlay[i]) != 0 || r.overlay[i] == 0)
+        {
+            const int e = VrFn<CreateFn>(r.vr, 1)(key, name, &r.overlay[i]);
+
+            if (e != 0 || r.overlay[i] == 0)
+            {
+                Log("passthrough overlay: SteamVR would not make the overlay (error %d)", e);
+                r.overlay[i] = 0;
+                r.vr = nullptr;
+                InterlockedExchange(&g_ovState, 4);
+                InterlockedExchange(&g_ovError, e);
+                return false;
+            }
+        }
+
+        VrFn<int(__stdcall*)(uint64_t, int, bool)>(r.vr, 11)(r.overlay[i], 1024, true); // side by side, left eye's picture first
+        VrFn<int(__stdcall*)(uint64_t, float)>(r.vr, 16)(r.overlay[i], 1.0f);
+        VrFn<int(__stdcall*)(uint64_t)>(r.vr, 44)(r.overlay[i]);
+        r.width[i] = 0.0f;
+    }
+
+    r.front = -1;
+    return true;
+}
+
+// One camera frame onto the overlay. `header` is SteamVR's, with the head's pose at the frame's moment.
+void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, double* waited)
+{
+    float cfg[kCamFloats];
+    float gamePose[12];
+    bool configured, luidKnown, gamePoseValid;
+    LUID luid;
+    HANDLE matteHandle;
+    uint32_t matteSerial, w, h;
+
+    AcquireSRWLockExclusive(&g_camLock);
+    configured = g_camConfigured;
+    memcpy(cfg, g_camConfig, sizeof(cfg));
+    luid = g_gameAdapter;
+    luidKnown = g_gameAdapterKnown;
+    matteHandle = g_matteHandle;
+    matteSerial = g_matteSerial;
+    memcpy(gamePose, g_gamePose, sizeof(gamePose));
+    gamePoseValid = g_gamePoseValid;
+    w = g_camW;
+    h = g_camH;
+    ReleaseSRWLockExclusive(&g_camLock);
+
+    if (!configured || cfg[kCfgMode] < 0.5f)
+    {
+        OverlayHide(r);
+        InterlockedExchange(&g_ovState, 0);
+        return;
+    }
+
+    if (!luidKnown)
+    {
+        InterlockedExchange(&g_ovState, 1);
+        return;
+    }
+
+    if (!OverlayDevice(r, luid))
+        return;
+
+    HRESULT hr = S_OK;
+
+    if (r.cam == nullptr || r.camW != w || r.camH != h)
+    {
+        SafeRelease(r.camSrv);
+        SafeRelease(r.cam);
+
+        D3D11_TEXTURE2D_DESC td {};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DYNAMIC;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = r.dev->CreateTexture2D(&td, nullptr, &r.cam);
+
+        if (SUCCEEDED(hr))
+            hr = r.dev->CreateShaderResourceView(r.cam, nullptr, &r.camSrv);
+
+        r.camW = w;
+        r.camH = h;
+    }
+
+    // The quad's picture: one square per eye, side by side -- or, where SteamVR shapes the quad by
+    // the whole texture, two half-width ones in a square.
+    const bool wholeTexture = cfg[kCfgStereoRule] > 0.5f;
+    const uint32_t outH = 1536, outW = wholeTexture ? 1536u : 3072u;
+
+    for (int i = 0; i < 2; ++i)
+    {
+        if (FAILED(hr) || (r.out[i] != nullptr && r.outW == outW && r.outH == outH))
+            continue;
+
+        SafeRelease(r.outRtv[i]);
+        SafeRelease(r.out[i]);
+
+        D3D11_TEXTURE2D_DESC td {};
+        td.Width = outW;
+        td.Height = outH;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+        hr = r.dev->CreateTexture2D(&td, nullptr, &r.out[i]);
+
+        if (SUCCEEDED(hr))
+            hr = r.dev->CreateRenderTargetView(r.out[i], nullptr, &r.outRtv[i]);
+    }
+
+    r.outW = outW;
+    r.outH = outH;
+
+    if (SUCCEEDED(hr) && r.done == nullptr)
+    {
+        D3D11_QUERY_DESC qd {};
+        qd.Query = D3D11_QUERY_EVENT;
+        hr = r.dev->CreateQuery(&qd, &r.done);
+    }
+
+    // The one that is not showing.
+    const int next = r.front == 0 ? 1 : 0;
+
+    if (FAILED(hr))
+    {
+        OverlayLost(r, hr, "making its textures");
+        return;
+    }
+
+    // The game's matte, whenever the game has made a new texture for it.
+    if (r.matteSerial != matteSerial)
+    {
+        SafeRelease(r.matteSrv);
+        SafeRelease(r.matte);
+        r.matteSerial = matteSerial;
+
+        if (matteHandle != nullptr && SUCCEEDED(r.dev->OpenSharedResource(matteHandle, __uuidof(ID3D11Texture2D), (void**) &r.matte)))
+            r.dev->CreateShaderResourceView(r.matte, nullptr, &r.matteSrv);
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped {};
+    hr = r.ctx->Map(r.cam, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+
+    if (FAILED(hr))
+    {
+        OverlayLost(r, hr, "taking the camera's frame");
+        return;
+    }
+
+    for (uint32_t y = 0; y < h; ++y)
+        memcpy((uint8_t*) mapped.pData + (size_t) y * mapped.RowPitch, grey + (size_t) y * w, w);
+
+    r.ctx->Unmap(r.cam, 0);
+
+    float framePose[12], headThen[12];
+    memcpy(framePose, header + 20, sizeof(framePose));
+    const bool headThenValid = header[96] != 0;
+    const Rigid head = HeadAt(framePose, cfg);
+
+    for (int i = 0; i < 12; ++i)
+        headThen[i] = (float) head.m[i];
+
+    OverlayParams op {};
+    const float distance = cfg[kCfgQuadDistance] > 0.1f ? cfg[kCfgQuadDistance] : 2.0f;
+    const float reach = (cfg[kCfgQuadTan] > 0.1f ? cfg[kCfgQuadTan] : 2.2f) * distance;
+    op.quad[0] = reach;
+    op.quad[1] = reach;
+    op.quad[2] = distance;
+    op.quad[3] = cfg[kCfgDistance];
+    op.lens[0] = cfg[kCfgFocal];
+    op.lens[1] = cfg[kCfgGain];
+    op.lens[2] = (float) (w / 2);
+    op.lens[3] = cfg[kCfgView];
+    memcpy(op.k, cfg + kCfgK, sizeof(op.k));
+    memcpy(op.centre, cfg + kCfgCentre, sizeof(op.centre));
+    op.cam[0] = (float) w;
+    op.cam[1] = (float) h;
+    op.cam[2] = (r.matteSrv != nullptr && g_matteFrames > 0) ? 1.0f : 0.0f;
+    op.cam[3] = cfg[kCfgEyeToHead + 12 + 3]; // the right eye's x in the head
+    memcpy(op.tangents, cfg + kCfgTan, sizeof(op.tangents));
+
+    for (int lens = 0; lens < 2; ++lens)
+    {
+        const Rigid headToCam = Inverse(FromFloats(cfg + kCfgCamToHead + lens * 12));
+
+        for (int i = 0; i < 12; ++i)
+            op.camRows[lens][i / 4][i % 4] = (float) headToCam.m[i];
+    }
+
+    // How the head stood at the camera frame's moment. The head the game's frame was drawn from
+    // comes with the matte (see PSMatte), and the shader sets the one against the other: only how
+    // the head has turned between the two, as SteamVR, too, carries the game's picture to the
+    // head's new place by turning it.
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            op.rot[i][j] = headThen[i * 4 + j];
+
+    op.rot[0][3] = headThenValid ? 1.0f : 0.0f;
+    op.matte[0] = (float) kMatteH / (float) kMatteTexH;
+    op.matte[1] = (float) kMattePoseRow;
+
+    SetSize(op.out, outW, outH);
+
+    hr = r.ctx->Map(r.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+
+    if (FAILED(hr))
+    {
+        OverlayLost(r, hr, "setting up the draw");
+        return;
+    }
+
+    memcpy(mapped.pData, &op, sizeof(op));
+    r.ctx->Unmap(r.cb, 0);
+
+    ID3D11DeviceContext* c = r.ctx;
+    ID3D11ShaderResourceView* none[3] {};
+    c->PSSetShaderResources(0, 3, none);
+    c->OMSetRenderTargets(1, &r.outRtv[next], nullptr);
+
+    D3D11_VIEWPORT vp {};
+    vp.Width = (float) outW;
+    vp.Height = (float) outH;
+    vp.MaxDepth = 1.0f;
+    c->RSSetViewports(1, &vp);
+    c->RSSetState(r.raster);
+    c->IASetInputLayout(nullptr);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->VSSetShader(r.vs, nullptr, 0);
+    c->PSSetShader(r.ps, nullptr, 0);
+    c->PSSetConstantBuffers(1, 1, &r.cb);
+    c->VSSetConstantBuffers(1, 1, &r.cb);
+    c->PSSetSamplers(0, 1, &r.sampler);
+
+    ID3D11ShaderResourceView* inputs[3] = { nullptr, r.camSrv, r.matteSrv };
+    c->PSSetShaderResources(0, 3, inputs);
+    c->VSSetShaderResources(0, 3, inputs);
+    c->Draw(3, 0);
+    c->PSSetShaderResources(0, 3, none);
+    c->VSSetShaderResources(0, 3, none);
+    ID3D11RenderTargetView* noTarget = nullptr;
+    c->OMSetRenderTargets(1, &noTarget, nullptr);
+    c->Flush();
+
+    hr = r.dev->GetDeviceRemovedReason();
+
+    if (hr != S_OK)
+    {
+        OverlayLost(r, hr, "drawing");
+        return;
+    }
+
+    InterlockedIncrement(&g_ovFrames);
+
+    // For the offline checks: the picture as bytes.
+    if (InterlockedCompareExchange(&g_ovDebugWant, 0, 1) == 1)
+    {
+        D3D11_TEXTURE2D_DESC sd {};
+        r.out[next]->GetDesc(&sd);
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.MiscFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Texture2D* staging = nullptr;
+
+        if (SUCCEEDED(r.dev->CreateTexture2D(&sd, nullptr, &staging)))
+        {
+            c->CopyResource(staging, r.out[next]);
+
+            if (SUCCEEDED(c->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)))
+            {
+                uint8_t* copy = new uint8_t[(size_t) outW * outH * 4];
+
+                for (uint32_t y = 0; y < outH; ++y)
+                    memcpy(copy + (size_t) y * outW * 4, (const uint8_t*) mapped.pData + (size_t) y * mapped.RowPitch, (size_t) outW * 4);
+
+                c->Unmap(staging, 0);
+
+                AcquireSRWLockExclusive(&g_camLock);
+                delete[] g_ovDebug;
+                g_ovDebug = copy;
+                g_ovDebugW = outW;
+                g_ovDebugH = outH;
+                ReleaseSRWLockExclusive(&g_camLock);
+            }
+
+            staging->Release();
+        }
+    }
+
+    if (!OverlayVr(r))
+        return;
+
+    // Without the head's pose at this frame's moment there is nowhere to stand it: the one that
+    // is showing stays.
+    if (!headThenValid)
+        return;
+
+    const uint64_t overlay = r.overlay[next];
+    const float width = reach * 2.0f;
+
+    if (width != r.width[next])
+    {
+        VrFn<int(__stdcall*)(uint64_t, float)>(r.vr, 22)(overlay, width);
+        r.width[next] = width;
+    }
+
+    // The quad stands where the head was when the camera took this frame, facing it.
+    float place[12];
+    memcpy(place, headThen, sizeof(place));
+
+    for (int i = 0; i < 3; ++i)
+        place[i * 4 + 3] = headThen[i * 4 + 3] - distance * headThen[i * 4 + 2];
+
+    VrFn<int(__stdcall*)(uint64_t, int, float*)>(r.vr, 33)(overlay, (int) cfg[kCfgSpace], place);
+
+    VrTexture texture { r.out[next], 0, 1 };
+    const int e = VrFn<int(__stdcall*)(uint64_t, VrTexture*)>(r.vr, 60)(overlay, &texture);
+
+    if (e != 0)
+    {
+        InterlockedExchange(&g_ovError, e);
+        InterlockedExchange(&g_ovState, 4);
+        return;
+    }
+
+    // SteamVR takes its copy of the picture through this device. Wait until the card has really
+    // done it -- it is busy with the game -- before letting the picture be seen.
+    if (r.done != nullptr)
+    {
+        const double start = Seconds();
+        c->End(r.done);
+        c->Flush();
+        BOOL finished = FALSE;
+
+        for (int i = 0; i < 100 && c->GetData(r.done, &finished, sizeof(finished), 0) != S_OK; ++i)
+            Sleep(1);
+
+        if (waited != nullptr)
+            *waited = Seconds() - start;
+    }
+
+    VrFn<int(__stdcall*)(uint64_t)>(r.vr, 43)(overlay);
+
+    if (r.front >= 0 && r.front != next)
+        VrFn<int(__stdcall*)(uint64_t)>(r.vr, 44)(r.overlay[r.front]);
+
+    r.front = next;
+    InterlockedExchange(&g_ovState, 5);
+}
+
+// The head in the room at a camera frame's moment, from the pose the frame came with. SteamVR's
+// header calls that pose the tracked device's; a PlayStation VR2's driver puts the first camera's
+// there instead -- thirty degrees down and eight centimetres forward of the head.
+Rigid HeadAt(const float* framePose, const float* cfg)
+{
+    const Rigid given = FromFloats(framePose);
+    return cfg[kCfgPoseIsCamera] > 0.5f ? Mul(given, Inverse(FromFloats(cfg + kCfgCamToHead))) : given;
+}
+
+// SteamVR's call, kept from taking the game down with it if the runtime goes away mid-call.
+int CamCall(void* buffer, uint32_t size, void* header)
+{
+    __try
+    {
+        return g_camFn(g_camHandle, 0, buffer, size, header, 112);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return -1;
+    }
+}
+
+// The angle between two poses' rotations, degrees.
+float TurnBetween(const float* a, const float* b)
+{
+    float trace = 0.0f;
+
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            trace += a[i * 4 + j] * b[i * 4 + j];
+
+    float c = (trace - 1.0f) * 0.5f;
+    c = c > 1.0f ? 1.0f : (c < -1.0f ? -1.0f : c);
+    return acosf(c) * 57.29578f;
+}
+
+double Seconds()
+{
+    LARGE_INTEGER f, t;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return (double) t.QuadPart / (double) f.QuadPart;
+}
+
+DWORD WINAPI CamThread(void* param)
+{
+    const LONG mine = (LONG) (intptr_t) param;
+    const uint32_t pixels = g_camW * g_camH;
+    uint8_t* rgba = new uint8_t[(size_t) pixels * 4];
+    uint8_t* grey = new uint8_t[pixels];
+    uint8_t header[128];
+    uint32_t last = 0xFFFFFFFFu;
+    OverlayRig rig;
+
+    // What the thread did, said once every couple of seconds: there is no looking into a headset
+    // from outside, and this is how a stall or a wrong pose shows.
+    float peek[12] {}, lastPose[12] {};
+    bool haveLast = false;
+    uint32_t frames = 0, skipped = 0;
+    float peekMax = 0.0f, moveSum = 0.0f, moveMax = 0.0f;
+    double tickSum = 0.0, tickMax = 0.0, waitSum = 0.0, waitMax = 0.0, fetchSum = 0.0, fetchMax = 0.0;
+    double since = Seconds(), gapMax = 0.0, lastFrameAt = since;
+    uint64_t lastExposure = 0;
+    int64_t exposureMin = 0, exposureMax = 0;
+    const LONG picturesAtStart = g_ovFrames;
+    LONG picturesBefore = picturesAtStart;
+
+    while (g_camGen == mine)
+    {
+        // The header alone first: it says whether there is a frame we have not had.
+        memset(header, 0, sizeof(header));
+        int e = CamCall(nullptr, 0, header);
+        uint32_t sequence = 0;
+        memcpy(&sequence, header + 16, 4);
+
+        if (e == 0 && sequence != last)
+        {
+            memcpy(peek, header + 20, sizeof(peek));
+            const double fetchStart = Seconds();
+            e = CamCall(rgba, pixels * 4, header);
+
+            if (e == 0)
+            {
+                uint32_t bytes = 0;
+                uint32_t got = 0;
+                memcpy(&got, header + 16, 4);
+                memcpy(&bytes, header + 12, 4);
+
+                if (last != 0xFFFFFFFFu && got - last > 1 && got - last < 1000)
+                    skipped += got - last - 1;
+
+                sequence = got;
+                last = sequence;
+
+                const double fetched = Seconds();
+                fetchSum += fetched - fetchStart;
+                fetchMax = fetched - fetchStart > fetchMax ? fetched - fetchStart : fetchMax;
+                gapMax = fetched - lastFrameAt > gapMax ? fetched - lastFrameAt : gapMax;
+                lastFrameAt = fetched;
+
+                float full[12];
+                memcpy(full, header + 20, sizeof(full));
+                const float peeked = TurnBetween(peek, full);
+                peekMax = peeked > peekMax ? peeked : peekMax;
+
+                if (haveLast)
+                {
+                    const float moved = TurnBetween(lastPose, full);
+                    moveSum += moved;
+                    moveMax = moved > moveMax ? moved : moveMax;
+                }
+
+                memcpy(lastPose, full, sizeof(full));
+                haveLast = true;
+
+                uint64_t exposure = 0;
+                memcpy(&exposure, header + 104, 8);
+
+                if (lastExposure != 0)
+                {
+                    const int64_t step = (int64_t) (exposure - lastExposure);
+                    exposureMin = (frames == 0 || step < exposureMin) ? step : exposureMin;
+                    exposureMax = (frames == 0 || step > exposureMax) ? step : exposureMax;
+                }
+
+                lastExposure = exposure;
+
+                // The cameras are monochrome: one channel says it all.
+                if (bytes == 4)
+                {
+                    for (uint32_t i = 0; i < pixels; ++i)
+                        grey[i] = rgba[(size_t) i * 4];
+                }
+                else
+                {
+                    memcpy(grey, rgba, pixels);
+                }
+
+                double waited = 0.0;
+                const double tickStart = Seconds();
+                OverlayTick(rig, grey, header, &waited);
+                const double ticked = Seconds() - tickStart;
+                tickSum += ticked;
+                tickMax = ticked > tickMax ? ticked : tickMax;
+                waitSum += waited;
+                waitMax = waited > waitMax ? waited : waitMax;
+
+                if (++frames >= 120)
+                {
+                    const double now = Seconds();
+                    const LONG pictures = g_ovFrames;
+                    Log("passthrough thread: %.0f camera frames/s (%u skipped, longest gap %.0f ms), %.0f overlay pictures/s; fetch %.1f/%.1f ms, "
+                        "overlay work %.1f/%.1f ms of which waiting for the card %.1f/%.1f ms (avg/max); head turned %.2f/%.2f deg per frame; "
+                        "pose moved %.3f deg between asking twice; exposure stamp steps %lld..%lld",
+                        frames / (now - since), skipped, gapMax * 1000.0, (pictures - picturesBefore) / (now - since), fetchSum / frames * 1000.0,
+                        fetchMax * 1000.0, tickSum / frames * 1000.0, tickMax * 1000.0, waitSum / frames * 1000.0, waitMax * 1000.0, moveSum / frames,
+                        moveMax, peekMax, (long long) exposureMin, (long long) exposureMax);
+
+                    picturesBefore = pictures;
+                    since = now;
+                    frames = skipped = 0;
+                    peekMax = moveSum = moveMax = 0.0f;
+                    tickSum = tickMax = waitSum = waitMax = fetchSum = fetchMax = gapMax = 0.0;
+                }
+
+                AcquireSRWLockExclusive(&g_camLock);
+                uint8_t* was = g_camFront;
+                g_camFront = grey;
+                grey = was;
+                memcpy(g_camFrontPose, header + 20, sizeof(g_camFrontPose));
+                g_camFrontPoseValid = header[96] != 0;
+                g_camFresh = true;
+                ReleaseSRWLockExclusive(&g_camLock);
+                InterlockedIncrement(&g_camFrames);
+            }
+        }
+
+        if (e != 0)
+            InterlockedExchange(&g_camError, e);
+
+        Sleep(e == 0 ? 2 : 50);
+    }
+
+    OverlayClose(rig);
+    delete[] rgba;
+    delete[] grey;
+    return 0;
+}
+
+// The frame buffers are made once per size and kept: the render thread may be reading one while
+// the stream is being stopped.
+void CamBuffers(uint32_t w, uint32_t h)
+{
+    if (g_camFront != nullptr && g_camW == w && g_camH == h)
+        return;
+
+    g_camFront = new uint8_t[(size_t) w * h]();
+    g_camSpare = new uint8_t[(size_t) w * h]();
+    g_camW = w;
+    g_camH = h;
+    g_camFresh = false;
+}
+
+// Replaces the key colour in a finished frame with the room, as the headset's camera sees it from
+// where the eye is. One eye per command: `eyes` 2 means the texture is double-wide and this eye's
+// half of it is drawn, 1 that the texture is this eye's own.
+void Passthrough(const VwsCmd& cmd)
+{
+    if (cmd.frame == nullptr || cmd.frame == g_passRefused)
+        return;
+
+    float cfg[kCamFloats];
+    float pose[12] {};
+    bool configured = false, poseValid = false;
+    uint8_t* fresh = nullptr;
+    uint32_t w = 0, h = 0;
+
+    AcquireSRWLockExclusive(&g_camLock);
+    configured = g_camConfigured;
+    memcpy(cfg, g_camConfig, sizeof(cfg));
+    w = g_camW;
+    h = g_camH;
+
+    if (g_camFresh && g_camFront != nullptr && g_camSpare != nullptr)
+    {
+        uint8_t* was = g_camSpare;
+        g_camSpare = g_camFront;
+        g_camFront = was;
+        fresh = g_camSpare;
+        memcpy(pose, g_camFrontPose, sizeof(pose));
+        poseValid = g_camFrontPoseValid;
+        g_camFresh = false;
+    }
+
+    ReleaseSRWLockExclusive(&g_camLock);
+
+    if (!configured || w == 0 || h == 0)
+        return;
+
+    ID3D11Device* device = DeviceOf(cmd.frame);
+
+    if (device == nullptr)
+        return;
+
+    HRESULT hr = EnsureDevice(device);
+    device->Release();
+
+    if (FAILED(hr))
+        return;
+
+    ID3D11DeviceContext* c = g_ctx;
+
+    if (g_camTex != nullptr)
+    {
+        D3D11_TEXTURE2D_DESC have {};
+        g_camTex->GetDesc(&have);
+
+        if (have.Width != w || have.Height != h)
+            ReleaseCamera();
+    }
+
+    if (g_camTex == nullptr)
+    {
+        D3D11_TEXTURE2D_DESC td {};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DYNAMIC;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = g_device->CreateTexture2D(&td, nullptr, &g_camTex);
+
+        if (SUCCEEDED(hr))
+            hr = g_device->CreateShaderResourceView(g_camTex, nullptr, &g_camSrv);
+
+        if (FAILED(hr))
+        {
+            Log("passthrough: no texture for the camera's %ux%u frames (hr=0x%08X)", w, h, (unsigned) hr);
+            ReleaseCamera();
+            g_passRefused = cmd.frame;
+            return;
+        }
+    }
+
+    if (fresh != nullptr)
+    {
+        D3D11_MAPPED_SUBRESOURCE mapped {};
+
+        if (SUCCEEDED(c->Map(g_camTex, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        {
+            for (uint32_t y = 0; y < h; ++y)
+                memcpy((uint8_t*) mapped.pData + (size_t) y * mapped.RowPitch, fresh + (size_t) y * w, w);
+
+            c->Unmap(g_camTex, 0);
+            memcpy(g_camPose, pose, sizeof(pose));
+            g_camPoseValid = poseValid;
+            g_camHave = true;
+            InterlockedIncrement(&g_camUploads);
+        }
+    }
+
+    // Until the camera has given a frame the key colour stays as it is.
+    if (!g_camHave)
+        return;
+
+    Surface target;
+
+    if (OpenSurface(target, cmd.frame, (cmd.srgbMask & kFrame) != 0, false, true, "the frame for passthrough", &hr) != ErrNone)
+    {
+        g_passRefused = cmd.frame;
+        return;
+    }
+
+    if (g_scratch.tex == nullptr || g_scratch.desc.Width != target.desc.Width || g_scratch.desc.Height != target.desc.Height ||
+        g_scratch.desc.Format != target.desc.Format)
+    {
+        g_scratch.Release();
+
+        D3D11_TEXTURE2D_DESC td = target.desc;
+        td.MipLevels = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = 0;
+        td.MiscFlags = 0;
+
+        ID3D11Texture2D* copy = nullptr;
+        hr = g_device->CreateTexture2D(&td, nullptr, &copy);
+
+        if (SUCCEEDED(hr))
+        {
+            const int opened = OpenSurface(g_scratch, copy, false, true, false, "the passthrough pass's copy", &hr);
+            copy->Release();
+
+            if (opened != ErrNone)
+                hr = E_FAIL;
+        }
+
+        if (FAILED(hr))
+        {
+            g_scratch.Release();
+            g_passRefused = cmd.frame;
+            target.Release();
+            return;
+        }
+    }
+
+    c->CopySubresourceRegion(g_scratch.tex, 0, 0, 0, 0, target.tex, 0, nullptr);
+
+    const uint32_t eye = cmd.which == 1 ? 1u : 0u;
+    const bool wide = cmd.eyes == 2;
+
+    // The eye's space to the camera's: through the head as it is now, the room, and the head as
+    // it was when the camera took its frame. Without both poses, straight through the head.
+    const Rigid camToHead = FromFloats(cfg + kCfgCamToHead + eye * 12);
+    Rigid eyeToCam;
+
+    if (cmd.moved != 0 && g_camPoseValid && cfg[kCfgCompensate] > 0.5f)
+    {
+        float eyeToRoom[12];
+        memcpy(eyeToRoom, cmd.window, 8 * sizeof(float));
+        memcpy(eyeToRoom + 8, cmd.prev, 4 * sizeof(float));
+        eyeToCam = Mul(Inverse(camToHead), Mul(Inverse(HeadAt(g_camPose, cfg)), FromFloats(eyeToRoom)));
+    }
+    else
+    {
+        eyeToCam = Mul(Inverse(camToHead), FromFloats(cfg + kCfgEyeToHead + eye * 12));
+    }
+
+    PassParams pp {};
+    SetSize(pp.dst, target.desc.Width, target.desc.Height);
+    pp.key[0] = cfg[kCfgKey];
+    pp.key[1] = cfg[kCfgKey + 1];
+    pp.key[2] = cfg[kCfgKey + 2];
+    pp.key[3] = cfg[kCfgTolerance];
+    pp.tune[0] = cfg[kCfgSoftness];
+    pp.tune[1] = cfg[kCfgGain];
+    pp.tune[2] = cfg[kCfgDistance];
+    pp.tune[3] = cfg[kCfgFocal];
+    memcpy(pp.k, cfg + kCfgK, sizeof(pp.k));
+    memcpy(pp.centre, cfg + kCfgCentre, sizeof(pp.centre));
+    pp.cam[0] = (float) w;
+    pp.cam[1] = (float) h;
+    pp.cam[2] = (float) (w / 2);
+    pp.cam[3] = cfg[kCfgView] + (cfg[kCfgMode] > 0.5f ? 8.0f : 0.0f); // +8: say in the frame's alpha where the room is
+    memcpy(pp.tangents, cfg + kCfgTan + eye * 4, sizeof(pp.tangents));
+
+    for (int j = 0; j < 4; ++j)
+    {
+        pp.row0[j] = (float) eyeToCam.m[j];
+        pp.row1[j] = (float) eyeToCam.m[4 + j];
+        pp.row2[j] = (float) eyeToCam.m[8 + j];
+    }
+
+    pp.misc[0] = (float) eye;
+    pp.misc[1] = wide ? 2.0f : 1.0f;
+    pp.misc[2] = target.Encoded() ? 1.0f : 0.0f;
+    pp.misc[3] = cmd.topDown != 0 ? 1.0f : 0.0f;
+
+    D3D11_MAPPED_SUBRESOURCE mapped {};
+    hr = c->Map(g_cbPass, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+
+    if (FAILED(hr))
+    {
+        target.Release();
+        return;
+    }
+
+    memcpy(mapped.pData, &pp, sizeof(pp));
+    c->Unmap(g_cbPass, 0);
+
+    StateBackup backup;
+    backup.Capture(c);
+
+    ID3D11Buffer* second = nullptr;
+    c->PSGetConstantBuffers(1, 1, &second);
+
+    ID3D11ShaderResourceView* none[3] {};
+    c->PSSetShaderResources(0, 3, none);
+    c->OMSetRenderTargets(1, &target.rtv, nullptr);
+
+    D3D11_VIEWPORT vp {};
+    vp.Width = wide ? (float) (target.desc.Width / 2) : (float) target.desc.Width;
+    vp.Height = (float) target.desc.Height;
+    vp.TopLeftX = wide ? (float) (eye * (target.desc.Width / 2)) : 0.0f;
+    vp.MaxDepth = 1.0f;
+    c->RSSetViewports(1, &vp);
+    c->RSSetState(g_raster);
+    c->OMSetBlendState(g_blend, nullptr, 0xFFFFFFFF);
+    c->OMSetDepthStencilState(g_depth, 0);
+
+    c->IASetInputLayout(nullptr);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->VSSetShader(g_vs, nullptr, 0);
+    c->HSSetShader(nullptr, nullptr, 0);
+    c->DSSetShader(nullptr, nullptr, 0);
+    c->GSSetShader(nullptr, nullptr, 0);
+    c->PSSetShader(g_psPass, nullptr, 0);
+    c->PSSetConstantBuffers(1, 1, &g_cbPass);
+    c->PSSetSamplers(0, 1, &g_sampler);
+
+    ID3D11ShaderResourceView* inputs[3] = { g_scratch.srv, g_camSrv, nullptr };
+    c->PSSetShaderResources(0, 3, inputs);
+
+    c->Draw(3, 0);
+
+    c->PSSetConstantBuffers(1, 1, &second);
+    SafeRelease(second);
+    backup.Restore(c);
+    target.Release();
+}
+
+// One eye of the game's matte for the overlay: white where the finished frame is the key colour.
+// The matte is one texture for both eyes, first row at the top, opened by the overlay's device.
+void Matte(const VwsCmd& cmd)
+{
+    if (cmd.frame == nullptr || cmd.frame == g_matteRefused)
+        return;
+
+    float cfg[kCamFloats];
+    bool configured = false;
+
+    AcquireSRWLockExclusive(&g_camLock);
+    configured = g_camConfigured;
+    memcpy(cfg, g_camConfig, sizeof(cfg));
+    ReleaseSRWLockExclusive(&g_camLock);
+
+    if (!configured)
+        return;
+
+    ID3D11Device* device = DeviceOf(cmd.frame);
+
+    if (device == nullptr)
+        return;
+
+    HRESULT hr = EnsureDevice(device);
+    device->Release();
+
+    if (FAILED(hr))
+        return;
+
+    ID3D11DeviceContext* c = g_ctx;
+
+    if (g_matteTex == nullptr)
+    {
+        D3D11_TEXTURE2D_DESC td {};
+        td.Width = kMatteW;
+        td.Height = kMatteTexH;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+        hr = g_device->CreateTexture2D(&td, nullptr, &g_matteTex);
+
+        if (SUCCEEDED(hr))
+            hr = g_device->CreateRenderTargetView(g_matteTex, nullptr, &g_matteRtv);
+
+        IDXGIResource* resource = nullptr;
+        HANDLE shared = nullptr;
+
+        if (SUCCEEDED(hr))
+            hr = g_matteTex->QueryInterface(__uuidof(IDXGIResource), (void**) &resource);
+
+        if (SUCCEEDED(hr))
+            hr = resource->GetSharedHandle(&shared);
+
+        SafeRelease(resource);
+
+        if (FAILED(hr) || shared == nullptr)
+        {
+            Log("passthrough overlay: no texture to share the matte through (hr=0x%08X)", (unsigned) hr);
+            SafeRelease(g_matteRtv);
+            SafeRelease(g_matteTex);
+            g_matteRefused = cmd.frame;
+            return;
+        }
+
+        const float clear[4] = { 0, 0, 0, 0 };
+        c->ClearRenderTargetView(g_matteRtv, clear);
+
+        AcquireSRWLockExclusive(&g_camLock);
+        g_matteHandle = shared;
+        g_matteSerial++;
+        ReleaseSRWLockExclusive(&g_camLock);
+    }
+
+    Surface source;
+
+    if (OpenSurface(source, cmd.frame, (cmd.srgbMask & kFrame) != 0, true, false, "the frame for the matte", &hr) != ErrNone)
+    {
+        g_matteRefused = cmd.frame;
+        return;
+    }
+
+    const uint32_t eye = cmd.which == 1 ? 1u : 0u;
+
+    PassParams pp {};
+    SetSize(pp.dst, kMatteW, kMatteH);
+    pp.key[0] = cfg[kCfgKey];
+    pp.key[1] = cfg[kCfgKey + 1];
+    pp.key[2] = cfg[kCfgKey + 2];
+    pp.key[3] = cfg[kCfgTolerance];
+    pp.tune[0] = cfg[kCfgSoftness];
+    pp.cam[3] = cmd.strength > 0.5f ? 1.0f : 0.0f; // 1: the frame's alpha already says where the room is
+    pp.misc[0] = (float) eye;
+    pp.misc[1] = cmd.eyes == 2 ? 2.0f : 1.0f;
+    pp.misc[2] = source.Encoded() ? 1.0f : 0.0f;
+    pp.misc[3] = cmd.topDown != 0 ? 1.0f : 0.0f;
+
+    D3D11_MAPPED_SUBRESOURCE mapped {};
+    hr = c->Map(g_cbPass, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+
+    if (FAILED(hr))
+    {
+        source.Release();
+        return;
+    }
+
+    memcpy(mapped.pData, &pp, sizeof(pp));
+    c->Unmap(g_cbPass, 0);
+
+    StateBackup backup;
+    backup.Capture(c);
+
+    ID3D11Buffer* second = nullptr;
+    c->PSGetConstantBuffers(1, 1, &second);
+
+    ID3D11ShaderResourceView* none[3] {};
+    c->PSSetShaderResources(0, 3, none);
+    c->OMSetRenderTargets(1, &g_matteRtv, nullptr);
+
+    D3D11_VIEWPORT vp {};
+    vp.Width = (float) (kMatteW / 2);
+    vp.Height = (float) kMatteH;
+    vp.TopLeftX = (float) (eye * (kMatteW / 2));
+    vp.MaxDepth = 1.0f;
+    c->RSSetViewports(1, &vp);
+    c->RSSetState(g_raster);
+    c->OMSetBlendState(g_blend, nullptr, 0xFFFFFFFF);
+    c->OMSetDepthStencilState(g_depth, 0);
+
+    c->IASetInputLayout(nullptr);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->VSSetShader(g_vs, nullptr, 0);
+    c->HSSetShader(nullptr, nullptr, 0);
+    c->DSSetShader(nullptr, nullptr, 0);
+    c->GSSetShader(nullptr, nullptr, 0);
+    c->PSSetShader(g_psMatte, nullptr, 0);
+    c->PSSetConstantBuffers(1, 1, &g_cbPass);
+    c->PSSetSamplers(0, 1, &g_sampler);
+
+    ID3D11ShaderResourceView* inputs[3] = { source.srv, nullptr, nullptr };
+    c->PSSetShaderResources(0, 3, inputs);
+
+    c->Draw(3, 0);
+
+    // With the second eye the matte is whole. The pose it belongs to goes into the row below it,
+    // in the same breath: the card will finish both together, whenever it gets to them.
+    if (eye == 1)
+    {
+        pp.cam[3] = 2.0f;
+        pp.misc[0] = cmd.moved != 0 ? 1.0f : 0.0f;
+
+        if (cmd.moved != 0)
+        {
+            memcpy(pp.row0, cmd.window, 4 * sizeof(float));
+            memcpy(pp.row1, cmd.window + 4, 4 * sizeof(float));
+            memcpy(pp.row2, cmd.prev, 4 * sizeof(float));
+        }
+
+        if (SUCCEEDED(c->Map(g_cbPass, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+        {
+            memcpy(mapped.pData, &pp, sizeof(pp));
+            c->Unmap(g_cbPass, 0);
+
+            D3D11_VIEWPORT row {};
+            row.Width = 16.0f;
+            row.Height = 1.0f;
+            row.TopLeftY = (float) kMattePoseRow;
+            row.MaxDepth = 1.0f;
+            c->RSSetViewports(1, &row);
+            c->Draw(3, 0);
+        }
+    }
+
+    c->PSSetConstantBuffers(1, 1, &second);
+    SafeRelease(second);
+    backup.Restore(c);
+    source.Release();
+
+    if (eye == 1)
+    {
+        c->Flush();
+        InterlockedIncrement(&g_matteFrames);
+    }
+}
+
+// Sharpens a finished frame where it lies: the texture is copied aside and drawn back over itself
+// through PSSharpen. It is opened for the length of the pass only -- it belongs to no set, and
+// whoever made it may replace it between one frame and the next.
+void Sharpen(const VwsCmd& cmd)
+{
+    if (cmd.frame == nullptr || cmd.frame == g_sharpenRefused || !(cmd.strength > 0.0f))
+        return;
+
+    ID3D11Device* device = DeviceOf(cmd.frame);
+
+    if (device == nullptr)
+        return;
+
+    HRESULT hr = EnsureDevice(device);
+    device->Release();
+
+    if (FAILED(hr))
+        return;
+
+    Surface target;
+
+    if (OpenSurface(target, cmd.frame, false, false, true, "the frame to sharpen", &hr) != ErrNone)
+    {
+        g_sharpenRefused = cmd.frame;
+        return;
+    }
+
+    if (g_scratch.tex == nullptr || g_scratch.desc.Width != target.desc.Width || g_scratch.desc.Height != target.desc.Height ||
+        g_scratch.desc.Format != target.desc.Format)
+    {
+        g_scratch.Release();
+
+        D3D11_TEXTURE2D_DESC td = target.desc;
+        td.MipLevels = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = 0;
+        td.MiscFlags = 0;
+
+        ID3D11Texture2D* copy = nullptr;
+        hr = g_device->CreateTexture2D(&td, nullptr, &copy);
+
+        if (SUCCEEDED(hr))
+        {
+            const int opened = OpenSurface(g_scratch, copy, false, true, false, "the sharpening pass's copy", &hr);
+            copy->Release();
+
+            if (opened != ErrNone)
+                hr = E_FAIL;
+        }
+
+        if (FAILED(hr))
+        {
+            Log("sharpening: no working copy of a %ux%u %s frame (hr=0x%08X) -- that frame is left as it is",
+                target.desc.Width, target.desc.Height, FormatName(target.desc.Format), (unsigned) hr);
+            g_scratch.Release();
+            g_sharpenRefused = cmd.frame;
+            target.Release();
+            return;
+        }
+    }
+
+    ID3D11DeviceContext* c = g_ctx;
+    c->CopySubresourceRegion(g_scratch.tex, 0, 0, 0, 0, target.tex, 0, nullptr);
+
+    bool codec = false;
+    const DXGI_FORMAT view = ViewFormat(target.desc.Format, &codec);
+
+    Params params {};
+    SetSize(params.frameSize, target.desc.Width, target.desc.Height);
+    SetSize(params.dstSize, target.desc.Width, target.desc.Height);
+    SetSize(params.workSize, target.desc.Width, target.desc.Height);
+    params.eyes = cmd.eyes == 2 ? 2u : 1u;
+    params.strength = cmd.strength > 1.0f ? 1.0f : cmd.strength;
+
+    // A float frame holds scene light with no ceiling; the filter's limits want one.
+    params.flags = (view == DXGI_FORMAT_R16G16B16A16_FLOAT || view == DXGI_FORMAT_R32G32B32A32_FLOAT) ? kFlagSquash : 0u;
+
+    D3D11_MAPPED_SUBRESOURCE mapped {};
+    hr = c->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+
+    if (FAILED(hr))
+    {
+        target.Release();
+        return;
+    }
+
+    memcpy(mapped.pData, &params, sizeof(params));
+    c->Unmap(g_cb, 0);
+
+    StateBackup backup;
+    backup.Capture(c);
+
+    ID3D11ShaderResourceView* none[3] {};
+    c->PSSetShaderResources(0, 3, none);
+    c->OMSetRenderTargets(1, &target.rtv, nullptr);
+
+    D3D11_VIEWPORT vp {};
+    vp.Width = (float) target.desc.Width;
+    vp.Height = (float) target.desc.Height;
+    vp.MaxDepth = 1.0f;
+    c->RSSetViewports(1, &vp);
+    c->RSSetState(g_raster);
+    c->OMSetBlendState(g_blend, nullptr, 0xFFFFFFFF);
+    c->OMSetDepthStencilState(g_depth, 0);
+
+    c->IASetInputLayout(nullptr);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->VSSetShader(g_vs, nullptr, 0);
+    c->HSSetShader(nullptr, nullptr, 0);
+    c->DSSetShader(nullptr, nullptr, 0);
+    c->GSSetShader(nullptr, nullptr, 0);
+    c->PSSetShader(g_psSharpen, nullptr, 0);
+    c->PSSetConstantBuffers(0, 1, &g_cb);
+    c->PSSetSamplers(0, 1, &g_sampler);
+
+    ID3D11ShaderResourceView* inputs[3] = { g_scratch.srv, nullptr, nullptr };
+    c->PSSetShaderResources(0, 3, inputs);
+
+    c->Draw(3, 0);
+
+    backup.Restore(c);
+    target.Release();
+}
+
 void Execute(const VwsCmd& cmd)
 {
+    if (cmd.op == OpSharpen)
+    {
+        Sharpen(cmd);
+        return;
+    }
+
+    if (cmd.op == OpPassthrough)
+    {
+        Passthrough(cmd);
+        return;
+    }
+
+    if (cmd.op == OpMatte)
+    {
+        Matte(cmd);
+        return;
+    }
+
     if (cmd.op == OpReleaseAll)
     {
         ReleaseDevice();
@@ -1013,6 +2641,192 @@ int Push(const VwsCmd& cmd)
     return kEventMagic | (int) slot;
 }
 } // namespace
+
+// Sharpens `texture` where it lies (see Sharpen). `strength` 0..1; `eyes` 2 for a double-wide
+// stereo frame, whose halves are then sharpened each on its own.
+VWS_EXPORT int vws_push_sharpen(void* texture, float strength, uint32_t eyes)
+{
+    VwsCmd cmd {};
+    cmd.op = OpSharpen;
+    cmd.frame = texture;
+    cmd.strength = strength;
+    cmd.eyes = eyes;
+    return Push(cmd);
+}
+
+// The numbers the passthrough pass works from (see CamField). Main thread, whenever they change.
+VWS_EXPORT void vws_cam_configure(const float* values, uint32_t count)
+{
+    if (values == nullptr)
+        return;
+
+    AcquireSRWLockExclusive(&g_camLock);
+    memcpy(g_camConfig, values, sizeof(float) * (count < kCamFloats ? count : kCamFloats));
+    g_camConfigured = true;
+    ReleaseSRWLockExclusive(&g_camLock);
+}
+
+// Starts taking the camera's frames: `getFrameBuffer` is IVRTrackedCamera's GetVideoStreamFrameBuffer
+// and `handle` a stream the caller acquired and will release after vws_cam_stop.
+VWS_EXPORT int vws_cam_start(void* getFrameBuffer, uint64_t handle, uint32_t width, uint32_t height)
+{
+    if (getFrameBuffer == nullptr || width == 0 || height == 0 || width > 8192 || height > 8192)
+        return 0;
+
+    if (g_camThread != nullptr)
+        return 1;
+
+    AcquireSRWLockExclusive(&g_camLock);
+    CamBuffers(width, height);
+    ReleaseSRWLockExclusive(&g_camLock);
+
+    g_camFn = (CamFrameFn) getFrameBuffer;
+    g_camHandle = handle;
+    InterlockedExchange(&g_camError, 0);
+    const LONG generation = InterlockedIncrement(&g_camGen);
+    g_camThread = CreateThread(nullptr, 0, CamThread, (void*) (intptr_t) generation, 0, nullptr);
+
+    if (g_camThread == nullptr)
+    {
+        InterlockedIncrement(&g_camGen);
+        return 0;
+    }
+
+    return 1;
+}
+
+VWS_EXPORT void vws_cam_stop()
+{
+    if (g_camThread == nullptr)
+        return;
+
+    // A thread that is stuck in a call and does not end in time is left behind: it belongs to a
+    // start that is over, and ends itself when the call lets it go.
+    InterlockedIncrement(&g_camGen);
+
+    if (WaitForSingleObject(g_camThread, 3000) != WAIT_OBJECT_0)
+        Log("passthrough: the camera thread did not end within three seconds -- it was stuck in a call");
+
+    CloseHandle(g_camThread);
+    g_camThread = nullptr;
+}
+
+VWS_EXPORT void vws_cam_status(uint32_t* frames, uint32_t* uploads, int32_t* error)
+{
+    if (frames != nullptr)
+        *frames = (uint32_t) g_camFrames;
+
+    if (uploads != nullptr)
+        *uploads = (uint32_t) g_camUploads;
+
+    if (error != nullptr)
+        *error = (int32_t) g_camError;
+}
+
+// A camera frame handed in directly, grey, with the head's pose at its moment (3x4, or null): what
+// the worker would have delivered. For the offline checks.
+VWS_EXPORT void vws_cam_inject(const uint8_t* grey, uint32_t width, uint32_t height, const float* pose)
+{
+    if (grey == nullptr || width == 0 || height == 0)
+        return;
+
+    AcquireSRWLockExclusive(&g_camLock);
+    CamBuffers(width, height);
+    memcpy(g_camFront, grey, (size_t) width * height);
+
+    if (pose != nullptr)
+        memcpy(g_camFrontPose, pose, sizeof(g_camFrontPose));
+
+    g_camFrontPoseValid = pose != nullptr;
+    g_camFresh = true;
+    ReleaseSRWLockExclusive(&g_camLock);
+}
+
+// One eye of the matte the overlay is cut by (see Matte): `source` is the finished frame, `eyes`
+// 2 when it holds both eyes side by side. `headPose`, twelve numbers or null, is the head in the
+// room as that frame was rendered. `fromAlpha`: the room has already been drawn into the frame and
+// the frame's alpha says where (1 = the game's own picture), so the key colour is not looked for.
+VWS_EXPORT int vws_push_matte(void* source, uint32_t eyes, uint32_t eye, uint32_t srgb, uint32_t topDown, const float* headPose, uint32_t fromAlpha)
+{
+    VwsCmd cmd {};
+    cmd.op = OpMatte;
+    cmd.strength = fromAlpha != 0 ? 1.0f : 0.0f;
+    cmd.frame = source;
+    cmd.eyes = eyes;
+    cmd.which = eye;
+    cmd.srgbMask = srgb != 0 ? kFrame : 0;
+    cmd.topDown = topDown;
+
+    if (headPose != nullptr)
+    {
+        memcpy(cmd.window, headPose, 8 * sizeof(float));
+        memcpy(cmd.prev, headPose + 8, 4 * sizeof(float));
+        cmd.moved = 1;
+    }
+
+    return Push(cmd);
+}
+
+// How the overlay stands: 0 not wanted, 1 waiting for the game's first frame, 2 no device of its
+// own, 3 no SteamVR overlay interface, 4 SteamVR refused it (`error`), 5 running.
+VWS_EXPORT void vws_overlay_status(int32_t* state, uint32_t* frames, int32_t* error)
+{
+    if (state != nullptr)
+        *state = (int32_t) g_ovState;
+
+    if (frames != nullptr)
+        *frames = (uint32_t) g_ovFrames;
+
+    if (error != nullptr)
+        *error = (int32_t) g_ovError;
+}
+
+// The overlay's picture as bytes (RGBA), for the offline checks: asks for the next one drawn and
+// returns the last one kept. 1 when `out` was filled.
+VWS_EXPORT int vws_overlay_read(uint8_t* out, uint32_t capacity, uint32_t* width, uint32_t* height)
+{
+    InterlockedExchange(&g_ovDebugWant, 1);
+
+    int filled = 0;
+    AcquireSRWLockExclusive(&g_camLock);
+
+    if (g_ovDebug != nullptr && out != nullptr && capacity >= g_ovDebugW * g_ovDebugH * 4)
+    {
+        memcpy(out, g_ovDebug, (size_t) g_ovDebugW * g_ovDebugH * 4);
+        filled = 1;
+    }
+
+    if (width != nullptr)
+        *width = g_ovDebugW;
+
+    if (height != nullptr)
+        *height = g_ovDebugH;
+
+    ReleaseSRWLockExclusive(&g_camLock);
+    return filled;
+}
+
+// One eye of the passthrough pass (see Passthrough). `eyeToRoom`, twelve numbers or null, is that
+// eye's space in the room's as the frame was rendered.
+VWS_EXPORT int vws_push_passthrough(void* target, uint32_t eyes, uint32_t eye, uint32_t srgb, uint32_t topDown, const float* eyeToRoom)
+{
+    VwsCmd cmd {};
+    cmd.op = OpPassthrough;
+    cmd.frame = target;
+    cmd.eyes = eyes;
+    cmd.which = eye;
+    cmd.srgbMask = srgb != 0 ? kFrame : 0;
+    cmd.topDown = topDown;
+
+    if (eyeToRoom != nullptr)
+    {
+        memcpy(cmd.window, eyeToRoom, 8 * sizeof(float));
+        memcpy(cmd.prev, eyeToRoom + 8, 4 * sizeof(float));
+        cmd.moved = 1;
+    }
+
+    return Push(cmd);
+}
 
 VWS_EXPORT uint32_t vws_abi()
 {

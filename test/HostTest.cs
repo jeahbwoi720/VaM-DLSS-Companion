@@ -202,6 +202,11 @@ public static class HostTest
         Check(Hooks.WindowHooked && Hooks.WindowProblem.Length == 0 && Hooks.GuideSites == 3 && Hooks.ParamSites == 1,
             "the focus window's redirections are in (" + Hooks.GuideSites + " guide copies, " + Hooks.ParamSites + " SetParams calls): " + Hooks.WindowProblem);
 
+        HeadsetUi.Resolve();
+        HeadsetUi.Apply(new Harmony("vws.hosttest.headsetui"));
+        Check(HeadsetUi.Hooked && HeadsetUi.Problem.Length == 0, "the headset's interface pass is hooked: " + HeadsetUi.Problem);
+        Check(HeadsetUi.Line().Length == 0, "the headset's interface pass says nothing until it is asked for");
+
         const BindingFlags any = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
         string[][] expected =
         {

@@ -10,6 +10,11 @@ native/vws_vs.h
 native/vws_ps_down.h
 native/vws_ps_resolve.h
 native/vws_ps_guide.h
+native/vws_ps_sharpen.h
+native/vws_ps_pass.h
+native/vws_ps_matte.h
+native/vws_ps_overlay.h
+native/vws_vs_overlay.h
 
 # never part of this repository: the mod this plugs into is UncleBurrito's, and paid
 orig/

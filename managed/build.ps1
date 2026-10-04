@@ -38,6 +38,8 @@ $vamRefs = @(
     (Join-Path $managed 'System.Core.dll'),
     (Join-Path $managed 'UnityEngine.dll'),
     (Join-Path $managed 'UnityEngine.CoreModule.dll'),
+    (Join-Path $managed 'UnityEngine.ImageConversionModule.dll'),
+    (Join-Path $managed 'UnityEngine.VRModule.dll'),
     (Join-Path $managed 'UnityEngine.UI.dll'),
     (Join-Path $managed 'Assembly-CSharp.dll')
 )
@@ -46,7 +48,7 @@ $refs = $vamRefs + @(
     (Join-Path $core '0Harmony.dll'),
     $ModDll
 )
-$sources = @((Join-Path $here 'WorkScale.cs'), (Join-Path $here 'ControlPanel.cs'))
+$sources = @((Join-Path $here 'WorkScale.cs'), (Join-Path $here 'ControlPanel.cs'), (Join-Path $here 'HeadsetUi.cs'), (Join-Path $here 'CameraProbe.cs'), (Join-Path $here 'Passthrough.cs'))
 $defines = @()
 
 if ($SelfTest) {

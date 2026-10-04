@@ -134,6 +134,64 @@ renamed to that on the first start):
 | `[Focus window] FollowGaze` | true | aim the window where you look, when SteamVR has eye tracking for the headset |
 | `[Focus window] GazeDeadZone` | 0.03 | how far the gaze may wander from the window's centre before the window moves (fraction of the eye; 0.03 ≈ 3°) |
 | `[Focus window] GazeHoldSeconds`, `GazeReturnSeconds` | 0.4, 0.3 | how long the window waits when the eye is lost (a blink), and how long it takes back to the lens centre |
+| `[Picture] Sharpening` | 0 | the [sharpening filter](#sharpening); 0 = off |
+| `[Interface] FullSizeInHeadset` | false | draw [VaM's menu at full size](#headset-menu-at-full-size) in a headset |
+| `[Passthrough] …` | | see [Passthrough](#passthrough-playstation-vr2) |
+
+## Sharpening
+
+*Sharpening* (0 to 1, off at 0) is a filter over the finished frame, after DLSS and Neural Rendering
+have done their work, on the monitor and in a headset. It is what one expects of a "DLSS
+sharpening" slider. VaM DLSS's own *texture sharpening* is something else — it biases textures
+towards their sharper mips while DLSS upscales and does nothing at DLAA — so the in-headset panel
+now calls that one *DLSS texture detail*.
+
+## Headset menu at full size
+
+In a headset VaM's menu floats in the scene, so with DLSS upscaling it is rendered small and
+enlarged with everything else, and Neural Rendering works on it too. With *Headset menu at full
+size* on, the menu is left out of the scene's frame and drawn afterwards, at the headset's full
+resolution, over the finished picture: DLSS, Neural Rendering and the sharpening filter never see
+it. Off by default. Used on a PlayStation VR2; not yet tried on other headsets.
+
+It is drawn over the picture, so a figure standing between you and the menu no longer hides it.
+
+## Passthrough (PlayStation VR2)
+
+*Passthrough (headset)* shows your room, through the headset's cameras, wherever the scene has a
+**key colour** — green, blue, magenta, black, white, or one you mix. Give the scene a flat
+background of that colour and the person stands in your room.
+
+- The room is its own SteamVR overlay, redrawn for every camera frame — 60 a second on a
+  PlayStation VR2 — whatever the game's frame rate is. The cut-out around the person comes from the
+  game's frame and is fitted to where your head has moved since.
+- It works with Neural Rendering and DLSS off, too.
+- The PlayStation VR2's cameras are black-and-white, and so is the room.
+- *Tolerance* and *edge softness* decide how much counts as the key colour. *Passthrough view* can
+  show the cut-out on its own, which is the quickest way to set them. With black as the key, keep
+  the tolerance low (0.02), or dark hair and shadows go with it.
+- With *Headset menu at full size* on, the menu stays in front of the room.
+
+It needs the headset's cameras to reach SteamVR. On a PlayStation VR2 that takes
+[PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit) **1.0.0-experimental** or later. The
+status box in the in-headset panel says what was found, and *Probe headset camera (to log)* writes
+the details to BepInEx's log. Another headset with two cameras that SteamVR hands out side by side
+may work, but the lens model was measured on a PlayStation VR2 and nothing else has been tried.
+
+| `[Passthrough]` setting | Default | |
+|---|---|---|
+| `Enabled` | false | the switch |
+| `Mode` | 0 | 0 = its own overlay, at the camera's pace; 1 = drawn into the game's frame, at the game's pace |
+| `KeyPreset` | 1 | 0 custom (`KeyRed`, `KeyGreen`, `KeyBlue`), 1 green, 2 blue, 3 magenta, 4 black, 5 white |
+| `Tolerance`, `EdgeSoftness` | 0.3, 0.15 | how far from the key colour still counts, and how soft the edge is |
+| `OverlayDistance` | 10 | how far away the overlay stands, in metres; close, the cut-out opens on one side while the head moves |
+| `OverlayRoomBehind` | true | also draw the room into the game's frame, under the overlay, so that a gap beside the person shows room and not the key colour |
+| `Distance` | 1.5 | the distance at which the room lines up with where things really are |
+| `Brightness` | 1 | camera brightness |
+| `LensFocal` | 382.6 | the room's apparent size; raise it if the room looks too small |
+| `FollowHead` | false | mode 1: carry the camera's picture to where the head is now. Not tried since its last fix |
+| `View` | 0 | 1 = the cut-out alone, 2 = the camera everywhere |
+| `OverlayOtherShape`, `CutOutPose`, `CutOutTimingMs` | false, 0, 0 | for troubleshooting an overlay that sits wrong |
 
 ## In-headset controls
 
@@ -145,7 +203,10 @@ UI**, as VaM's own sliders, toggles and popups, where the controllers' pointer r
   passes, run-before-DLSS
 - the per-region mask: on/off, edge softness, and intensity / tone / structure for whichever region
   you pick from a list (head, torso, limbs, genitals, clothing, scene)
-- DLSS Super Resolution on/off, quality, model, texture sharpening
+- DLSS Super Resolution on/off, quality, model, texture detail, and its sign switches for a picture
+  that will not hold still (*DLSS fix: reset to defaults* puts them back)
+- the [sharpening filter](#sharpening), [headset menu at full size](#headset-menu-at-full-size)
+  and [passthrough](#passthrough-playstation-vr2)
 - frame generation on/off, multiplier, pacing (monitor only, as in VaM DLSS)
 - a live status box — what is running, at what size, the frame pacing — and reset buttons
 

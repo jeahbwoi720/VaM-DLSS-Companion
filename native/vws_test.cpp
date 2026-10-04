@@ -1855,6 +1855,752 @@ static void TestTiming(uint32_t fw, uint32_t fh, uint32_t ww, uint32_t wh, uint3
     rig.Free();
 }
 
+// ---- sharpening ---------------------------------------------------------------------------------
+//
+// PSSharpen, worked on the CPU: the same five taps, the same limits.
+static Image SharpenReference(const Image& src, uint32_t eyes, float strength, bool squash)
+{
+    Image out(src.w, src.h);
+    const int w = (int) src.w, h = (int) src.h, eyeW = eyes == 2 ? w / 2 : w;
+
+    auto tap = [&](int x, int y, float c[3]) {
+        const float* p = src.at((uint32_t) x, (uint32_t) y);
+
+        for (int i = 0; i < 3; ++i)
+            c[i] = squash ? (p[i] > 0.0f ? p[i] : 0.0f) : Saturate(p[i]);
+
+        if (squash)
+        {
+            const float m = 1.0f + std::max(c[0], std::max(c[1], c[2]));
+
+            for (int i = 0; i < 3; ++i)
+                c[i] /= m;
+        }
+    };
+
+    for (int y = 0; y < h; ++y)
+    {
+        for (int x = 0; x < w; ++x)
+        {
+            const int x0 = (eyes == 2 && x >= eyeW) ? eyeW : 0;
+            const int x1 = x0 + eyeW - 1;
+            float e[3], b[3], d[3], f[3], hh[3];
+            tap(x, y, e);
+            tap(x, std::max(y - 1, 0), b);
+            tap(std::max(x - 1, x0), y, d);
+            tap(std::min(x + 1, x1), y, f);
+            tap(x, std::min(y + 1, h - 1), hh);
+
+            float widest = -1e30f;
+
+            for (int i = 0; i < 3; ++i)
+            {
+                const float mn4 = std::min(std::min(b[i], d[i]), std::min(f[i], hh[i]));
+                const float mx4 = std::max(std::max(b[i], d[i]), std::max(f[i], hh[i]));
+                const float hitMin = std::min(mn4, e[i]) / std::max(4.0f * mx4, 1e-5f);
+                const float hitMax = (1.0f - std::max(mx4, e[i])) / std::min(4.0f * mn4 - 4.0f, -1e-5f);
+                widest = std::max(widest, std::max(-hitMin, hitMax));
+            }
+
+            const float lobe = std::max(-0.1875f, std::min(widest, 0.0f)) * Saturate(strength);
+            float o[3];
+
+            for (int i = 0; i < 3; ++i)
+                o[i] = (lobe * (b[i] + d[i] + f[i] + hh[i]) + e[i]) / (4.0f * lobe + 1.0f);
+
+            if (squash)
+            {
+                for (int i = 0; i < 3; ++i)
+                    o[i] = std::min(std::max(o[i], 0.0f), 0.999f);
+
+                const float m = 1.0f - std::max(o[0], std::max(o[1], o[2]));
+
+                for (int i = 0; i < 3; ++i)
+                    o[i] /= m;
+            }
+            else
+            {
+                for (int i = 0; i < 3; ++i)
+                    o[i] = Saturate(o[i]);
+            }
+
+            float* q = out.at((uint32_t) x, (uint32_t) y);
+            q[0] = o[0];
+            q[1] = o[1];
+            q[2] = o[2];
+            q[3] = src.at((uint32_t) x, (uint32_t) y)[3];
+        }
+    }
+
+    return out;
+}
+
+static void TestSharpen()
+{
+    printf("[sharpening a finished frame where it lies]\n");
+
+    const uint32_t w = 64, h = 24;
+    Image img(w, h);
+
+    for (uint32_t y = 0; y < h; ++y)
+    {
+        for (uint32_t x = 0; x < w; ++x)
+        {
+            float v = 0.15f + 0.07f * (float) ((x * 7 + y * 13) % 11);
+
+            if (x >= 4 && x < 14 && y >= 2 && y < 10)
+                v = 0.5f; // a flat patch: nothing to sharpen
+
+            if (y >= 16)
+                v *= 6.0f; // scene light well above 1
+
+            float* p = img.at(x, y);
+            p[0] = v;
+            p[1] = v * 0.8f;
+            p[2] = v * 0.5f + 0.05f;
+            p[3] = 0.25f + 0.5f * (float) (x % 2);
+        }
+    }
+
+    // What the texture really holds once it is half floats.
+    for (float& v : img.px)
+        v = HalfToFloat(FloatToHalf(v));
+
+    VwsCmd c {};
+    c.op = 8; // OpSharpen
+    c.eyes = 2;
+
+    // A double-wide half-float frame, as DLSS's output is in a headset.
+    {
+        ID3D11Texture2D* t = MakeTexture(w, h, DXGI_FORMAT_R16G16B16A16_TYPELESS, kRT);
+        UploadHalf(t, img);
+
+        c.frame = t;
+        c.strength = 0.0f;
+        Run(c);
+        std::vector<float> same = ReadFloats(t, 4);
+        float moved = 0.0f;
+
+        for (size_t i = 0; i < same.size(); ++i)
+            moved = std::max(moved, fabsf(same[i] - img.px[i]));
+
+        CHECK(moved == 0.0f, "strength 0 leaves the frame as it was (moved by %g)", moved);
+
+        c.strength = 0.8f;
+        Run(c);
+        const std::vector<float> got = ReadFloats(t, 4);
+        const Image ref = SharpenReference(img, 2, 0.8f, true);
+
+        float worst = 0.0f, changed = 0.0f, flat = 0.0f, alpha = 0.0f;
+
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                for (int i = 0; i < 4; ++i)
+                {
+                    const float g = got[((size_t) y * w + x) * 4 + i];
+                    const float r = ref.at(x, y)[i];
+                    const float was = img.at(x, y)[i];
+
+                    if (i == 3)
+                    {
+                        alpha = std::max(alpha, fabsf(g - was));
+                        continue;
+                    }
+
+                    worst = std::max(worst, fabsf(g - r) / (0.004f + 0.004f * fabsf(r)));
+                    changed = std::max(changed, fabsf(g - was));
+
+                    if (x >= 5 && x < 13 && y >= 3 && y < 9)
+                        flat = std::max(flat, fabsf(g - was));
+                }
+            }
+        }
+
+        CHECK(worst <= 1.0f, "a half-float stereo frame comes back as the reference has it (worst %.2fx the tolerance)", worst);
+        CHECK(changed > 0.02f, "the pass sharpened something (largest change %g)", changed);
+        CHECK(flat < 0.003f, "a flat patch is left alone (moved by %g)", flat);
+        CHECK(alpha == 0.0f, "alpha is carried through (moved by %g)", alpha);
+        t->Release();
+    }
+
+    // An 8-bit frame, as Neural Rendering's result is.
+    {
+        Bytes bytes(w, h);
+        Image seen(w, h);
+
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                for (int i = 0; i < 4; ++i)
+                {
+                    const int b = ToByte(Saturate(img.at(x, y)[i] * (y >= 16 ? 1.0f / 6.0f : 1.0f)));
+                    bytes.at(x, y)[i] = (uint8_t) b;
+                    seen.at(x, y)[i] = (float) b / 255.0f;
+                }
+            }
+        }
+
+        ID3D11Texture2D* t = MakeTexture(w, h, DXGI_FORMAT_R8G8B8A8_TYPELESS, kRT);
+        UploadBytes(t, bytes);
+
+        c.frame = t;
+        c.eyes = 1;
+        c.strength = 1.0f;
+        Run(c);
+
+        const Bytes got = ReadBytes(t);
+        const Image ref = SharpenReference(seen, 1, 1.0f, false);
+        int worst = 0;
+
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x)
+                for (int i = 0; i < 4; ++i)
+                    worst = std::max(worst, abs((int) got.at(x, y)[i] - (int) lroundf(ref.at(x, y)[i] * 255.0f)));
+
+        CHECK(worst <= 1, "an 8-bit frame comes back as the reference has it (worst %d/255)", worst);
+        t->Release();
+    }
+
+    // Something that is not a texture is refused once, quietly, and nothing else is disturbed.
+    c.frame = g_dev;
+    Run(c);
+    Run(c);
+    Drain(true);
+}
+
+// ---- passthrough --------------------------------------------------------------------------------
+//
+// PSPassthrough worked on the CPU, with the transforms composed the way the DLL composes them.
+struct Rig34
+{
+    double m[12];
+};
+
+static Rig34 RigInverse(const Rig34& a)
+{
+    Rig34 r;
+
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = 0; j < 3; ++j)
+            r.m[i * 4 + j] = a.m[j * 4 + i];
+
+        r.m[i * 4 + 3] = -(a.m[i] * a.m[3] + a.m[4 + i] * a.m[7] + a.m[8 + i] * a.m[11]);
+    }
+
+    return r;
+}
+
+static Rig34 RigMul(const Rig34& a, const Rig34& b)
+{
+    Rig34 r;
+
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 4; ++j)
+            r.m[i * 4 + j] = a.m[i * 4] * b.m[j] + a.m[i * 4 + 1] * b.m[4 + j] + a.m[i * 4 + 2] * b.m[8 + j] + (j == 3 ? a.m[i * 4 + 3] : 0.0);
+
+    return r;
+}
+
+static Rig34 RigFrom(const float* f)
+{
+    Rig34 r;
+
+    for (int i = 0; i < 12; ++i)
+        r.m[i] = f[i];
+
+    return r;
+}
+
+static void RigYaw(float* out, float yaw, float pitch, float x, float y, float z)
+{
+    const float cy = cosf(yaw), sy = sinf(yaw), cp = cosf(pitch), sp = sinf(pitch);
+    const float m[12] = { cy, sy * sp, sy * cp, x, 0, cp, -sp, y, -sy, cy * sp, cy * cp, z };
+    memcpy(out, m, sizeof(m));
+}
+
+// The room's grey at one pixel of one eye's picture; `matte` is how much of it shows.
+static float PassRoom(const float* cfg, const Rig34& eyeToCam, const std::vector<uint8_t>& cam, uint32_t cw, uint32_t ch, uint32_t eye,
+                      float u, float v)
+{
+    const float* tn = cfg + 16 + eye * 4;
+    double ray[3] = { tn[0] + (tn[1] - tn[0]) * u, -(tn[2] + (tn[3] - tn[2]) * v), -1.0 };
+    const double len = sqrt(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
+    double at[3], q[3];
+
+    for (int i = 0; i < 3; ++i)
+        at[i] = ray[i] / len * cfg[6];
+
+    for (int i = 0; i < 3; ++i)
+        q[i] = eyeToCam.m[i * 4] * at[0] + eyeToCam.m[i * 4 + 1] * at[1] + eyeToCam.m[i * 4 + 2] * at[2] + eyeToCam.m[i * 4 + 3];
+
+    const double across = std::max(sqrt(q[0] * q[0] + q[1] * q[1]), 1e-9);
+    const double angle = atan2(across, -q[2]);
+    const double a2 = angle * angle;
+    const double radius = cfg[7] * angle * (1.0 + a2 * (cfg[8] + a2 * (cfg[9] + a2 * (cfg[10] + a2 * cfg[11]))));
+    const double lensW = cw / 2;
+    double tx = cfg[12 + eye * 2] + radius * q[0] / across;
+    double ty = cfg[13 + eye * 2] - radius * q[1] / across;
+    const double inside = std::min(std::max((lensW * 0.5 - 6.0 - radius) / 40.0, 0.0), 1.0);
+    tx = std::min(std::max(tx, 0.0), lensW - 1.0);
+    ty = std::min(std::max(ty, 0.0), (double) ch - 1.0);
+
+    const int x0 = (int) floor(tx), y0 = (int) floor(ty);
+    const int x1 = std::min(x0 + 1, (int) lensW - 1), y1 = std::min(y0 + 1, (int) ch - 1);
+    const double fx = tx - x0, fy = ty - y0;
+    const int ox = (int) (eye * lensW);
+    const double g = (cam[(size_t) y0 * cw + ox + x0] * (1 - fx) * (1 - fy) + cam[(size_t) y0 * cw + ox + x1] * fx * (1 - fy) +
+                      cam[(size_t) y1 * cw + ox + x0] * (1 - fx) * fy + cam[(size_t) y1 * cw + ox + x1] * fx * fy) / 255.0;
+
+    return (float) (std::min(std::max(g * cfg[5], 0.0), 1.0) * inside);
+}
+
+static float PassMatte(const float* cfg, float r, float g, float b)
+{
+    const float d = sqrtf((r - cfg[0]) * (r - cfg[0]) + (g - cfg[1]) * (g - cfg[1]) + (b - cfg[2]) * (b - cfg[2]));
+    const float t = Saturate((d - cfg[3]) / std::max(cfg[4], 1e-4f));
+    return 1.0f - t * t * (3.0f - 2.0f * t);
+}
+
+static void TestPassthrough(HMODULE dll)
+{
+    printf("[passthrough: the key colour becomes the camera's picture]\n");
+
+    typedef void (*ConfigureFn)(const float*, uint32_t);
+    typedef void (*InjectFn)(const uint8_t*, uint32_t, uint32_t, const float*);
+    typedef int (*PushPassFn2)(void*, uint32_t, uint32_t, uint32_t, uint32_t, const float*);
+    const ConfigureFn configure = (ConfigureFn) GetProcAddress(dll, "vws_cam_configure");
+    const InjectFn inject = (InjectFn) GetProcAddress(dll, "vws_cam_inject");
+    const PushPassFn2 push = (PushPassFn2) GetProcAddress(dll, "vws_push_passthrough");
+
+    CHECK(configure && inject && push, "the passthrough exports are there");
+
+    if (!configure || !inject || !push)
+        return;
+
+    // A camera frame with something smooth in it, two lenses side by side.
+    const uint32_t cw = 2032, ch = 1016;
+    std::vector<uint8_t> cam((size_t) cw * ch);
+
+    for (uint32_t y = 0; y < ch; ++y)
+        for (uint32_t x = 0; x < cw; ++x)
+            cam[(size_t) y * cw + x] = (uint8_t) lroundf(128.0f + 90.0f * sinf(x * 0.013f) * cosf(y * 0.017f));
+
+    float cfg[80] = {};
+    cfg[0] = 0.0f; cfg[1] = 1.0f; cfg[2] = 0.0f; // green
+    cfg[3] = 0.30f;  // tolerance
+    cfg[4] = 0.20f;  // softness
+    cfg[5] = 1.2f;   // gain
+    cfg[6] = 1.5f;   // distance
+    cfg[7] = 382.6f; // focal
+    cfg[8] = 0.01983145f; cfg[9] = -0.0011872f; cfg[10] = -0.00294614f; cfg[11] = 0.00045608f;
+    cfg[12] = 507.887f; cfg[13] = 510.078f; cfg[14] = 506.532f; cfg[15] = 504.605f;
+    const float tangents[8] = { -1.8418f, 0.9472f, -1.329f, 1.329f, -0.9472f, 1.8418f, -1.329f, 1.329f };
+    memcpy(cfg + 16, tangents, sizeof(tangents));
+    const float camToHead[24] = { 0.9647f, 0.0022f, 0.2635f, -0.04f, -0.1331f, 0.8671f, 0.48f, -0.0392f, -0.2274f, -0.4981f, 0.8368f, -0.0809f,
+                                  0.9653f, 0.0041f, -0.261f, 0.0388f, 0.1275f, 0.8651f, 0.4852f, -0.0393f, 0.2278f, -0.5016f, 0.8345f, -0.0806f };
+    memcpy(cfg + 24, camToHead, sizeof(camToHead));
+    const float eyeToHead[24] = { 1, 0, 0, -0.0325f, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0.0325f, 0, 1, 0, 0, 0, 0, 1, 0 };
+    memcpy(cfg + 48, eyeToHead, sizeof(eyeToHead));
+    cfg[72] = 1.0f; // follow the head
+    cfg[73] = 0.0f;
+
+    float headThen[12], headNow[12];
+    RigYaw(headThen, 0.20f, 0.05f, 0.10f, 1.20f, -0.30f);
+    RigYaw(headNow, 0.27f, 0.02f, 0.12f, 1.21f, -0.28f);
+
+    // The pose a frame comes with is the first camera's, as a PlayStation VR2 gives it.
+    cfg[79] = 1.0f;
+    float cameraThen[12];
+    {
+        const Rig34 c = RigMul(RigFrom(headThen), RigFrom(camToHead));
+
+        for (int i = 0; i < 12; ++i)
+            cameraThen[i] = (float) c.m[i];
+    }
+
+    configure(cfg, 80);
+    inject(cam.data(), cw, ch, cameraThen);
+
+    // A double-wide half-float frame, first row at the top: key, nearly key, not key.
+    {
+        const uint32_t w = 128, h = 64, eyeW = 64;
+        Image img(w, h);
+
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                const uint32_t third = (x % eyeW) * 3 / eyeW;
+                float* p = img.at(x, y);
+                const float rgb[3][3] = { { 0.0f, 1.0f, 0.0f }, { 0.05f, 0.8f, 0.05f }, { 0.4f, 0.3f, 0.2f } };
+                p[0] = rgb[third][0];
+                p[1] = rgb[third][1];
+                p[2] = rgb[third][2];
+                p[3] = 0.5f;
+            }
+        }
+
+        for (float& v : img.px)
+            v = HalfToFloat(FloatToHalf(v));
+
+        ID3D11Texture2D* t = MakeTexture(w, h, DXGI_FORMAT_R16G16B16A16_TYPELESS, kRT);
+        UploadHalf(t, img);
+
+        Rig34 eyeToCam[2];
+
+        for (uint32_t eye = 0; eye < 2; ++eye)
+        {
+            const Rig34 eyeToRoom = RigMul(RigFrom(headNow), RigFrom(eyeToHead + eye * 12));
+            float asFloats[12];
+
+            for (int i = 0; i < 12; ++i)
+                asFloats[i] = (float) eyeToRoom.m[i];
+
+            eyeToCam[eye] = RigMul(RigInverse(RigFrom(camToHead + eye * 12)), RigMul(RigInverse(RigFrom(headThen)), RigFrom(asFloats)));
+            g_event(push(t, 2, eye, 0, 1, asFloats));
+        }
+
+        const std::vector<float> got = ReadFloats(t, 4);
+        float worst = 0.0f, keyed = 0.0f, kept = 0.0f;
+        int rooms = 0;
+
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                const uint32_t eye = x / eyeW;
+                const float* was = img.at(x, y);
+                const float matte = PassMatte(cfg, L2S(Saturate(was[0])), L2S(Saturate(was[1])), L2S(Saturate(was[2])));
+                const float room = S2L(PassRoom(cfg, eyeToCam[eye], cam, cw, ch, eye, (x - eye * eyeW + 0.5f) / eyeW, (y + 0.5f) / h));
+
+                for (int i = 0; i < 3; ++i)
+                {
+                    const float want = was[i] + (room - was[i]) * matte;
+                    const float g = got[((size_t) y * w + x) * 4 + i];
+                    worst = std::max(worst, fabsf(g - want) / (0.02f + 0.02f * fabsf(want)));
+
+                    if (matte >= 1.0f)
+                        keyed = std::max(keyed, fabsf(g - room));
+
+                    if (matte <= 0.0f)
+                        kept = std::max(kept, fabsf(g - was[i]));
+                }
+
+                if (matte >= 1.0f && room > 0.02f)
+                    rooms++;
+            }
+        }
+
+        CHECK(worst <= 1.0f, "a stereo half-float frame comes back as the reference has it (worst %.2fx the tolerance)", worst);
+        CHECK(kept == 0.0f, "what is not the key colour is left exactly as it was (moved by %g)", kept);
+        CHECK(rooms > 500, "the key colour shows the camera's picture (%d pixels of it)", rooms);
+        t->Release();
+    }
+
+    // One eye's own 8-bit frame, first row at the bottom, no pose given: straight through the head.
+    {
+        const uint32_t w = 64, h = 64, eye = 1;
+        Bytes bytes(w, h);
+
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                uint8_t* p = bytes.at(x, y);
+                const bool key = x < w / 2;
+                p[0] = key ? 0 : 120;
+                p[1] = key ? 255 : 60;
+                p[2] = key ? 0 : 200;
+                p[3] = 255;
+            }
+        }
+
+        ID3D11Texture2D* t = MakeTexture(w, h, DXGI_FORMAT_R8G8B8A8_TYPELESS, kRT);
+        UploadBytes(t, bytes);
+        g_event(push(t, 1, eye, 1, 0, nullptr));
+
+        const Rig34 eyeToCam = RigMul(RigInverse(RigFrom(camToHead + eye * 12)), RigFrom(eyeToHead + eye * 12));
+        const Bytes got = ReadBytes(t);
+        int worst = 0;
+
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                const uint8_t* was = bytes.at(x, y);
+                const float matte = PassMatte(cfg, was[0] / 255.0f, was[1] / 255.0f, was[2] / 255.0f);
+                const float room = PassRoom(cfg, eyeToCam, cam, cw, ch, eye, (x + 0.5f) / w, 1.0f - (y + 0.5f) / h);
+
+                for (int i = 0; i < 3; ++i)
+                {
+                    const float want = was[i] / 255.0f + (room - was[i] / 255.0f) * matte;
+                    worst = std::max(worst, abs((int) got.at(x, y)[i] - (int) lroundf(want * 255.0f)));
+                }
+            }
+        }
+
+        CHECK(worst <= 2, "one eye's 8-bit frame, the other way up, comes back as the reference has it (worst %d/255)", worst);
+        t->Release();
+    }
+
+    Drain(true);
+}
+
+// ---- the room as an overlay -----------------------------------------------------------------------
+//
+// The camera thread, fed by a stand-in for SteamVR's frame call, draws the overlay's picture on a
+// device of its own from the matte this thread's device wrote. There is no SteamVR here, so the
+// picture goes nowhere; it is read back and held to the same arithmetic done on the CPU.
+static std::vector<uint8_t> g_fakeCam;
+static uint32_t g_fakeW = 0, g_fakeH = 0;
+static float g_fakePose[12];
+
+static int __stdcall FakeFrame(uint64_t, int, void* buffer, uint32_t size, void* header, uint32_t headerSize)
+{
+    if (header == nullptr || headerSize < 100)
+        return 1;
+
+    uint8_t* h = (uint8_t*) header;
+    const uint32_t fields[5] = { 0, g_fakeW, g_fakeH, 4, GetTickCount() / 20 };
+    memcpy(h, fields, sizeof(fields));
+    memcpy(h + 20, g_fakePose, sizeof(g_fakePose));
+    h[96] = 1;
+
+    if (buffer != nullptr)
+    {
+        if (size < g_fakeW * g_fakeH * 4)
+            return 2;
+
+        uint8_t* out = (uint8_t*) buffer;
+
+        for (size_t i = 0; i < (size_t) g_fakeW * g_fakeH; ++i)
+        {
+            out[i * 4] = out[i * 4 + 1] = out[i * 4 + 2] = g_fakeCam[i];
+            out[i * 4 + 3] = 255;
+        }
+    }
+
+    return 0;
+}
+
+static void TestOverlay(HMODULE dll)
+{
+    printf("[passthrough as an overlay: a second device, the game's matte, the camera's own pace]\n");
+
+    typedef void (*ConfigureFn)(const float*, uint32_t);
+    typedef int (*PushMatteFn)(void*, uint32_t, uint32_t, uint32_t, uint32_t, const float*, uint32_t);
+    typedef int (*StartFn)(void*, uint64_t, uint32_t, uint32_t);
+    typedef void (*StopFn)();
+    typedef int (*ReadFn)(uint8_t*, uint32_t, uint32_t*, uint32_t*);
+    typedef void (*StatusFn2)(int32_t*, uint32_t*, int32_t*);
+    const ConfigureFn configure = (ConfigureFn) GetProcAddress(dll, "vws_cam_configure");
+    const PushMatteFn pushMatte = (PushMatteFn) GetProcAddress(dll, "vws_push_matte");
+    const StartFn start = (StartFn) GetProcAddress(dll, "vws_cam_start");
+    const StopFn stop = (StopFn) GetProcAddress(dll, "vws_cam_stop");
+    const ReadFn read = (ReadFn) GetProcAddress(dll, "vws_overlay_read");
+    const StatusFn2 status = (StatusFn2) GetProcAddress(dll, "vws_overlay_status");
+
+    CHECK(configure && pushMatte && start && stop && read && status, "the overlay exports are there");
+
+    if (!configure || !pushMatte || !start || !stop || !read || !status)
+        return;
+
+    const uint32_t cw = 2032, ch = 1016;
+    g_fakeW = cw;
+    g_fakeH = ch;
+    g_fakeCam.resize((size_t) cw * ch);
+
+    for (uint32_t y = 0; y < ch; ++y)
+        for (uint32_t x = 0; x < cw; ++x)
+            g_fakeCam[(size_t) y * cw + x] = (uint8_t) lroundf(128.0f + 90.0f * sinf(x * 0.013f) * cosf(y * 0.017f));
+
+    float cfg[80] = {};
+    cfg[0] = 0.0f; cfg[1] = 1.0f; cfg[2] = 0.0f;
+    cfg[3] = 0.30f;
+    cfg[4] = 0.20f;
+    cfg[5] = 1.2f;
+    cfg[6] = 1.5f;
+    cfg[7] = 382.6f;
+    cfg[8] = 0.01983145f; cfg[9] = -0.0011872f; cfg[10] = -0.00294614f; cfg[11] = 0.00045608f;
+    cfg[12] = 507.887f; cfg[13] = 510.078f; cfg[14] = 506.532f; cfg[15] = 504.605f;
+    const float tangents[8] = { -1.8418f, 0.9472f, -1.329f, 1.329f, -0.9472f, 1.8418f, -1.329f, 1.329f };
+    memcpy(cfg + 16, tangents, sizeof(tangents));
+    const float camToHead[24] = { 0.9647f, 0.0022f, 0.2635f, -0.04f, -0.1331f, 0.8671f, 0.48f, -0.0392f, -0.2274f, -0.4981f, 0.8368f, -0.0809f,
+                                  0.9653f, 0.0041f, -0.261f, 0.0388f, 0.1275f, 0.8651f, 0.4852f, -0.0393f, 0.2278f, -0.5016f, 0.8345f, -0.0806f };
+    memcpy(cfg + 24, camToHead, sizeof(camToHead));
+    const float eyeToHead[24] = { 1, 0, 0, -0.0325f, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0.0325f, 0, 1, 0, 0, 0, 0, 1, 0 };
+    memcpy(cfg + 48, eyeToHead, sizeof(eyeToHead));
+    cfg[72] = 1.0f; // follow the head
+    cfg[73] = 0.0f; // the picture
+    cfg[74] = 1.0f; // as an overlay
+    cfg[75] = 2.2f; // the quad's reach
+    cfg[76] = 2.0f; // its distance
+    cfg[77] = 0.0f; // shaped by one eye's picture
+    cfg[78] = 1.0f; // standing universe
+
+    cfg[79] = 1.0f; // the frames come with the first camera's pose
+
+    float headNow[12], headThen[12];
+    RigYaw(headThen, 0.20f, 0.05f, 0.10f, 1.20f, -0.30f);
+    RigYaw(headNow, 0.27f, 0.02f, 0.12f, 1.21f, -0.28f);
+    {
+        const Rig34 c = RigMul(RigFrom(headThen), RigFrom(camToHead));
+
+        for (int i = 0; i < 12; ++i)
+            g_fakePose[i] = (float) c.m[i];
+    }
+
+    configure(cfg, 80);
+
+    // The game's frame: thirds of key, nearly key, not key, in each eye.
+    const uint32_t w = 192, h = 64, eyeW = 96;
+    const float thirds[3][3] = { { 0.0f, 1.0f, 0.0f }, { 0.05f, 0.8f, 0.05f }, { 0.4f, 0.3f, 0.2f } };
+    Image img(w, h);
+
+    for (uint32_t y = 0; y < h; ++y)
+    {
+        for (uint32_t x = 0; x < w; ++x)
+        {
+            const uint32_t third = (x % eyeW) * 3 / eyeW;
+            float* p = img.at(x, y);
+            p[0] = thirds[third][0];
+            p[1] = thirds[third][1];
+            p[2] = thirds[third][2];
+            p[3] = 1.0f;
+        }
+    }
+
+    ID3D11Texture2D* frame = MakeTexture(w, h, DXGI_FORMAT_R16G16B16A16_TYPELESS, kRT);
+    UploadHalf(frame, img);
+    g_event(pushMatte(frame, 2, 0, 0, 1, headNow, 0));
+    g_event(pushMatte(frame, 2, 1, 0, 1, headNow, 0));
+    g_ctx->Flush();
+    Drain(true);
+
+    CHECK(start((void*) &FakeFrame, 1, cw, ch) == 1, "the camera thread starts");
+
+    std::vector<uint8_t> picture((size_t) 3072 * 1536 * 4);
+    uint32_t pw = 0, ph = 0;
+    int filled = 0;
+
+    for (int i = 0; i < 200 && !filled; ++i)
+    {
+        Sleep(50);
+        filled = read(picture.data(), (uint32_t) picture.size(), &pw, &ph);
+    }
+
+    int32_t state = 0, error = 0;
+    uint32_t frames = 0;
+    status(&state, &frames, &error);
+    CHECK(filled == 1 && pw == 3072 && ph == 1536, "the overlay drew a picture on its own device (%ux%u, state %d, %u frames, error 0x%X)", pw, ph, state, frames, (unsigned) error);
+
+    if (filled)
+    {
+        // the rotation between the two heads, as the DLL composes it
+        double rot[3][3];
+
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                rot[i][j] = headNow[i] * headThen[j] + headNow[4 + i] * headThen[4 + j] + headNow[8 + i] * headThen[8 + j];
+
+        const double reach = cfg[75] * cfg[76];
+        int worstGrey = 0, worstAlpha = 0, checked = 0, shown = 0;
+
+        for (uint32_t py = 20; py < ph; py += 61)
+        {
+            for (uint32_t px = 20; px < pw; px += 67)
+            {
+                const uint32_t eye = px >= pw / 2 ? 1 : 0;
+                const double u = (px + 0.5 - eye * (pw / 2.0)) / (pw / 2.0), v = (py + 0.5) / ph;
+                const double onQuad[3] = { (2 * u - 1) * reach, (1 - 2 * v) * reach, -cfg[76] };
+                const double from[3] = { eye == 0 ? -0.0325 : 0.0325, 0, 0 };
+                double ray[3] = { onQuad[0] - from[0], onQuad[1] - from[1], onQuad[2] - from[2] };
+                const double len = sqrt(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
+
+                for (double& c : ray)
+                    c /= len;
+
+                // the camera's grey: PassRoom takes a point of the eye's space through eyeToCam, so
+                // give it the head's point and the head -> camera transform
+                const Rig34 headToCam = RigInverse(RigFrom(camToHead + eye * 12));
+                const double at[3] = { from[0] + ray[0] * cfg[6], from[1] + ray[1] * cfg[6], from[2] + ray[2] * cfg[6] };
+                double q[3];
+
+                for (int i = 0; i < 3; ++i)
+                    q[i] = headToCam.m[i * 4] * at[0] + headToCam.m[i * 4 + 1] * at[1] + headToCam.m[i * 4 + 2] * at[2] + headToCam.m[i * 4 + 3];
+
+                const double across = std::max(sqrt(q[0] * q[0] + q[1] * q[1]), 1e-9);
+                const double angle = atan2(across, -q[2]);
+                const double a2 = angle * angle;
+                const double radius = cfg[7] * angle * (1.0 + a2 * (cfg[8] + a2 * (cfg[9] + a2 * (cfg[10] + a2 * cfg[11]))));
+                const double lensW = cw / 2;
+                const double inside = std::min(std::max((lensW * 0.5 - 6.0 - radius) / 40.0, 0.0), 1.0);
+                double tx = std::min(std::max(cfg[12 + eye * 2] + radius * q[0] / across, 0.0), lensW - 1.0);
+                double ty = std::min(std::max(cfg[13 + eye * 2] - radius * q[1] / across, 0.0), (double) ch - 1.0);
+                const int x0 = (int) floor(tx), y0 = (int) floor(ty);
+                const int x1 = std::min(x0 + 1, (int) lensW - 1), y1 = std::min(y0 + 1, (int) ch - 1);
+                const double fx = tx - x0, fy = ty - y0;
+                const int ox = (int) (eye * lensW);
+                const double grey = (g_fakeCam[(size_t) y0 * cw + ox + x0] * (1 - fx) * (1 - fy) + g_fakeCam[(size_t) y0 * cw + ox + x1] * fx * (1 - fy) +
+                                     g_fakeCam[(size_t) y1 * cw + ox + x0] * (1 - fx) * fy + g_fakeCam[(size_t) y1 * cw + ox + x1] * fx * fy) / 255.0;
+                const int wantGrey = (int) lround(std::min(std::max(grey * cfg[5], 0.0), 1.0) * 255.0);
+
+                // the matte, in the direction the game's picture has this line of sight
+                double g[3];
+
+                for (int i = 0; i < 3; ++i)
+                    g[i] = rot[i][0] * ray[0] + rot[i][1] * ray[1] + rot[i][2] * ray[2];
+
+                double alpha = 0.0;
+                bool sure = true;
+
+                if (g[2] < -1e-3)
+                {
+                    const float* tn = tangents + eye * 4;
+                    const double mx = (g[0] / -g[2] - tn[0]) / (tn[1] - tn[0]), my = (-g[1] / -g[2] - tn[2]) / (tn[3] - tn[2]);
+
+                    if (mx >= 0 && mx <= 1 && my >= 0 && my <= 1)
+                    {
+                        // well inside one third, away from where two colours were filtered together
+                        const double third = mx * 3.0, part = third - floor(third);
+                        sure = part > 0.2 && part < 0.8 && mx > 0.03 && mx < 0.97 && my > 0.03 && my < 0.97;
+                        const float* c = thirds[std::min((int) floor(third), 2)];
+                        alpha = PassMatte(cfg, L2S(c[0]), L2S(c[1]), L2S(c[2]));
+                    }
+                    else
+                    {
+                        sure = mx < -0.03 || mx > 1.03 || my < -0.03 || my > 1.03;
+                    }
+                }
+
+                const uint8_t* got = &picture[((size_t) py * pw + px) * 4];
+                worstGrey = std::max(worstGrey, abs((int) got[0] - wantGrey));
+
+                if (sure)
+                {
+                    worstAlpha = std::max(worstAlpha, abs((int) got[3] - (int) lround(alpha * inside * 255.0)));
+                    checked++;
+
+                    if (alpha * inside > 0.9)
+                        shown++;
+                }
+            }
+        }
+
+        CHECK(worstGrey <= 3, "the room on the quad is what the reference has (worst %d/255)", worstGrey);
+        CHECK(worstAlpha <= 3, "it shows where the game's frame is the key colour, seen from the turned head (worst %d/255 over %d texels)", worstAlpha, checked);
+        CHECK(shown > 20, "some of the quad is the room (%d of the texels checked)", shown);
+    }
+
+    stop();
+    frame->Release();
+    Drain(true);
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     const wchar_t* dllPath = argc > 1 ? argv[1] : L"VamDlssNrWorkScaleNative.dll";
@@ -1933,6 +2679,10 @@ int wmain(int argc, wchar_t** argv)
     Drain(true);
     TestEditTransfer();
     TestCubeScale();
+    TestSharpen();
+    TestPassthrough(dll);
+    TestOverlay(dll);
+    Drain(true);
     TestStereoSeam();
     TestWindow();
     Drain(true);

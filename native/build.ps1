@@ -19,7 +19,12 @@ $shaders = @(
     @{ Entry = 'VSMain';    Profile = 'vs_5_0'; Name = 'g_vwsVs';        File = 'vws_vs.h' },
     @{ Entry = 'PSDown';    Profile = 'ps_5_0'; Name = 'g_vwsPsDown';    File = 'vws_ps_down.h' },
     @{ Entry = 'PSResolve'; Profile = 'ps_5_0'; Name = 'g_vwsPsResolve'; File = 'vws_ps_resolve.h' },
-    @{ Entry = 'PSGuide';   Profile = 'ps_5_0'; Name = 'g_vwsPsGuide';   File = 'vws_ps_guide.h' }
+    @{ Entry = 'PSGuide';   Profile = 'ps_5_0'; Name = 'g_vwsPsGuide';   File = 'vws_ps_guide.h' },
+    @{ Entry = 'PSSharpen'; Profile = 'ps_5_0'; Name = 'g_vwsPsSharpen'; File = 'vws_ps_sharpen.h' },
+    @{ Entry = 'PSPassthrough'; Profile = 'ps_5_0'; Name = 'g_vwsPsPass'; File = 'vws_ps_pass.h' },
+    @{ Entry = 'PSMatte'; Profile = 'ps_5_0'; Name = 'g_vwsPsMatte'; File = 'vws_ps_matte.h' },
+    @{ Entry = 'PSOverlay'; Profile = 'ps_5_0'; Name = 'g_vwsPsOverlay'; File = 'vws_ps_overlay.h' },
+    @{ Entry = 'VSOverlay'; Profile = 'vs_5_0'; Name = 'g_vwsVsOverlay'; File = 'vws_vs_overlay.h' }
 )
 
 foreach ($s in $shaders) {
@@ -28,7 +33,7 @@ foreach ($s in $shaders) {
 }
 
 $common = '/nologo /std:c++17 /O2 /W4 /EHsc /MT /DUNICODE /D_UNICODE'
-$dll = "cl $common /LD `"$here\vws.cpp`" /Fo`"$out\\`" /Fe`"$out\VamDlssNrWorkScaleNative.dll`" /link /NOLOGO d3d11.lib dxguid.lib"
+$dll = "cl $common /LD `"$here\vws.cpp`" /Fo`"$out\\`" /Fe`"$out\VamDlssNrWorkScaleNative.dll`" /link /NOLOGO d3d11.lib dxgi.lib dxguid.lib"
 $test = "cl $common `"$here\vws_test.cpp`" /Fo`"$out\\`" /Fe`"$out\vws_test.exe`" /link /NOLOGO d3d11.lib dxguid.lib"
 
 cmd /c "`"$vcvars`" >nul && $dll"

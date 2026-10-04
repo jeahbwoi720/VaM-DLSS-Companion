@@ -47,6 +47,7 @@ static const uint F_OUT_ENCODED   = 8u; // the render target stores what is writ
 static const uint F_WINDOW        = 16u; // the model works on gWindow, not on the whole of each eye
 static const uint F_MOVED         = 32u; // guide: these are motion vectors and the window is not where, or what size, it was (gPrev)
 static const uint F_TOP_DOWN      = 64u; // guide: the textures' first row is the TOP of the picture (motion's y points up it)
+static const uint F_SQUASH        = 128u; // sharpen: the frame is scene light with no ceiling; bring it under 1 for the filter
 
 Texture2D<float4> tFrame : register(t0);
 Texture2D<float4> tProxy : register(t1);
@@ -351,4 +352,290 @@ float4 PSResolve(float4 pos : SV_Position) : SV_Target
         return EmitEncoded(saturate(0.5 + edit * 4.0), alpha);
 
     return EmitEncoded(AddEditInGamut(frameEnc, edit), alpha);
+}
+
+// ---- PSSharpen ---------------------------------------------------------------------------------
+//
+// Contrast-adaptive sharpening of a finished frame, after the shape of FidelityFX RCAS: the
+// centre is pushed away from its four neighbours by a negative lobe, and the lobe is held to
+// what keeps the result between the darkest and the brightest of the five. Flat areas and hard
+// edges are left nearly alone; soft detail gains the most.
+//
+// tFrame is a copy of the target. Each eye of a double-wide frame is filtered on its own.
+
+float3 Squash(float3 c)
+{
+    c = max(c, 0.0);
+    return c / (1.0 + max(c.r, max(c.g, c.b)));
+}
+
+float3 Unsquash(float3 c)
+{
+    c = clamp(c, 0.0, 0.999);
+    return c / (1.0 - max(c.r, max(c.g, c.b)));
+}
+
+float3 SharpenTap(int2 p, bool squash)
+{
+    float3 c = tFrame.Load(int3(p, 0)).rgb;
+    return squash ? Squash(c) : saturate(c);
+}
+
+float4 PSSharpen(float4 pos : SV_Position) : SV_Target
+{
+    const bool squash = (gFlags & F_SQUASH) != 0u;
+    const int2 p = int2(pos.xy);
+    const int w = (int) gFrameSize.x;
+    const int h = (int) gFrameSize.y;
+    const int eyeW = gEyes == 2u ? w / 2 : w;
+    const int x0 = (gEyes == 2u && p.x >= eyeW) ? eyeW : 0;
+    const int x1 = x0 + eyeW - 1;
+
+    const float4 centre = tFrame.Load(int3(p, 0));
+    const float3 e = squash ? Squash(centre.rgb) : saturate(centre.rgb);
+    const float3 b = SharpenTap(int2(p.x, max(p.y - 1, 0)), squash);
+    const float3 d = SharpenTap(int2(max(p.x - 1, x0), p.y), squash);
+    const float3 f = SharpenTap(int2(min(p.x + 1, x1), p.y), squash);
+    const float3 hh = SharpenTap(int2(p.x, min(p.y + 1, h - 1)), squash);
+
+    const float3 mn4 = min(min(b, d), min(f, hh));
+    const float3 mx4 = max(max(b, d), max(f, hh));
+
+    const float3 hitMin = min(mn4, e) / max(4.0 * mx4, 1e-5);
+    const float3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, -1e-5);
+    const float3 lobeRgb = max(-hitMin, hitMax);
+    const float lobe = max(-0.1875, min(max(lobeRgb.r, max(lobeRgb.g, lobeRgb.b)), 0.0)) * saturate(gStrength);
+
+    float3 o = (lobe * (b + d + f + hh) + e) / (4.0 * lobe + 1.0);
+    o = squash ? Unsquash(o) : saturate(o);
+
+    return float4(o, centre.a);
+}
+
+// ---- PSPassthrough -----------------------------------------------------------------------------
+//
+// Where a finished frame holds the key colour, the room instead: for each such pixel, the point
+// the eye sees through it at a set distance, carried into the camera's space and through the
+// camera's fisheye to a place in its frame. tFrame is a copy of the target, tProxy the camera's
+// frame (grey; the two lenses side by side). One eye per draw.
+
+cbuffer PassthroughParams : register(b1)
+{
+    float4 pDst;     // target width, height, 1/width, 1/height
+    float4 pKey;     // rgb as displayed (sRGB-encoded), a = tolerance
+    float4 pTune;    // softness, camera gain, distance (m), fisheye pixels per radian
+    float4 pK;       // the fisheye's polynomial
+    float4 pCentre;  // its centre in each lens's half, pixels: left xy, right zw
+    float4 pCam;     // camera frame width, height, lens width, view (0 picture, 1 matte, 2 camera everywhere)
+    float4 pTan;     // this eye's left, right, top, bottom tangents (y down)
+    float4 pRow0;    // a point in the eye's space -> the camera's
+    float4 pRow1;
+    float4 pRow2;
+    float4 pMisc;    // eye, eyes in the target, target holds encoded values, first row at the top
+};
+
+float4 PSPassthrough(float4 pos : SV_Position) : SV_Target
+{
+    const float4 c = tFrame.Load(int3(int2(pos.xy), 0));
+    const bool encoded = pMisc.z > 0.5;
+
+    // With an overlay to be cut by this frame, its alpha is made to say where the room went: 1 for
+    // the game's own picture, 0 for the room.
+    const bool mark = pCam.w >= 7.5;
+    const int view = (int) (mark ? pCam.w - 8.0 : pCam.w);
+
+    const float3 seen = encoded ? saturate(c.rgb) : LinearToSrgb(saturate(c.rgb));
+    float matte = 1.0 - smoothstep(pKey.a, pKey.a + max(pTune.x, 1e-4), length(seen - pKey.rgb));
+
+    if (view == 2)
+        matte = 1.0;
+
+    if (matte <= 0.0)
+        return float4(c.rgb, mark ? 1.0 : c.a);
+
+    if (view == 1)
+        return float4(encoded ? matte.xxx : SrgbToLinear(matte.xxx), mark ? 1.0 - matte : c.a);
+
+    // Where this pixel is in its eye's picture, from the top left.
+    const bool wide = pMisc.y > 1.5;
+    const float eyeW = wide ? pDst.x * 0.5 : pDst.x;
+    const float u = (pos.x - (wide ? pMisc.x * eyeW : 0.0)) / eyeW;
+    const float fromTop = pos.y * pDst.w;
+    const float v = pMisc.w > 0.5 ? fromTop : 1.0 - fromTop;
+
+    // The eye looks down -z; its tangents count y downwards.
+    const float3 ray = normalize(float3(lerp(pTan.x, pTan.y, u), -lerp(pTan.z, pTan.w, v), -1.0));
+    const float3 at = ray * pTune.z;
+    const float3 q = float3(dot(pRow0.xyz, at) + pRow0.w, dot(pRow1.xyz, at) + pRow1.w, dot(pRow2.xyz, at) + pRow2.w);
+
+    // The camera looks down -z too. Its lens lays an angle from the axis down as a radius.
+    const float across = max(length(q.xy), 1e-9);
+    const float angle = atan2(across, -q.z);
+    const float a2 = angle * angle;
+    const float radius = pTune.w * angle * (1.0 + a2 * (pK.x + a2 * (pK.y + a2 * (pK.z + a2 * pK.w))));
+
+    const float lensW = pCam.z;
+    const float2 centre = pMisc.x < 0.5 ? pCentre.xy : pCentre.zw;
+    float2 texel = centre + radius * float2(q.x, -q.y) / across;
+
+    // The lens's picture is a circle; beyond it there is nothing, and it fades out towards that.
+    const float inside = saturate((lensW * 0.5 - 6.0 - radius) / 40.0);
+    texel = clamp(texel, 0.0, float2(lensW, pCam.y) - 1.0);
+
+    const float2 uv = float2((texel.x + 0.5 + pMisc.x * lensW) / pCam.x, (texel.y + 0.5) / pCam.y);
+    const float grey = saturate(tProxy.SampleLevel(sLinear, uv, 0).r * pTune.y) * inside;
+    const float3 room = encoded ? grey.xxx : SrgbToLinear(grey.xxx);
+
+    return float4(lerp(c.rgb, room, matte), mark ? 1.0 - matte : c.a);
+}
+
+// ---- PSMatte -----------------------------------------------------------------------------------
+//
+// How much of each pixel of a finished frame is the key colour, written into one eye's half of a
+// matte the overlay is cut by. The matte's first row is the top of the picture whichever way up
+// the frame lies. tFrame is the frame itself.
+
+float4 PSMatte(float4 pos : SV_Position) : SV_Target
+{
+    // Below the matte, a row of texels that carries the head's pose the frame was drawn from, each
+    // number spread over three bytes. Written by the same pass as the matte, it reaches the
+    // overlay's device at the same moment the matte does -- which a pose handed across on the
+    // side would not: the card runs a frame behind the commands it is sent.
+    if (pCam.w > 1.5)
+    {
+        const int i = (int) pos.x;
+
+        if (i >= 12)
+            return float4(pMisc.x, pMisc.x, pMisc.x, 1.0);
+
+        const float4 rows[3] = { pRow0, pRow1, pRow2 };
+        const float n = round(saturate(rows[i / 4][i % 4] * 0.5 + 0.5) * 16777215.0);
+        const float hi = floor(n / 65536.0);
+        const float mid = floor((n - hi * 65536.0) / 256.0);
+        const float lo = n - hi * 65536.0 - mid * 256.0;
+        return float4(hi / 255.0, mid / 255.0, lo / 255.0, 1.0);
+    }
+
+    const float halfW = pDst.x * 0.5;
+    const float u = (pos.x - pMisc.x * halfW) / halfW;
+    const float v = pos.y * pDst.w;
+
+    const float2 at = float2(pMisc.y > 1.5 ? (pMisc.x + u) * 0.5 : u, pMisc.w > 0.5 ? v : 1.0 - v);
+    const float4 c = tFrame.SampleLevel(sLinear, at, 0);
+    const float3 seen = pMisc.z > 0.5 ? saturate(c.rgb) : LinearToSrgb(saturate(c.rgb));
+    float matte = 1.0 - smoothstep(pKey.a, pKey.a + max(pTune.x, 1e-4), length(seen - pKey.rgb));
+
+    // Where the room has been drawn into the frame already, its alpha says so (see PSPassthrough).
+    if (pCam.w > 0.5)
+        matte = 1.0 - saturate(c.a);
+
+    return float4(matte, matte, matte, 1.0);
+}
+
+// ---- PSOverlay ---------------------------------------------------------------------------------
+//
+// The room on a quad that stands in front of where the head was when the camera took its frame:
+// one picture per eye, side by side. Each texel is a point on the quad; the eye's line to it is
+// followed out to where the room is taken to be, and that point is found in the camera's frame
+// (tProxy) the way PSPassthrough finds it. How much of it shows is the game's matte (tModel),
+// looked up in the direction the game's own picture has that line of sight.
+
+cbuffer OverlayParams : register(b1)
+{
+    float4 oQuad;       // half-width, half-height, distance of the quad; distance of the room
+    float4 oLens;       // fisheye pixels per radian, gain, lens width, view
+    float4 oK;
+    float4 oCentre;
+    float4 oCam;        // camera frame width, height, matte usable, the right eye's x in the head
+    float4 oTan[2];     // each eye's left, right, top, bottom tangents in the game's picture (y down)
+    float4 oCamRows[6]; // the head's space -> each camera's, three rows apiece
+    float4 oRot[3];     // the head at the camera frame's moment, in the room (rotation); [0].w = it is known
+    float4 oOut;        // texture width, height, 1/width, 1/height
+    float4 oMatte;      // x = how much of the matte texture's height is matte, y = the row its pose is in
+};
+
+struct OverlayVertex
+{
+    float4 pos : SV_Position;
+    nointerpolation float3 turn0 : TEXCOORD0; // the head at the camera frame's moment -> the head
+    nointerpolation float3 turn1 : TEXCOORD1; // the game's frame was drawn from, row by row
+    nointerpolation float3 turn2 : TEXCOORD2;
+};
+
+float PoseNumber(int i)
+{
+    const float3 t = round(tModel.Load(int3(i, (int) oMatte.y, 0)).rgb * 255.0);
+    return dot(t, float3(65536.0, 256.0, 1.0)) / 16777215.0 * 2.0 - 1.0;
+}
+
+// The turn is worked out once, here, from the pose the game wrote beside its matte.
+OverlayVertex VSOverlay(uint id : SV_VertexID)
+{
+    OverlayVertex o;
+    const float2 uv = float2((id << 1) & 2, id & 2);
+    o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+
+    float3x3 turn = float3x3(1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0);
+
+    if (oCam.z > 0.5 && oRot[0].w > 0.5 && tModel.Load(int3(12, (int) oMatte.y, 0)).r > 0.5)
+    {
+        const float3x3 game = float3x3(PoseNumber(0), PoseNumber(1), PoseNumber(2), PoseNumber(4), PoseNumber(5), PoseNumber(6), PoseNumber(8),
+                                       PoseNumber(9), PoseNumber(10));
+        const float3x3 then = float3x3(oRot[0].xyz, oRot[1].xyz, oRot[2].xyz);
+        turn = mul(transpose(game), then);
+    }
+
+    o.turn0 = turn[0];
+    o.turn1 = turn[1];
+    o.turn2 = turn[2];
+    return o;
+}
+
+float4 PSOverlay(OverlayVertex vertex) : SV_Target
+{
+    const float4 pos = vertex.pos;
+    const float eyeW = oOut.x * 0.5;
+    const int eye = pos.x >= eyeW ? 1 : 0;
+    const float u = (pos.x - eye * eyeW) / eyeW;
+    const float v = pos.y * oOut.w;
+
+    const float3 onQuad = float3((2.0 * u - 1.0) * oQuad.x, (1.0 - 2.0 * v) * oQuad.y, -oQuad.z);
+    const float3 from = float3(eye == 0 ? -oCam.w : oCam.w, 0.0, 0.0);
+    const float3 ray = normalize(onQuad - from);
+    const float3 at = from + ray * oQuad.w;
+
+    const float4 r0 = oCamRows[eye * 3], r1 = oCamRows[eye * 3 + 1], r2 = oCamRows[eye * 3 + 2];
+    const float3 q = float3(dot(r0.xyz, at) + r0.w, dot(r1.xyz, at) + r1.w, dot(r2.xyz, at) + r2.w);
+
+    const float across = max(length(q.xy), 1e-9);
+    const float angle = atan2(across, -q.z);
+    const float a2 = angle * angle;
+    const float radius = oLens.x * angle * (1.0 + a2 * (oK.x + a2 * (oK.y + a2 * (oK.z + a2 * oK.w))));
+
+    const float lensW = oLens.z;
+    const float2 centre = eye == 0 ? oCentre.xy : oCentre.zw;
+    float2 texel = centre + radius * float2(q.x, -q.y) / across;
+    const float inside = saturate((lensW * 0.5 - 6.0 - radius) / 40.0);
+    texel = clamp(texel, 0.0, float2(lensW, oCam.y) - 1.0);
+
+    const float2 uv = float2((texel.x + 0.5 + eye * lensW) / oCam.x, (texel.y + 0.5) / oCam.y);
+    const float grey = saturate(tProxy.SampleLevel(sLinear, uv, 0).r * oLens.y);
+
+    // The same line of sight in the game's picture.
+    float alpha = 0.0;
+    const float3 g = float3(dot(vertex.turn0, ray), dot(vertex.turn1, ray), dot(vertex.turn2, ray));
+
+    if (oCam.z > 0.5 && g.z < -1e-3)
+    {
+        const float4 tn = oTan[eye];
+        const float2 m = float2((g.x / -g.z - tn.x) / (tn.y - tn.x), (-g.y / -g.z - tn.z) / (tn.w - tn.z));
+
+        if (m.x >= 0.0 && m.x <= 1.0 && m.y >= 0.0 && m.y <= 1.0)
+            alpha = tModel.SampleLevel(sLinear, float2((eye + m.x) * 0.5, m.y * oMatte.x), 0).r;
+    }
+
+    if ((int) oLens.w == 2)
+        alpha = 1.0;
+
+    return float4(grey, grey, grey, alpha * inside);
 }

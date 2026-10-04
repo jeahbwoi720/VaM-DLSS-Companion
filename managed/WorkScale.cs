@@ -51,7 +51,7 @@ namespace VamDlssNrWorkScale
     internal static class Native
     {
         private const string Dll = "VamDlssNrWorkScaleNative";
-        private const uint ExpectedAbi = 5;
+        private const uint ExpectedAbi = 12;
 
         internal const uint Frame = 1, Proxy = 2, Model = 4, Result = 8;
         internal const int ReadyDown = 1, ReadyResolve = 2, ReadyGuide = 4; // ReadyGuide << n for guide n
@@ -95,6 +95,24 @@ namespace VamDlssNrWorkScale
         private static PushPassFn _pushPass;
         private static PushRegisterGuideFn _pushRegisterGuide;
         private static PushGuideFn _pushGuide;
+        private delegate int PushSharpenFn(IntPtr texture, float strength, uint eyes);
+        private static PushSharpenFn _pushSharpen;
+        private delegate void CamConfigureFn([In] float[] values, uint count);
+        private delegate int CamStartFn(IntPtr getFrameBuffer, ulong handle, uint width, uint height);
+        private delegate void CamStopFn();
+        private delegate void CamStatusFn(out uint frames, out uint uploads, out int error);
+        private delegate int PushPassthroughFn(IntPtr target, uint eyes, uint eye, uint srgb, uint topDown, [In] float[] eyeToRoom);
+        private static CamConfigureFn _camConfigure;
+        private static CamStartFn _camStart;
+        private static CamStopFn _camStop;
+        private static CamStatusFn _camStatus;
+        private static PushPassthroughFn _pushPassthrough;
+        private delegate int PushMatteFn(IntPtr source, uint eyes, uint eye, uint srgb, uint topDown, [In] float[] headPose, uint fromAlpha);
+        private delegate void OverlayStatusFn(out int state, out uint frames, out int error);
+        private static PushMatteFn _pushMatte;
+        private static OverlayStatusFn _overlayStatus;
+        private delegate int OverlayReadFn([Out] byte[] rgba, uint capacity, out uint width, out uint height);
+        private static OverlayReadFn _overlayRead;
         private static PushReleaseFn _pushRelease;
         private static PollFn _poll;
         private static DrainFn _drain;
@@ -160,6 +178,15 @@ namespace VamDlssNrWorkScale
                 _pushPass = (PushPassFn)Bind(module, "vws_push_pass_window", typeof(PushPassFn));
                 _pushRegisterGuide = (PushRegisterGuideFn)Bind(module, "vws_push_register_guide", typeof(PushRegisterGuideFn));
                 _pushGuide = (PushGuideFn)Bind(module, "vws_push_guide", typeof(PushGuideFn));
+                _pushSharpen = (PushSharpenFn)Bind(module, "vws_push_sharpen", typeof(PushSharpenFn));
+                _camConfigure = (CamConfigureFn)Bind(module, "vws_cam_configure", typeof(CamConfigureFn));
+                _camStart = (CamStartFn)Bind(module, "vws_cam_start", typeof(CamStartFn));
+                _camStop = (CamStopFn)Bind(module, "vws_cam_stop", typeof(CamStopFn));
+                _camStatus = (CamStatusFn)Bind(module, "vws_cam_status", typeof(CamStatusFn));
+                _pushPassthrough = (PushPassthroughFn)Bind(module, "vws_push_passthrough", typeof(PushPassthroughFn));
+                _pushMatte = (PushMatteFn)Bind(module, "vws_push_matte", typeof(PushMatteFn));
+                _overlayStatus = (OverlayStatusFn)Bind(module, "vws_overlay_status", typeof(OverlayStatusFn));
+                _overlayRead = (OverlayReadFn)Bind(module, "vws_overlay_read", typeof(OverlayReadFn));
                 _pushRelease = (PushReleaseFn)Bind(module, "vws_push_release", typeof(PushReleaseFn));
                 _poll = (PollFn)Bind(module, "vws_poll", typeof(PollFn));
                 _drain = (DrainFn)Bind(module, "vws_drain_log", typeof(DrainFn));
@@ -212,6 +239,54 @@ namespace VamDlssNrWorkScale
         internal static int PushGuide(uint set, int index, int eyes, float[] window, float[] previous, bool topDown)
         {
             return _pushGuide(set, (uint)index, (uint)eyes, window, previous, topDown ? 1u : 0u);
+        }
+
+        // Sharpens that texture where it lies; `eyes` 2 for a double-wide stereo frame.
+        internal static int PushSharpen(IntPtr texture, float strength, int eyes)
+        {
+            return _pushSharpen(texture, strength, (uint)eyes);
+        }
+
+        // The passthrough pass and the camera worker behind it (see Passthrough.cs).
+        internal static void CamConfigure(float[] values)
+        {
+            _camConfigure(values, (uint)values.Length);
+        }
+
+        internal static int CamStart(IntPtr getFrameBuffer, ulong handle, uint width, uint height)
+        {
+            return _camStart(getFrameBuffer, handle, width, height);
+        }
+
+        internal static void CamStop()
+        {
+            _camStop();
+        }
+
+        internal static void CamStatus(out uint frames, out uint uploads, out int error)
+        {
+            _camStatus(out frames, out uploads, out error);
+        }
+
+        internal static int PushPassthrough(IntPtr target, int eyes, int eye, bool srgb, bool topDown, float[] eyeToRoom)
+        {
+            return _pushPassthrough(target, (uint)eyes, (uint)eye, srgb ? 1u : 0u, topDown ? 1u : 0u, eyeToRoom);
+        }
+
+        internal static int PushMatte(IntPtr source, int eyes, int eye, bool srgb, bool topDown, float[] headPose, bool fromAlpha)
+        {
+            return _pushMatte(source, (uint)eyes, (uint)eye, srgb ? 1u : 0u, topDown ? 1u : 0u, headPose, fromAlpha ? 1u : 0u);
+        }
+
+        // The overlay's picture as RGBA bytes: asks for the next one drawn, returns the last one kept.
+        internal static bool OverlayRead(byte[] rgba, out uint width, out uint height)
+        {
+            return _overlayRead(rgba, (uint)rgba.Length, out width, out height) != 0;
+        }
+
+        internal static void OverlayStatus(out int state, out uint frames, out int error)
+        {
+            _overlayStatus(out state, out frames, out error);
         }
 
         internal static int PushRelease(uint set)
@@ -2854,6 +2929,16 @@ namespace VamDlssNrWorkScale
                     }
                 }
 
+                if (HeadsetUi.Hooked && HeadsetUi.CfgSharpen != null)
+                {
+                    M_slider.Invoke(__instance, new object[] { 0f, "Sharpening", HeadsetUi.CfgSharpen });
+                }
+
+                if (M_toggle != null && HeadsetUi.Hooked && HeadsetUi.CfgOn != null)
+                {
+                    M_toggle.Invoke(__instance, new object[] { 0f, "Sharp headset menu", HeadsetUi.CfgOn, false, null, false });
+                }
+
                 M_live.Invoke(__instance, new object[] { 0f, new Func<string>(StatusLine) });
 
                 if (M_liveWarn != null)
@@ -2929,7 +3014,7 @@ namespace VamDlssNrWorkScale
     public class WorkScalePlugin : BaseUnityPlugin
     {
         public const string Guid = "jeahbwoi720.vamdlssnr.workscale";
-        public const string Version = "1.5.1";
+        public const string Version = "1.6.0";
 
         // What every build's settings file is called after its owner prefix.
         private const string SettingsSuffix = ".vamdlssnr.workscale.cfg";
@@ -3061,6 +3146,67 @@ namespace VamDlssNrWorkScale
                 "The network's cost does not change with any of that. MonitorWidth x MonitorHeight then stands for the AREA the network is given, not for a window size: a small figure gets the network's pixels one for one, a figure that fills the screen gets them spread thinner (the status line says how thin). Growing, shrinking and moving are free; a change of SHAPE rebuilds the network, a hitch of a fifth of a second, so a shape is kept for a couple of seconds at least.\n\n" +
                 "Off, the window is MonitorWidth x MonitorHeight of the screen and only follows.");
 
+            Passthrough.CfgOn = Config.Bind("Passthrough", "Enabled", false,
+                "In a headset whose cameras SteamVR can read (a PlayStation VR2 with PSVR2Toolkit 1.0.0 or later), show the room wherever the finished frame is the key colour: put a backdrop of that colour behind the person and the room appears in its place, with the person and the interface left as they are.\n\n" +
+                "The cameras are monochrome and give 60 pictures a second; the room is drawn into the game's own frame, so what moves in it moves at the game's frame rate.");
+            Passthrough.CfgMode = Config.Bind("Passthrough", "Mode", 0, new ConfigDescription(
+                "How the room is shown. 0: as a SteamVR overlay of its own, drawn by a thread that keeps the camera's pace (60 pictures a second) however slowly the game runs -- SteamVR places it for the head at the headset's own rate, and the game only says where it shows. 1: drawn into the game's own frame, where it moves at the game's frame rate.",
+                new AcceptableValueRange<int>(0, 1)));
+            Passthrough.CfgOverlayShape = Config.Bind("Passthrough", "OverlayOtherShape", false,
+                "Mode 0 only. The overlay holds the two eyes' pictures side by side, and SteamVR's rule for how tall such an overlay stands is not written down. If the room looks squashed or stretched top to bottom, turn this on.");
+
+            Passthrough.CfgOverlayDistance = Config.Bind("Passthrough", "OverlayDistance", 10f, new ConfigDescription(
+                "Mode 0 only. How far away the overlay's quad stands, in metres. SteamVR carries the game's picture to a moving head by turning it, as if it were infinitely far; a quad that stands close shifts against it when the head moves sideways, and the cut-out around the person opens on one side. Far away, the two move as one.",
+                new AcceptableValueRange<float>(1f, 60f)));
+            Passthrough.CfgRoomBehind = Config.Bind("Passthrough", "OverlayRoomBehind", true,
+                "Mode 0 only. Draw the room into the game's own frame as well, underneath the overlay. Wherever the overlay's cut-out and the person do not quite meet, the room shows instead of the key colour.");
+
+            Passthrough.CfgPoseSource = Config.Bind("Passthrough", "CutOutPose", 0, new ConfigDescription(
+                "Which head pose the game's frame is taken to have been drawn from, when the overlay's cut-out is fitted to it: 0 the one Unity gave the camera for this frame; 1 the one SteamVR last handed out. If they differ, the wrong one makes the cut-out run ahead of the person, or trail, while the head turns.",
+                new AcceptableValueRange<int>(0, 1)));
+            Passthrough.CfgPoseTiming = Config.Bind("Passthrough", "CutOutTimingMs", 0f, new ConfigDescription(
+                "Moves that pose along the head's turning by this many milliseconds. If the person is cut on the side away from the turn while the head moves, lower it; if on the side of the turn, raise it.",
+                new AcceptableValueRange<float>(-80f, 80f)));
+
+            Passthrough.CfgPreset = Config.Bind("Passthrough", "KeyPreset", 1, new ConfigDescription(
+                "The key colour, by name: 0 as the three numbers below stand, 1 green, 2 blue, 3 magenta, 4 black, 5 white. Choosing one writes the three numbers.",
+                new AcceptableValueRange<int>(0, 5)));
+            Passthrough.CfgRed = Config.Bind("Passthrough", "KeyRed", 0f, new ConfigDescription("The key colour's red, as displayed (0 to 1).", new AcceptableValueRange<float>(0f, 1f)));
+            Passthrough.CfgGreen = Config.Bind("Passthrough", "KeyGreen", 1f, new ConfigDescription("The key colour's green, as displayed (0 to 1).", new AcceptableValueRange<float>(0f, 1f)));
+            Passthrough.CfgBlue = Config.Bind("Passthrough", "KeyBlue", 0f, new ConfigDescription("The key colour's blue, as displayed (0 to 1).", new AcceptableValueRange<float>(0f, 1f)));
+            Passthrough.CfgTolerance = Config.Bind("Passthrough", "Tolerance", 0.3f, new ConfigDescription(
+                "How far a pixel's colour may be from the key colour and still be replaced. Raise it if patches of the backdrop are left; lower it if parts of the person turn into the room.",
+                new AcceptableValueRange<float>(0.02f, 1f)));
+            Passthrough.CfgSoftness = Config.Bind("Passthrough", "EdgeSoftness", 0.15f, new ConfigDescription(
+                "How gradually the room fades in beyond the tolerance: the width of the soft edge around the person.",
+                new AcceptableValueRange<float>(0f, 0.6f)));
+            Passthrough.CfgDistance = Config.Bind("Passthrough", "Distance", 1.5f, new ConfigDescription(
+                "How far away the room is taken to be, in metres. The cameras are not where the eyes are, so things at this distance line up with where they really are; nearer and farther things are slightly off.",
+                new AcceptableValueRange<float>(0.3f, 10f)));
+            Passthrough.CfgBrightness = Config.Bind("Passthrough", "Brightness", 1f, new ConfigDescription("Camera brightness.", new AcceptableValueRange<float>(0.2f, 4f)));
+            Passthrough.CfgFocal = Config.Bind("Passthrough", "LensFocal", 382.6f, new ConfigDescription(
+                "The cameras' fisheye scale, in pixels per radian for a 1016-pixel-wide lens picture. Measured on a PlayStation VR2; it sets the room's apparent size -- raise it if the room looks too small, lower it if too large.",
+                new AcceptableValueRange<float>(200f, 600f)));
+            Passthrough.CfgFollowHead = Config.Bind("Passthrough", "FollowHead", false,
+                "Carry the camera's picture from where the head was when it was taken to where the head is now, so a turning head does not drag the room with it. Off, the room is drawn as if no time had passed.");
+            Passthrough.CfgView = Config.Bind("Passthrough", "View", 0, new ConfigDescription(
+                "0 the picture; 1 the matte (white where the room will show) for setting the tolerance; 2 the camera everywhere, for looking at the room alone.",
+                new AcceptableValueRange<int>(0, 2)));
+            Passthrough.CfgPreset.SettingChanged += delegate { Passthrough.ApplyPreset(); };
+
+            HeadsetUi.CfgSharpen = Config.Bind("Picture", "Sharpening", 0f, new ConfigDescription(
+                "Sharpen the finished frame, after DLSS and Neural Rendering and before the interface is drawn: 0 is off, 1 the most. DLSS has no sharpening of its own any more, and its picture -- DLAA's most of all -- is on the soft side.\n\n" +
+                "The filter is contrast-adaptive: soft detail gains the most, flat areas and edges that are already hard are left nearly alone, and nothing is pushed beyond the darkest and brightest of its neighbours, so it does not ring.",
+                new AcceptableValueRange<float>(0f, 1f)));
+
+            HeadsetUi.CfgMethod = Config.Bind("Interface", "HeadsetDrawWhen", 0, new ConfigDescription(
+                "When FullSizeInHeadset draws the interface: 0 at the end of the frame, with the single-pass stereo shader keyword off (the way that works); 1 at the end of the frame with the keyword left alone; 2 at once, inside VaM DLSS's own frame. For finding what a given headset runtime needs -- leave at 0.",
+                new AcceptableValueRange<int>(0, 2)));
+
+            HeadsetUi.CfgOn = Config.Bind("Interface", "FullSizeInHeadset", false,
+                "Draw VaM's interface apart from the scene in a headset, the way VaM DLSS does on the monitor: its layers ([General] UILayerMask in VaM DLSS's file) come off the scene and are drawn afterwards, at the headset's full size, onto the frame DLSS and Neural Rendering have finished with. The menu is then neither rendered small by a DLSS quality mode nor reworked by either.\n\n" +
+                "The interface is drawn with nothing of the scene's depth behind it, so it is always on top: a hand or a person in front of the menu does not cover it.");
+
             // The in-headset panel needs none of what follows: it is offered VamDlssNr's settings
             // even when the frame hook below cannot go in.
             ControlPanel.Watch();
@@ -3105,6 +3251,21 @@ namespace VamDlssNrWorkScale
                 return;
             }
 
+            // The headset's interface pass stands apart, with a Harmony of its own: if it cannot
+            // go in, it alone is taken back out.
+            HeadsetUi.Resolve();
+            HeadsetUi.Apply(new Harmony(Guid + ".headsetui"));
+
+            if (HeadsetUi.Problem.Length != 0)
+            {
+                Logger.LogWarning("[vws] " + HeadsetUi.Problem);
+            }
+
+            if (HeadsetUi.Hooked)
+            {
+                StartCoroutine(EndOfFrames());
+            }
+
             if (Hooks.PanelProblem.Length != 0)
             {
                 Logger.LogWarning("[vws] " + Hooks.PanelProblem);
@@ -3124,8 +3285,31 @@ namespace VamDlssNrWorkScale
 #endif
         }
 
+        private void OnApplicationQuit()
+        {
+            Passthrough.Stop();
+        }
+
+        // The headset's interface is drawn once every camera has rendered (see HeadsetUi).
+        private IEnumerator EndOfFrames()
+        {
+            WaitForEndOfFrame wait = new WaitForEndOfFrame();
+
+            while (true)
+            {
+                yield return wait;
+                HeadsetUi.EndOfFrame();
+            }
+        }
+
         private void Update()
         {
+            // Nothing, unless the panel's button started a probe.
+            CameraProbe.Tick(Time.unscaledTime);
+
+            // Gives the headset's camera back once passthrough has not been drawn for a while.
+            Passthrough.Tick(Time.unscaledTime);
+
             // The in-headset panel stands apart from the rest: a fault in it takes only it down.
             if (!ControlPanel.Off)
             {

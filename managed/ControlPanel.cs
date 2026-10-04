@@ -495,7 +495,19 @@ namespace VamDlssNrWorkScale
             Choice(p, Right, "DLSS quality", Mod<int>("CfgSrQuality"),
                 new[] { "DLAA (native)", "Ultra Quality", "Quality", "Balanced", "Performance", "Ultra Performance" }, new[] { 5, 4, 2, 1, 0, 3 });
             Choice(p, Right, "DLSS model", Mod<int>("CfgSrModel"), new[] { "DLSS 3", "DLSS 4", "DLSS 4.5" }, new[] { 0, 1, 2 });
-            Slider(p, Right, "DLSS texture sharpening", Mod<float>("CfgMipBiasStrength"), "F2");
+            // Not a sharpening filter: how far textures are biased towards their sharper mips while
+            // DLSS upscales. It does nothing at DLAA.
+            Slider(p, Right, "DLSS texture detail (not DLAA)", Mod<float>("CfgMipBiasStrength"), "F2");
+
+            if (HeadsetUi.Hooked && HeadsetUi.CfgSharpen != null)
+            {
+                Slider(p, Right, "Sharpening (0 = off)", HeadsetUi.CfgSharpen, "F2");
+            }
+
+            if (HeadsetUi.Hooked && HeadsetUi.CfgOn != null)
+            {
+                Toggle(p, Right, "Headset menu at full size", HeadsetUi.CfgOn);
+            }
 
             Toggle(p, Right, "Frame generation (monitor only)", Mod<bool>("CfgFrameGen"));
             Choice(p, Right, "Frame generation multiplier", Mod<int>("CfgFgMultiplier"), new[] { "2x", "3x", "4x" }, new[] { 2, 3, 4 });
@@ -551,9 +563,41 @@ namespace VamDlssNrWorkScale
                 ToDefault(motionY);
             });
 
+            if (HeadsetUi.Hooked && Passthrough.CfgOn != null)
+            {
+                Toggle(p, Right, "Passthrough (headset)", Passthrough.CfgOn);
+                Choice(p, Right, "Passthrough mode", Passthrough.CfgMode, new[] { "Own overlay (camera's pace)", "In the game's frame" }, new[] { 0, 1 });
+                Slider(p, Right, "Passthrough overlay distance (m)", Passthrough.CfgOverlayDistance, "F0");
+                Toggle(p, Right, "Passthrough overlay: room behind", Passthrough.CfgRoomBehind);
+                Choice(p, Right, "Passthrough key colour", Passthrough.CfgPreset, new[] { "Custom", "Green", "Blue", "Magenta", "Black", "White" }, new[] { 0, 1, 2, 3, 4, 5 });
+                Slider(p, Right, "Passthrough key: red", Passthrough.CfgRed, "F2");
+                Slider(p, Right, "Passthrough key: green", Passthrough.CfgGreen, "F2");
+                Slider(p, Right, "Passthrough key: blue", Passthrough.CfgBlue, "F2");
+                Slider(p, Right, "Passthrough tolerance", Passthrough.CfgTolerance, "F2");
+                Slider(p, Right, "Passthrough edge softness", Passthrough.CfgSoftness, "F2");
+                Slider(p, Right, "Passthrough distance (m)", Passthrough.CfgDistance, "F2");
+                Slider(p, Right, "Passthrough brightness", Passthrough.CfgBrightness, "F2");
+                Slider(p, Right, "Passthrough room size", Passthrough.CfgFocal, "F0");
+                Toggle(p, Right, "Passthrough follows head", Passthrough.CfgFollowHead);
+                Choice(p, Right, "Passthrough view", Passthrough.CfgView, new[] { "Picture", "Matte", "Camera everywhere" }, new[] { 0, 1, 2 });
+
+                Button(p, Right, "Passthrough: save a capture", delegate
+                {
+                    Passthrough.CaptureWanted = true;
+                });
+            }
+
+            // What the headset's cameras give SteamVR, written to the log: the first question any
+            // passthrough has to ask.
+            Button(p, Right, "Probe headset camera (to log)", delegate
+            {
+                CameraProbe.Begin(Time.unscaledTime);
+            });
+
             Button(p, Right, "Reset NR strengths to defaults", delegate
             {
-                ToDefault(Hooks.CfgScale);
+                // Not the model resolution: that one is a frame-rate setting, and putting it back to
+                // 100% from a button about strengths halves the frame rate without saying so.
                 ToDefault(intensity);
                 ToDefault(tone);
                 ToDefault(structure);
@@ -741,6 +785,23 @@ namespace VamDlssNrWorkScale
             if (model.Length != 0)
             {
                 sb.Append(model).Append('\n');
+            }
+
+            string menu = HeadsetUi.Line();
+
+            if (menu.Length != 0)
+            {
+                sb.Append(menu).Append('\n');
+            }
+
+            if (Passthrough.Status.Length != 0)
+            {
+                sb.Append(Passthrough.Status).Append('\n');
+            }
+
+            if (CameraProbe.Summary.Length != 0)
+            {
+                sb.Append(CameraProbe.Summary).Append('\n');
             }
 
             foreach (FieldInfo field in new[] { F_chain, F_upscale, F_pace })
