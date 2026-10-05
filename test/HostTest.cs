@@ -403,6 +403,27 @@ public static class HostTest
         Check(!EyeSize.ScaleWrong(0.3333f, 0.1111f, 1f, 1f), "a scale somebody has just written is VaM DLSS's to take first");
         Check(!EyeSize.ScaleWrong(0.3333f, 0.1111f, 0.1111f, 0f), "without VaM's preference nothing is judged");
         Check(!EyeSize.ScaleWrong(0f, 0f, 1f, 1f), "nothing held yet: nothing to put right");
+
+        // put right as often as it goes wrong over a session, but not in a tug-of-war
+        EyeSize.Allowance allowance = new EyeSize.Allowance();
+        int taken = 0;
+
+        for (int i = 0; i < 40; i++)
+        {
+            taken += allowance.Take(100f + i * 30f) ? 1 : 0;
+        }
+
+        Check(taken == 40, "something that goes wrong every half minute is put right every time: " + taken + " of 40");
+        allowance = new EyeSize.Allowance();
+        taken = 0;
+
+        for (int i = 0; i < 20; i++)
+        {
+            taken += allowance.Take(100f + i * 0.75f) ? 1 : 0;
+        }
+
+        Check(taken == 4, "something that goes wrong again at once is put right four times and then left: " + taken);
+        Check(!allowance.Take(119f) && allowance.Take(120.5f), "and again once the first of those is twenty seconds ago");
     }
 
     private static void GazeFollowing()

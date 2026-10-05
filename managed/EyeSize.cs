@@ -111,6 +111,31 @@ namespace VamDlssNrWorkScale
             }
         }
 
+        // How often a thing may be put right: so many times within so many seconds, and then not
+        // until the oldest of those is that long ago. A session's log had the scale go wrong at
+        // every change of DLSS quality, minutes apart, and stay right in between -- that is to be
+        // put right every time, however long the session. What this keeps from happening is a
+        // tug-of-war with something that wants it otherwise, frame after frame.
+        internal sealed class Allowance
+        {
+            internal float Within = 20f;
+
+            private readonly float[] _at = { -1e9f, -1e9f, -1e9f, -1e9f };
+            private int _next;
+
+            internal bool Take(float now)
+            {
+                if (now - _at[_next] < Within)
+                {
+                    return false;
+                }
+
+                _at[_next] = now;
+                _next = (_next + 1) % _at.Length;
+                return true;
+            }
+        }
+
         // ---- SteamVR's size for an eye ----------------------------------------------------------
 
         [DllImport("kernel32", CharSet = CharSet.Unicode)]
@@ -227,14 +252,15 @@ namespace VamDlssNrWorkScale
 
         // ---- every frame ------------------------------------------------------------------------
 
-        private const int MostLines = 160, MostCorrections = 4;
+        private const int MostLines = 160;
 
         private static readonly Patience _patience = new Patience(), _scalePatience = new Patience();
-        private static int _scaleCorrections;
+        private static readonly Allowance _allowance = new Allowance(), _scaleAllowance = new Allowance();
+        private static float _noteUntil;
         private static readonly float[] _said = new float[6];
         private static readonly int[] _saidSizes = new int[6];
         private static string _saidDevice = "";
-        private static int _lines, _corrections, _saidVerdict = -1;
+        private static int _lines, _saidVerdict = -1;
         private static float _askAt;
         private static int _steamW, _steamH;
         private static bool _off;
@@ -243,6 +269,12 @@ namespace VamDlssNrWorkScale
 
         internal static void Tick(float now)
         {
+            // (what was put right is said in the panel for a while, not for the rest of the session)
+            if (Note.Length != 0 && now > _noteUntil)
+            {
+                Note = "";
+            }
+
             if (_off || !XRSettings.enabled)
             {
                 return;
@@ -296,14 +328,15 @@ namespace VamDlssNrWorkScale
                 {
                     Once("VaM DLSS takes " + held.ToString("0.000") + " for your eye scale where VaM's Render Scale is " + preference.ToString("0.00") + ": [Headset] CorrectEyeSize is off, so it stays (moving VaM's Render Scale slider puts it right)");
                 }
-                else if (_scaleCorrections >= MostCorrections)
+                else if (!_scaleAllowance.Take(now))
                 {
-                    Once("VaM DLSS's idea of your eye scale has gone wrong " + (MostCorrections + 1) + " times this session (now " + held.ToString("0.000") + " against VaM's Render Scale " + preference.ToString("0.00") + "): left alone from here on");
+                    Once("VaM DLSS's idea of your eye scale has been put right four times within " + _scaleAllowance.Within.ToString("0") + " seconds and is wrong again (" + held.ToString("0.000") + " against VaM's Render Scale " + preference.ToString("0.00") +
+                        "): something keeps setting it. Left alone for a while.");
                 }
                 else
                 {
                     F_base.SetValue(null, preference);
-                    _scaleCorrections++;
+                    _noteUntil = now + 20f;
                     Note = "eye scale put right: VaM DLSS had taken " + held.ToString("0.000") + " for yours, VaM's Render Scale is " + preference.ToString("0.00");
                     Say("VaM DLSS was multiplying its DLSS ratio onto an eye scale of " + held.ToString("0.000") + " (eye scale in force " + scale.ToString("0.000") + "), where VaM's Render Scale is " + preference.ToString("0.00") +
                         ". It is given VaM's: the eye scale becomes " + (preference * (held > 0f ? set / held : 1f)).ToString("0.000") + ".");
@@ -323,16 +356,16 @@ namespace VamDlssNrWorkScale
                 return;
             }
 
-            if (_corrections >= MostCorrections)
+            if (!_allowance.Take(now))
             {
-                Once("VaM DLSS's size for the headset's picture has gone wrong " + (MostCorrections + 1) + " times this session (now " + was + " against SteamVR's " + _steamW + "x" + _steamH + "): left alone from here on");
+                Once("VaM DLSS's size for the headset's picture has been put right four times within " + _allowance.Within.ToString("0") + " seconds and is wrong again (" + was + " against SteamVR's " + _steamW + "x" + _steamH + "): left alone for a while");
                 return;
             }
 
             F_anchorW.SetValue(null, _steamW);
             F_anchorH.SetValue(null, _steamH);
             F_anchorScale.SetValue(null, 1f);
-            _corrections++;
+            _noteUntil = now + 20f;
             Note = "headset size put right: " + _steamW + "x" + _steamH + " (VaM DLSS had measured " + anchorW + "x" + anchorH + ")";
             Say("VaM DLSS had measured the headset's picture as " + was + "; SteamVR's size for an eye is " + _steamW + "x" + _steamH + ", and the eye texture (" + eyeW + "x" + eyeH + " at eye scale " + scale.ToString("0.000") +
                 ") agrees with SteamVR. Its measurement is put right: it reconstructs to " + _steamW + "x" + _steamH + " from here on.");
