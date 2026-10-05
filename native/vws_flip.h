@@ -692,7 +692,8 @@ UINT PaceNext(IDXGISwapChain* self)
     if (n == 0)
         InterlockedIncrement(&p.dropped);
 
-    InterlockedExchange(&p.rate, (LONG) (rate * 1000.0));
+    // (kept in thousandths in a LONG: capped where that would run over)
+    InterlockedExchange(&p.rate, (LONG) ((rate < 1.0e6 ? rate : 1.0e6) * 1000.0));
     InterlockedExchange(&p.each, (LONG) (each * 1000.0));
     InterlockedExchange(&p.queue, waiting < 0 ? -1 : (LONG) waiting * 1000);
     return n;

@@ -51,7 +51,7 @@ namespace VamDlssNrWorkScale
     internal static class Native
     {
         private const string Dll = "VamDlssNrWorkScaleNative";
-        private const uint ExpectedAbi = 17;
+        private const uint ExpectedAbi = 21;
 
         internal const uint Frame = 1, Proxy = 2, Model = 4, Result = 8;
         internal const int ReadyDown = 1, ReadyResolve = 2, ReadyGuide = 4; // ReadyGuide << n for guide n
@@ -117,6 +117,14 @@ namespace VamDlssNrWorkScale
         private static FoveaEventFn _foveaEvent;
         private static FoveaConfigureFn _foveaConfigure;
         private static FoveaStatusFn _foveaStatus;
+        private delegate void FoveaMissesFn(out uint noTarget, out uint small, out uint byDepth);
+        private static FoveaMissesFn _foveaMisses;
+        private delegate void FoveaAskedFn(out uint asked, out uint noDevice);
+        private static FoveaAskedFn _foveaAsked;
+        private delegate int FoveaEventForFn(uint camera, uint opaque);
+        private delegate void FoveaMeasuredFn([Out] ulong[] runs, [Out] uint[] times);
+        private static FoveaEventForFn _foveaEventFor;
+        private static FoveaMeasuredFn _foveaMeasured;
         private delegate void FlipStatusFn(out int state, out uint width, out uint height, out uint presents, out uint tearing);
         private static FlipStatusFn _flipStatus;
         private delegate void FlipPaceFn(int on, uint multiplier);
@@ -219,6 +227,10 @@ namespace VamDlssNrWorkScale
                 _foveaEvent = (FoveaEventFn)Bind(module, "vws_fovea_event", typeof(FoveaEventFn));
                 _foveaConfigure = (FoveaConfigureFn)Bind(module, "vws_fovea_configure", typeof(FoveaConfigureFn));
                 _foveaStatus = (FoveaStatusFn)Bind(module, "vws_fovea_status", typeof(FoveaStatusFn));
+                _foveaMisses = (FoveaMissesFn)Bind(module, "vws_fovea_misses", typeof(FoveaMissesFn));
+                _foveaAsked = (FoveaAskedFn)Bind(module, "vws_fovea_asked", typeof(FoveaAskedFn));
+                _foveaEventFor = (FoveaEventForFn)Bind(module, "vws_fovea_event_for", typeof(FoveaEventForFn));
+                _foveaMeasured = (FoveaMeasuredFn)Bind(module, "vws_fovea_measured", typeof(FoveaMeasuredFn));
                 _flipStatus = (FlipStatusFn)Bind(module, "vws_flip_status", typeof(FlipStatusFn));
                 _flipPace = (FlipPaceFn)Bind(module, "vws_flip_pace", typeof(FlipPaceFn));
                 _flipPaceStatus = (FlipPaceStatusFn)Bind(module, "vws_flip_pace_status", typeof(FlipPaceStatusFn));
@@ -341,6 +353,28 @@ namespace VamDlssNrWorkScale
         internal static void FoveaStatus(out int state, out uint width, out uint height, out uint samples, out uint coarse, out uint ons)
         {
             _foveaStatus(out state, out width, out height, out samples, out coarse, out ons);
+        }
+
+        // "On" for the camera with this number (0: the scene's), for its opaque pass or another.
+        internal static int FoveaEventFor(int camera, bool opaque)
+        {
+            return _foveaEventFor((uint)camera, opaque ? 1u : 0u);
+        }
+
+        // Four numbers each: the opaque pass with the rates and without, then the transparent pass.
+        internal static void FoveaMeasured(ulong[] runs, uint[] times)
+        {
+            _foveaMeasured(runs, times);
+        }
+
+        internal static void FoveaAsked(out uint asked, out uint noDevice)
+        {
+            _foveaAsked(out asked, out noDevice);
+        }
+
+        internal static void FoveaMisses(out uint noTarget, out uint small, out uint byDepth)
+        {
+            _foveaMisses(out noTarget, out small, out byDepth);
         }
 
         // What became of the flip-model window the preloader patcher armed (vws_flip.h).
@@ -3351,7 +3385,7 @@ namespace VamDlssNrWorkScale
             Foveation.CfgMonitor = Config.Bind("Foveation", "OnMonitor", false,
                 "Also in desktop mode, around the middle of the window.");
 
-            Presentation.CfgFlip = Config.Bind("Presentation", "FlipModel", true,
+            Presentation.CfgFlip = Config.Bind("Presentation", "FlipModel", false,
                 "Monitor mode only, and read when VaM starts: present the game's window with the flip model instead of Unity's old bit-block copy. " +
                 "With the old way the desktop compositor drops most frames above the base rate -- frame generation renders more frames and the picture gets no smoother -- and RTX HDR cannot take the window. " +
                 "Needs VaM's own anti-aliasing off (DLSS does that job) and the file in BepInEx\\patchers that comes with this plugin.");
@@ -3370,8 +3404,8 @@ namespace VamDlssNrWorkScale
                 "Who moves VaM's own hands while hand tracking is on. 0 Controllers: the tracked hands are only shown. 1 Auto: a controller that is being moved or squeezed has its hand; a hand the cameras see, whose controller lies still, follows the cameras. 2 Hands: the cameras have every hand they see. " +
                 "It is done through VaM's Leap Motion hands, without a Leap sensor and without touching VaM's Leap switch. To touch and push a person with them, VaM's own hand collision has to be on (User Preferences).",
                 new AcceptableValueRange<int>(0, 2)));
-            HandUi.CfgOn = Config.Bind("Hands", "Menus", true,
-                "While a tracked hand drives VaM's hand: point at VaM's menus with it (a line from the hand shows where), pinch thumb and index to click, hold the pinch to drag a slider or scroll. " +
+            HandUi.CfgOn = Config.Bind("Hands", "Menus", false,
+                "Not working yet. While a tracked hand drives VaM's hand: point at VaM's menus with it (a line from the hand shows where), pinch thumb and index to click, hold the pinch to drag a slider or scroll. " +
                 "Turn the left palm to your face and pinch to open or close the menu. The controller's own pointer comes back the moment the controller is picked up.");
             Hands.CfgSwap = Config.Bind("Hands", "SwapLeftRight", false,
                 "Turn on if the left hand is shown as the right one (orange) and the right as the left (blue).");

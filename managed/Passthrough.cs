@@ -799,6 +799,30 @@ namespace VamDlssNrWorkScale
         }
         private static int _loggedState = -1;
 
+        private static System.Reflection.FieldInfo _hudVisible;
+        private static bool _hudLooked;
+
+        // Is VaM's main menu showing? (Its own flag; without it, no.)
+        private static bool MenuOpen()
+        {
+            if (!_hudLooked)
+            {
+                _hudLooked = true;
+                _hudVisible = typeof(SuperController).GetField("_mainHUDVisible", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public);
+            }
+
+            SuperController sc = SuperController.singleton;
+
+            try
+            {
+                return _hudVisible != null && sc != null && (bool)_hudVisible.GetValue(sc);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
         // The matte, once the interface has been drawn: `eyes` the two reconstructed eyes, else
         // `wide` holds both side by side.
         internal static void MatteLate(RenderTexture wide, RenderTexture[] eyes, bool topDown)
@@ -1026,7 +1050,13 @@ namespace VamDlssNrWorkScale
             bool posed = LastPose();
             bool drew = false;
 
-            if (overlay)
+            // The room comes in front of the scene where it is nearer -- and the depth buffer knows
+            // nothing of the interface. Drawn over the frame afterwards it is told apart by the
+            // frame's alpha; while it is part of the scene itself (the full-size menu off, or
+            // VamDlssNr's pipeline idle) it cannot be, and the room would be drawn over the menu
+            // wherever no figure stands behind it. So with the menu open and in the scene, the
+            // room stays behind.
+            if (overlay && !(MenuOpen() && !matteLater))
             {
                 SceneDepth();
             }

@@ -28,19 +28,23 @@ namespace VamDlssNrWorkScale
         internal static string Status = "";
 
         // The native half's block of numbers (FovField in vws.cpp).
-        private const int FOn = 0, FCentre = 1, FInner = 5, FOuter = 6, FStrong = 7, FShow = 8, FTopDown = 9;
+        private const int FOn = 0, FCentre = 1, FInner = 5, FOuter = 6, FStrong = 7, FShow = 8, FTopDown = 9, FWide = 10, FHigh = 11;
         private static readonly float[] _values = new float[16];
         private static readonly float[] _gaze = new float[4];
 
         private sealed class Wired
         {
             internal Camera Camera;
-            internal CommandBuffer On, Off;
+            internal CommandBuffer On, OnOpaque, Off;
         }
 
         private static readonly List<Wired> _wired = new List<Wired>();
         private static bool _listening, _failed, _wasOn;
-        private static float _statusAt;
+        private static float _statusAt, _countedAt = -1f, _saidAt = -100f, _measuredSaidAt = -100f;
+        private static uint _measuredWidth;
+        private static readonly ulong[] _runs = new ulong[4];
+        private static readonly uint[] _times = new uint[4];
+        private static uint _onsThen, _noTargetThen, _smallThen;
         private static bool _tracked;
 
         internal static void Begin()
@@ -88,12 +92,71 @@ namespace VamDlssNrWorkScale
 
             _statusAt = now + 0.5f;
             int state;
-            uint width, height, samples, coarse, ons;
+            uint width, height, samples, coarse, ons, noTarget, small, byDepth;
             Native.FoveaStatus(out state, out width, out height, out samples, out coarse, out ons);
+            Native.FoveaMisses(out noTarget, out small, out byDepth);
+
+            // How often it was really switched on since the last look, and how often it was asked
+            // and could not: a setting that reads "on" and does nothing is the thing to catch.
+            float span = _countedAt >= 0f ? Mathf.Max(0.05f, now - _countedAt) : 0f;
+            float applied = span > 0f ? (ons - _onsThen) / span : -1f;
+            float refused = span > 0f ? ((noTarget - _noTargetThen) + (small - _smallThen)) / span : 0f;
+            _countedAt = now;
+            _onsThen = ons;
+            _noTargetThen = noTarget;
+            _smallThen = small;
+
+            string doing = applied < 0f ? "" :
+                applied < 1f ? "\nfoveation is NOT being applied" + (refused >= 1f ? " (no picture bound at the scene's pass, " + refused.ToString("F0") + "/s)" : " (its moment in the frame never comes)") :
+                ", applied " + applied.ToString("F0") + "/s";
+
+            if (applied >= 0f && applied < 1f && _wired.Count != 0 && now - _saidAt > 10f && Hooks.Warn != null)
+            {
+                _saidAt = now;
+                uint asked, noDevice;
+                Native.FoveaAsked(out asked, out noDevice);
+                string cameras = "";
+
+                for (int i = 0; i < _wired.Count; i++)
+                {
+                    Camera c = _wired[i].Camera;
+                    cameras += (i != 0 ? ", " : "") + (c == null ? "(gone)" : "'" + c.name + "' " + (c.isActiveAndEnabled ? "on" : "off") + " " + c.actualRenderingPath +
+                        " buffers " + c.GetCommandBuffers(CameraEvent.BeforeForwardOpaque).Length + "/" + c.commandBufferCount);
+                }
+
+                Hooks.Warn("foveation: switched on but not applied -- state " + state + ", its event reached the card's side " + asked + " times in all (no device " + noDevice + "), refused " + refused.ToString("F0") +
+                    "/s (no target " + noTarget + ", small " + small + ", by depth " + byDepth + "), cameras: " + cameras);
+            }
+
+            // What it saves, as counted on the card: the pixel shader's runs over the scene's
+            // opaque pass with the rates and (one frame now and then) without.
+            Native.FoveaMeasured(_runs, _times);
+            string saves = "";
+            ulong with = _runs[0] + _runs[2], without = _runs[1] + _runs[3];
+            bool both = _times[0] != 0 && _times[1] != 0 && _times[2] != 0 && _times[3] != 0;
+
+            if (both && without > 0)
+            {
+                float less = 100f * (1f - (float)with / (float)without);
+                saves = "\n" + (less >= 3f ? less.ToString("F0") + "% fewer pixels shaded (measured)" : "NO fewer pixels shaded (measured): no effect");
+            }
+
+            if (state == 1 && (_times[0] | _times[1] | _times[2] | _times[3]) != 0 && (now - _measuredSaidAt > 15f || width != _measuredWidth))
+            {
+                _measuredSaidAt = now;
+                _measuredWidth = width;
+
+                if (Hooks.Info != null)
+                {
+                    Hooks.Info("foveation: " + width + "x" + height + ", applied " + applied.ToString("F0") + "/s; pixel shader runs with the rates / without -- opaque pass " + _runs[0] + " / " + _runs[1] +
+                        ", transparent pass " + _runs[2] + " / " + _runs[3] + "; counted " + _times[0] + "/" + _times[1] + " and " + _times[2] + "/" + _times[3] + " times" +
+                        (CfgShow.Value ? "; zones shown, so nothing is being counted without" : ""));
+                }
+            }
 
             Status = "foveation: " + (
                 state == 1 ? width + "x" + height + (samples > 1 ? ", " + samples + "x anti-aliasing" : "") + ", " + coarse + "% shaded coarsely, " +
-                    (_tracked ? "following the eyes" : (CfgGaze.Value ? "lens centre (no gaze: " + Gaze.Status + ")" : "lens centre")) :
+                    (_tracked ? "following the eyes" : (CfgGaze.Value ? "lens centre (no gaze: " + Gaze.Status + ")" : "lens centre")) + doing + saves :
                 state == 2 ? "this graphics card has no variable rate shading (NVIDIA, GTX 16 / RTX 20 series or later)" :
                 state == 3 ? "the driver refused it (see the log)" :
                 "waiting for the scene camera");
@@ -137,16 +200,30 @@ namespace VamDlssNrWorkScale
         {
             Wired w = new Wired();
             w.Camera = camera;
+            // Number 0 is the camera the scene is seen through (it draws the ordinary layers); a
+            // camera that draws only an interface -- a scene plugin's, after it -- is another. The
+            // first is the one whose opaque pass the native half measures.
+            bool scene = (camera.cullingMask & 1) != 0;
+
+            for (int i = 0; scene && i < _wired.Count; i++)
+            {
+                scene = _wired[i].Camera == null || (_wired[i].Camera.cullingMask & 1) == 0;
+            }
+
+            int number = scene ? 0 : Mathf.Min(15, 1 + _wired.Count);
             w.On = new CommandBuffer();
             w.On.name = "Vws foveation on";
-            w.On.IssuePluginEvent(Native.EventFunc, Native.FoveaEvent(true));
+            w.On.IssuePluginEvent(Native.EventFunc, Native.FoveaEventFor(number, false));
+            w.OnOpaque = new CommandBuffer();
+            w.OnOpaque.name = "Vws foveation on (opaque)";
+            w.OnOpaque.IssuePluginEvent(Native.EventFunc, Native.FoveaEventFor(number, true));
             w.Off = new CommandBuffer();
             w.Off.name = "Vws foveation off";
             w.Off.IssuePluginEvent(Native.EventFunc, Native.FoveaEvent(false));
 
             // Around the geometry and nothing else. (Whichever way the camera renders: the deferred
             // events simply never come in forward, and the other way round.)
-            camera.AddCommandBuffer(CameraEvent.BeforeForwardOpaque, w.On);
+            camera.AddCommandBuffer(CameraEvent.BeforeForwardOpaque, w.OnOpaque);
             camera.AddCommandBuffer(CameraEvent.AfterForwardOpaque, w.Off);
             camera.AddCommandBuffer(CameraEvent.BeforeGBuffer, w.On);
             camera.AddCommandBuffer(CameraEvent.AfterGBuffer, w.Off);
@@ -169,7 +246,7 @@ namespace VamDlssNrWorkScale
 
                 if (w.Camera != null)
                 {
-                    w.Camera.RemoveCommandBuffer(CameraEvent.BeforeForwardOpaque, w.On);
+                    w.Camera.RemoveCommandBuffer(CameraEvent.BeforeForwardOpaque, w.OnOpaque);
                     w.Camera.RemoveCommandBuffer(CameraEvent.AfterForwardOpaque, w.Off);
                     w.Camera.RemoveCommandBuffer(CameraEvent.BeforeGBuffer, w.On);
                     w.Camera.RemoveCommandBuffer(CameraEvent.AfterGBuffer, w.Off);
@@ -179,6 +256,7 @@ namespace VamDlssNrWorkScale
                 }
 
                 w.On.Release();
+                w.OnOpaque.Release();
                 w.Off.Release();
             }
 
@@ -236,6 +314,21 @@ namespace VamDlssNrWorkScale
 
                         _tracked = true;
                     }
+                }
+
+                // The size of what the scene is drawn into: in a headset the eye texture as it is
+                // allocated now (both eyes side by side in one, as VaM renders), which shrinks and
+                // grows with DLSS's quality mode; on the monitor the camera's own.
+                if (camera.stereoEnabled)
+                {
+                    bool pair = UnityEngine.XR.XRSettings.eyeTextureDesc.vrUsage == VRTextureUsage.TwoEyes;
+                    _values[FWide] = UnityEngine.XR.XRSettings.eyeTextureWidth * (pair ? 2 : 1);
+                    _values[FHigh] = UnityEngine.XR.XRSettings.eyeTextureHeight;
+                }
+                else
+                {
+                    _values[FWide] = camera.pixelWidth;
+                    _values[FHigh] = camera.pixelHeight;
                 }
 
                 float inner = CfgInner.Value, outer = Mathf.Max(CfgOuter.Value, inner);

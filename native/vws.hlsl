@@ -434,6 +434,14 @@ cbuffer PassthroughParams : register(b1)
     float4 pMisc;    // eye, eyes in the target, target holds encoded values, first row at the top
 };
 
+// The alpha the game's own picture is marked with while the room's depth is in use. The interface is
+// drawn over the frame afterwards with ordinary blending, which leaves a^2 + mark * (1 - a) in the
+// alpha for a pixel of opacity a: anything above the mark is interface. The mark is low so that
+// this holds for a see-through panel too -- at a half, a panel under about 85% opacity stayed
+// below the old threshold, was taken for scene with nothing near behind it, and the room was drawn
+// over it everywhere but in front of the person.
+static const float kOwn = 32.0 / 255.0;
+
 float4 PSPassthrough(float4 pos : SV_Position) : SV_Target
 {
     const float4 c = tFrame.Load(int3(int2(pos.xy), 0));
@@ -441,13 +449,13 @@ float4 PSPassthrough(float4 pos : SV_Position) : SV_Target
 
     // With an overlay to be cut by this frame, its alpha is made to say where the room went: 1 for
     // the game's own picture, 0 for the room.
-    // With the room's depth in use the game's own picture is marked with a half: what is drawn
-    // over the frame afterwards -- the interface -- raises that to 1, and can so be told from it.
+    // With the room's depth in use the game's own picture is marked with kOwn: what is drawn
+    // over the frame afterwards -- the interface -- raises that, and can so be told from it.
     const bool halved = pCam.w >= 15.5;
     const float asked = halved ? pCam.w - 16.0 : pCam.w;
     const bool mark = asked >= 7.5;
     const int view = (int) (mark ? asked - 8.0 : asked);
-    const float own = halved ? 0.5 : 1.0;
+    const float own = halved ? kOwn : 1.0;
 
     const float3 seen = encoded ? saturate(c.rgb) : LinearToSrgb(saturate(c.rgb));
     float matte = 1.0 - smoothstep(pKey.a, pKey.a + max(pTune.x, 1e-4), length(seen - pKey.rgb));
@@ -535,15 +543,22 @@ float4 PSMatte(float4 pos : SV_Position) : SV_Target
     float matte = 1.0 - smoothstep(pKey.a, pKey.a + max(pTune.x, 1e-4), length(seen - pKey.rgb));
 
     // Where the room has been drawn into the frame already, its alpha says so (see PSPassthrough).
-    // (pCentre.x: the game's own picture was marked with a half, and more than that is the
+    // (pCentre.x: the game's own picture was marked with kOwn, and more than that is the
     // interface, drawn over the frame since.)
     bool menu = false;
 
     if (pCam.w > 0.5)
     {
         const bool halved = pCentre.x > 0.5;
-        matte = 1.0 - saturate(halved ? c.a * 2.0 : c.a);
-        menu = halved && c.a > 0.75;
+        // The room pass left 0 where it put the room and 1 (kOwn, with the room's depth in use)
+        // on the game's own picture. The interface, drawn over the frame since with ordinary
+        // blending, leaves only a^2 of its opacity a in the alpha over the room: read as it
+        // stands, a half-transparent panel let three quarters of the overlay through and was all
+        // but gone -- except in front of the person, where the alpha was 1 to begin with. The
+        // frame under the interface is right as it is (the room is in it, the interface over it),
+        // so a little alpha is taken for the whole of it: the overlay is cut away there.
+        matte = 1.0 - saturate(c.a / kOwn);
+        menu = halved && c.a > kOwn + 4.0 / 255.0;
     }
 
     // Beside the matte, how near the scene is along this line of sight: one over its distance in

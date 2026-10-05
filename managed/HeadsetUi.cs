@@ -19,6 +19,15 @@
 // headset frame the frame before: if its pipeline stops (DLSS and NR both off, a debug view), the
 // interface goes back into the scene on the next frame.
 //
+// Someone else's interface camera. A scene plugin can have taken the interface off the scene
+// camera already and given it to a camera of its own that renders after it -- MacGruber's
+// PostMagic does (its "CameraHook"), so that its image effects leave the menu alone. That camera
+// draws into the game's frame; while DLSS is upscaling in a headset the compositor is handed the
+// reconstructed eyes instead, and the menu is nowhere to be seen (reported as "enabling DLSS-SR is
+// making menus not accessible", in some scenes only). So when the scene camera carries none of the
+// interface's layers and another headset camera does, the interface is drawn onto the reconstructed
+// eyes here as well -- whether "full size" is switched on or not, since without it there is no menu.
+//
 // The same moment -- the finished frame, about to be handed on -- is where the sharpening pass
 // runs, on the monitor as in a headset and for stills too: first the picture is sharpened, then
 // the interface is drawn over it, so the menu is never sharpened.
@@ -49,6 +58,7 @@ namespace VamDlssNrWorkScale
         private static FieldInfo F_srPresented;
         private static FieldInfo F_present;
         private static MethodInfo M_missStreak, M_substitution;
+        private static FieldInfo F_anchorW, F_anchorScale;
 
         // Any capture's frame while its Compose runs: where it goes, and whether it has been
         // finished yet.
@@ -71,6 +81,55 @@ namespace VamDlssNrWorkScale
 
         private static Camera _stripped;
         private static int _removed;
+
+        // The interface's layers are not the scene camera's this frame but another camera's (see
+        // the top): nothing was taken off, and nothing is to be put back.
+        private static bool _borrowed, _pendingBorrowed, _wasBorrowed;
+        private static Camera[] _cameras = new Camera[16];
+        private static int _nElsewhere;
+
+        // What became of the interface, frame by frame, since the last line in the log: taken off
+        // the camera, noted to be drawn, drawn (and onto what), and each way it can fall through.
+        // A menu that is gone has its reason in these.
+        private static int _nOff, _nNoLayers, _nNotLive, _nNoted, _nNotedNothingOff, _nNeverFinished, _nDrawnEyes, _nDrawnFrame, _nLate, _nEyesGone, _nNoTarget;
+        private static float _tallyAt, _talliedAt;
+        private static string _tally = "";
+
+        private static void Tally(float now)
+        {
+            if (now < _tallyAt)
+            {
+                return;
+            }
+
+            _tallyAt = now + 2f;
+            int drawn = _nDrawnEyes + _nDrawnFrame;
+            bool lost = _nOff > drawn + 2;
+            string line = "taken off " + _nOff + ", noted " + _nNoted + ", drawn onto the eyes " + _nDrawnEyes + " / the frame " + _nDrawnFrame +
+                "; not live " + _nNotLive + ", camera without the layers " + _nNoLayers + ", frame never finished " + _nNeverFinished +
+                ", end of another frame " + _nLate + ", eyes gone " + _nEyesGone + ", no target " + _nNoTarget + ", nothing off when noted " + _nNotedNothingOff +
+                ", drawn by another camera " + _nElsewhere;
+
+            if (lost)
+            {
+                _tally = " -- NOT DRAWN in " + (_nOff - drawn) + " of " + _nOff + " frames";
+                Say("the menu was taken off the camera and not drawn back: " + line);
+            }
+            else
+            {
+                _tally = "";
+
+                // (and now and then what it did, so that a menu that is gone for another reason
+                // has this half of the story on record)
+                if ((_nOff != 0 || _nElsewhere != 0) && now >= _talliedAt)
+                {
+                    _talliedAt = now + 20f;
+                    Say("the last two seconds: " + line);
+                }
+            }
+
+            _nOff = _nNoLayers = _nNotLive = _nNoted = _nNotedNothingOff = _nNeverFinished = _nDrawnEyes = _nDrawnFrame = _nLate = _nEyesGone = _nNoTarget = _nElsewhere = 0;
+        }
         private static int _drawnFrame = -1;
         private static bool _perEye;
         private static bool _failed;
@@ -100,6 +159,15 @@ namespace VamDlssNrWorkScale
             // What VamDlssNr's submit hook says of itself (optional: only for telling, see EndOfFrame).
             M_missStreak = typeof(VamDlssNrPlugin).GetMethod("VrMissStreak", any, null, Type.EmptyTypes, null);
             M_substitution = typeof(VamDlssNrPlugin).GetMethod("VrSubstitution", any, null, Type.EmptyTypes, null);
+
+            // The headset's own picture size as VamDlssNr measured it (optional: see WatchAnchor).
+            F_anchorW = capture.GetField("_vrAnchorW", any);
+            F_anchorScale = capture.GetField("_vrAnchorScale", any);
+
+            if (F_anchorW == null || !F_anchorW.IsStatic || F_anchorW.FieldType != typeof(int) || F_anchorScale == null || !F_anchorScale.IsStatic || F_anchorScale.FieldType != typeof(float))
+            {
+                F_anchorW = F_anchorScale = null;
+            }
 
             FieldInfo layers = typeof(VamDlssNrPlugin).GetField("CfgUiLayerMask", any);
             _modLayers = layers != null ? layers.GetValue(null) as ConfigEntry<int> : null;
@@ -188,13 +256,13 @@ namespace VamDlssNrWorkScale
             }
 
             // Whatever a frame that never reached its end left behind.
-            Restore();
-
-            if (!Wanted())
+            if ((object)_stripped != null && !_presented)
             {
-                _live = false;
-                return;
+                _nNeverFinished++;
             }
+
+            Restore();
+            Tally(Time.unscaledTime);
 
             Camera camera = Hooks.CameraOf(__instance);
 
@@ -204,22 +272,142 @@ namespace VamDlssNrWorkScale
                 return;
             }
 
-            if (!_live)
+            WatchAnchor();
+
+            int layers = Layers();
+
+            // Drawn by a camera of someone else's, after this one: noted, so that it is put onto
+            // the reconstructed eyes if those are what the headset is given.
+            Camera other = !_failed && (camera.cullingMask & layers) == 0 ? OtherInterfaceCamera(camera, layers) : null;
+
+            if (other != null)
             {
+                _stripped = camera;
+                _removed = other.cullingMask & layers;
+                _borrowed = true;
+                _presented = false;
+                _nElsewhere++;
                 return;
             }
 
-            int layers = Layers();
+            if (!Wanted())
+            {
+                _live = false;
+                return;
+            }
+
+            if (!_live)
+            {
+                _nNotLive++;
+                return;
+            }
+
             int removed = camera.cullingMask & layers;
 
             if (removed == 0)
             {
+                _nNoLayers++;
                 return;
             }
 
             camera.cullingMask &= ~layers;
             _stripped = camera;
             _removed = removed;
+            _presented = false;
+            _nOff++;
+        }
+
+        // VamDlssNr measures the headset's picture size once -- its "anchor" -- and reconstructs to
+        // that from then on. If the size changes afterwards, it goes on reconstructing to the old
+        // one: seen in sessions that began at 1020x1040 an eye and were at 2040x2080 a little
+        // later, where every upscaling mode then gave the headset a 1020x1040 picture, menu and
+        // all. The eye texture Unity allocates is the headset's size times the eye scale in force,
+        // so the anchor can be checked against it every frame, and the mismatch said. (Clearing
+        // the anchor to make VamDlssNr measure again was tried and made it worse: it measured
+        // while its own reduced scale was still in force, and took that for the headset's.)
+        private static int _anchorWrong;
+        private static float _anchorSaidAt = -100f;
+        internal static string AnchorNote = "";
+
+        private static void WatchAnchor()
+        {
+            if (F_anchorW == null)
+            {
+                return;
+            }
+
+            try
+            {
+                int anchor = (int)F_anchorW.GetValue(null);
+                float at = (float)F_anchorScale.GetValue(null);
+                int actual = UnityEngine.XR.XRSettings.eyeTextureWidth;
+                float scale = UnityEngine.XR.XRSettings.eyeTextureResolutionScale;
+
+                if (anchor <= 0 || at <= 0f || actual <= 0 || scale <= 0f)
+                {
+                    _anchorWrong = 0;
+                    return;
+                }
+
+                float expected = anchor * (scale / at);
+
+                // (a change of scale takes a frame or two to reach the texture: only a lasting
+                // difference counts, and only a plain one)
+                if (Mathf.Abs(actual - expected) <= Mathf.Max(3f, expected * 0.04f))
+                {
+                    _anchorWrong = 0;
+                    AnchorNote = "";
+                    return;
+                }
+
+                if (++_anchorWrong < 90)
+                {
+                    return;
+                }
+
+                int native = Mathf.RoundToInt(actual / scale);
+                AnchorNote = "VaM DLSS took the headset for " + Mathf.RoundToInt(anchor / at) + " wide, it is " + native + ": restart VaM for a sharp picture";
+
+                if (Time.unscaledTime - _anchorSaidAt > 60f)
+                {
+                    _anchorSaidAt = Time.unscaledTime;
+                    Say("the headset's picture is " + actual + " wide at eye scale " + scale.ToString("0.000") + " (so " + native + " at full size), but VaM DLSS measured " + anchor + " at " + at.ToString("0.000") +
+                        " when it started and reconstructs for that: restarting VaM makes it measure again");
+                }
+            }
+            catch (Exception)
+            {
+                F_anchorW = null;
+            }
+        }
+
+        // An enabled headset camera other than the scene's that renders the interface's layers
+        // after it, or null.
+        private static Camera OtherInterfaceCamera(Camera main, int layers)
+        {
+            int count = Camera.allCamerasCount;
+
+            if (count > _cameras.Length)
+            {
+                _cameras = new Camera[count + 8];
+            }
+
+            count = Camera.GetAllCameras(_cameras);
+            Camera found = null;
+
+            for (int i = 0; i < count; i++)
+            {
+                Camera c = _cameras[i];
+
+                if (c != null && c != main && c.stereoEnabled && c.targetTexture == null && (c.cullingMask & layers) != 0 && c.depth > main.depth)
+                {
+                    found = c;
+                }
+
+                _cameras[i] = null;
+            }
+
+            return found;
         }
 
         public static void ComposePrefix(NrCapture __instance, RenderTexture __0, RenderTexture __1)
@@ -250,7 +438,7 @@ namespace VamDlssNrWorkScale
             _dst = null;
             _presented = false;
 
-            if (!Wanted() || __1 == null || !stereo)
+            if ((!Wanted() && !_borrowed) || __1 == null || !stereo)
             {
                 return;
             }
@@ -445,7 +633,7 @@ namespace VamDlssNrWorkScale
         {
             if ((object)_stripped != null)
             {
-                if (_stripped != null)
+                if (_stripped != null && !_borrowed)
                 {
                     _stripped.cullingMask |= _removed;
                 }
@@ -453,6 +641,8 @@ namespace VamDlssNrWorkScale
                 _stripped = null;
                 _removed = 0;
             }
+
+            _borrowed = false;
         }
 
         // How and when the two eyes are drawn.
@@ -465,7 +655,6 @@ namespace VamDlssNrWorkScale
 
         private const string StereoKeyword = "UNITY_SINGLE_PASS_STEREO";
         private static Camera _camera;
-        private static RenderTexture _depth;
         private static int _reportedMethod = -1;
 
         // What the end of the frame is to draw, noted while VamDlssNr composed it.
@@ -492,13 +681,16 @@ namespace VamDlssNrWorkScale
             if ((object)_stripped == null || _stripped == null)
             {
                 _presented = true;
+                _nNotedNothingOff++;
                 return false;
             }
 
             _drawnFrame = Time.frameCount;
             _presented = true;
+            _nNoted++;
+            _pendingBorrowed = _borrowed;
 
-            if (Method() == 2)
+            if (Method() == 2 && !_borrowed)
             {
                 return Guarded(delegate { Draw(_stripped, _removed, eyes, frame, Hooks.NetIsTopDown(), true); });
             }
@@ -522,6 +714,13 @@ namespace VamDlssNrWorkScale
         {
             if (_pendingFrame != Time.frameCount)
             {
+                // noted in a frame whose end never came here: said, and dropped
+                if (_pendingFrame >= 0)
+                {
+                    _nLate++;
+                    _pendingFrame = -1;
+                }
+
                 return;
             }
 
@@ -545,6 +744,7 @@ namespace VamDlssNrWorkScale
                 if (_pendingEyes[0] != null && _pendingEyes[1] != null && _pendingEyes[0].IsCreated() && _pendingEyes[1].IsCreated())
                 {
                     Guarded(delegate { Draw(main, _pendingLayers, _pendingEyes, null, Hooks.NetIsTopDown(), keywordOff); });
+                    _nDrawnEyes++;
 
                     // And the camera's own frame as well. The reconstructed eyes reach the headset
                     // only when VamDlssNr's hook on the compositor's submit puts them in place of
@@ -553,7 +753,8 @@ namespace VamDlssNrWorkScale
                     // scene that happens (reported: "enabling DLSS-SR is making menus not
                     // accessible", only where the frame rate is low), and the menu was gone for as
                     // long as it did. Drawn into both, it is there whichever of the two is shown.
-                    if (!_failed && dst != null && dst.IsCreated())
+                    // (not where another camera has drawn it into the frame already)
+                    if (!_failed && !_pendingBorrowed && dst != null && dst.IsCreated())
                     {
                         Guarded(delegate { Draw(main, _pendingLayers, null, dst, false, keywordOff); });
                         _perEye = true;
@@ -565,19 +766,40 @@ namespace VamDlssNrWorkScale
                 else if (dst != null && dst.IsCreated())
                 {
                     // the eyes went away between the frame's composing and its end: the frame, then
-                    Guarded(delegate { Draw(main, _pendingLayers, null, dst, false, keywordOff); });
+                    if (!_pendingBorrowed)
+                    {
+                        Guarded(delegate { Draw(main, _pendingLayers, null, dst, false, keywordOff); });
+                    }
+
                     MatteAfterMenu(dst, null, false);
+                    _nEyesGone++;
+                    _nDrawnFrame++;
+                }
+                else
+                {
+                    _nNoTarget++;
                 }
             }
             else if (dst != null && dst.IsCreated())
             {
                 // The camera's own target, which VamDlssNr has filled by now: a render texture
-                // like any other, first row at the bottom.
-                Guarded(delegate { Draw(main, _pendingLayers, null, dst, false, keywordOff); });
+                // like any other, first row at the bottom. (Where the interface is another
+                // camera's, that camera has drawn it there by now, and the frame is what is shown.)
+                if (!_pendingBorrowed)
+                {
+                    Guarded(delegate { Draw(main, _pendingLayers, null, dst, false, keywordOff); });
+                }
+
                 MatteAfterMenu(dst, null, false);
+                _nDrawnFrame++;
+            }
+            else
+            {
+                _nNoTarget++;
             }
 
             _pendingEyes[0] = _pendingEyes[1] = null;
+            _wasBorrowed = _pendingBorrowed;
         }
 
         // How often VamDlssNr's submit hook did not put the reconstructed eyes in the frame's
@@ -746,26 +968,41 @@ namespace VamDlssNrWorkScale
             }
         }
 
+        private static readonly RenderTexture[] _depths = new RenderTexture[2];
+        private static int _depthTurn;
+
+        // One for each size in use: the reconstructed eyes and the camera's own frame are drawn
+        // into in the same frame and differ in size, and a single one would be made anew twice a
+        // frame.
         private static RenderTexture Depth(RenderTexture like)
         {
             int aa = like.antiAliasing > 1 ? like.antiAliasing : 1;
 
-            if (_depth != null && _depth.width == like.width && _depth.height == like.height && _depth.antiAliasing == aa && _depth.IsCreated())
+            for (int i = 0; i < _depths.Length; i++)
             {
-                return _depth;
+                RenderTexture d = _depths[i];
+
+                if (d != null && d.width == like.width && d.height == like.height && d.antiAliasing == aa && d.IsCreated())
+                {
+                    return d;
+                }
             }
 
-            if (_depth != null)
+            int at = _depthTurn;
+            _depthTurn = (_depthTurn + 1) % _depths.Length;
+
+            if (_depths[at] != null)
             {
-                _depth.Release();
-                UnityEngine.Object.Destroy(_depth);
+                _depths[at].Release();
+                UnityEngine.Object.Destroy(_depths[at]);
             }
 
-            _depth = new RenderTexture(like.width, like.height, 24, RenderTextureFormat.R8, RenderTextureReadWrite.Linear);
-            _depth.antiAliasing = aa;
-            _depth.hideFlags = HideFlags.HideAndDontSave;
-            _depth.Create();
-            return _depth;
+            RenderTexture made = new RenderTexture(like.width, like.height, 24, RenderTextureFormat.R8, RenderTextureReadWrite.Linear);
+            made.antiAliasing = aa;
+            made.hideFlags = HideFlags.HideAndDontSave;
+            made.Create();
+            _depths[at] = made;
+            return made;
         }
 
         private static void Say(string line)
@@ -853,6 +1090,16 @@ namespace VamDlssNrWorkScale
                 return CfgOn != null && CfgOn.Value ? Problem : "";
             }
 
+            if (AnchorNote.Length != 0)
+            {
+                return AnchorNote;
+            }
+
+            if (_wasBorrowed)
+            {
+                return "headset menu: another camera's (a scene plugin) -- put onto DLSS's picture" + _tally;
+            }
+
             if (CfgOn == null || !CfgOn.Value)
             {
                 return "";
@@ -863,8 +1110,8 @@ namespace VamDlssNrWorkScale
                 return "headset menu: in the scene (no headset frame from VaM DLSS yet)";
             }
 
-            return _perEye ? "headset menu: drawn at full size, after DLSS" + (_missFrames != 0 ? " (" + _missFrames + " frames not reconstructed)" : "") :
-                "headset menu: drawn after DLSS and Neural Rendering";
+            return (_perEye ? "headset menu: drawn at full size, after DLSS" + (_missFrames != 0 ? " (" + _missFrames + " frames not reconstructed)" : "") :
+                "headset menu: drawn after DLSS and Neural Rendering") + _tally;
         }
     }
 }

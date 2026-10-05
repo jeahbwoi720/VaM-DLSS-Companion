@@ -60,9 +60,10 @@
 
 namespace
 {
-const uint32_t kAbi = 17;
+const uint32_t kAbi = 21;
 const int kEventMagic = 0x57530000; // 'WS'
-const int kEventFovea = 0x57460000; // 'WF': | 1 foveated shading on for what is drawn next, | 2 off
+const int kEventFovea = 0x57460000; // 'WF': low byte 1 = foveated shading on for what is drawn next, 2 = off;
+                                    // bits 8-11 which camera (0 the scene's), bit 12 its opaque pass
 const int kEventMask = 0x7FFF0000;
 const int kSlots = 64;
 const uint32_t kSets = 16;
@@ -688,12 +689,21 @@ enum FovField : uint32_t
     kFovStrong = 7,   // 1: the coarsest rate is as coarse as the target's anti-aliasing allows, else as the ring's
     kFovShow = 8,     // 1: beyond the outer radius nothing is shaded at all -- to see where the zones are
     kFovTopDown = 9,  // 1: the target's first row is the top of the picture
+    kFovWide = 10,    // the size of the target the scene is drawn into, as the game knows it (0: whatever is bound)
+    kFovHigh = 11,
 };
 
 SRWLOCK g_fovLock = SRWLOCK_INIT;
 float g_fovCfg[kFovFloats] {};
 void* g_fovAnyTexture = nullptr; // a texture of the game's device: the way to that device
 volatile LONG g_fovState = 0, g_fovW = 0, g_fovH = 0, g_fovSamples = 0, g_fovCoarse = 0, g_fovOns = 0;
+volatile LONG g_fovAsked = 0, g_fovNoDevice = 0;
+// What it does, measured: the pixel shader's runs over the scene camera's opaque pass [0] and its
+// transparent pass [1] (where VaM draws people), with the rates in force [.][0] and, every so often
+// for one frame, without [.][1]; and how often each has been counted.
+volatile LONG64 g_fovPs[2][2] = {};
+volatile LONG g_fovPsTimes[2][2] = {};
+volatile LONG g_fovNoTarget = 0, g_fovSmall = 0, g_fovByDepth = 0; // asked for and not done: nothing bound, a small target; done by the depth target's size
 
 // The render thread's.
 struct Fovea
@@ -706,12 +716,28 @@ struct Fovea
     uint32_t w = 0, h = 0, samples = 0, tilesW = 0, tilesH = 0;
     float made[kFovFloats] {};
     uint8_t* tiles = nullptr;
+    // the measuring: a pipeline-statistics query round each of the scene camera's two passes
+    struct Meter
+    {
+        ID3D11Query* query = nullptr;
+        int stage = 0;        // 0 free, 1 begun, 2 ended and waiting to be read
+        bool control = false; // the pass being measured is drawn without the rates
+    } meter[2];
+    bool frameMeasure = false, frameControl = false; // decided at the opaque pass, for the frame
+    uint32_t passes = 0, measures = 0;
 } g_fov;
 
 void FoveaRelease()
 {
     SafeRelease(g_fov.view);
     SafeRelease(g_fov.map);
+    for (Fovea::Meter& m : g_fov.meter)
+    {
+        SafeRelease(m.query);
+        m.stage = 0;
+    }
+
+    g_fov.frameMeasure = g_fov.frameControl = false;
     delete[] g_fov.tiles;
     g_fov.tiles = nullptr;
     g_fov.w = g_fov.h = 0;
@@ -722,25 +748,48 @@ void FoveaRelease()
 
 void FoveaOff()
 {
+    for (Fovea::Meter& m : g_fov.meter)
+    {
+        if (g_ctx != nullptr && m.stage == 1 && m.query != nullptr)
+        {
+            g_ctx->End(m.query);
+            m.stage = 2;
+        }
+    }
+
     if (!g_fov.set || g_ctx == nullptr)
         return;
 
-    // No viewports named: off for all of them.
+    // Off for the viewport it was put on, by name: the rate table back to one shading a pixel.
+    NV_D3D11_VIEWPORT_SHADING_RATE_DESC plain[NV_MAX_NUM_VIEWPORTS];
+
+    for (NV_D3D11_VIEWPORT_SHADING_RATE_DESC& p : plain)
+    {
+        p = NV_D3D11_VIEWPORT_SHADING_RATE_DESC {};
+        p.enableVariablePixelShadingRate = false;
+
+        for (NV_PIXEL_SHADING_RATE& r : p.shadingRateTable)
+            r = NV_PIXEL_X1_PER_RASTER_PIXEL;
+    }
+
     NV_D3D11_VIEWPORTS_SHADING_RATE_DESC none {};
     none.version = NV_D3D11_VIEWPORTS_SHADING_RATE_DESC_VER;
-    none.numViewports = 0;
+    none.numViewports = NV_MAX_NUM_VIEWPORTS;
+    none.pViewports = plain;
     NvAPI_D3D11_RSSetViewportsPixelShadingRates(g_ctx, &none);
     NvAPI_D3D11_RSSetShadingRateResourceView(g_ctx, nullptr);
     g_fov.set = false;
 }
 
-void FoveaOn()
+void FoveaOn(uint32_t camera, bool opaque)
 {
     float cfg[kFovFloats];
     AcquireSRWLockShared(&g_fovLock);
     memcpy(cfg, g_fovCfg, sizeof(cfg));
     void* any = g_fovAnyTexture;
     ReleaseSRWLockShared(&g_fovLock);
+
+    InterlockedIncrement(&g_fovAsked);
 
     if (cfg[kFovOn] < 0.5f)
     {
@@ -752,13 +801,19 @@ void FoveaOn()
     ID3D11Device* device = DeviceOf(any);
 
     if (device == nullptr)
+    {
+        InterlockedIncrement(&g_fovNoDevice);
         return;
+    }
 
     const HRESULT ready = EnsureDevice(device);
     device->Release();
 
     if (FAILED(ready))
+    {
+        InterlockedIncrement(&g_fovNoDevice);
         return;
+    }
 
     // Can this card do it? Asked once a device.
     if (g_fov.askedOf != g_device)
@@ -788,17 +843,34 @@ void FoveaOn()
         return;
     }
 
-    // What is being drawn into.
+    // What is being drawn into. Its size is all that is wanted of it, so where no colour target is
+    // bound at this moment (a camera with a depth texture can be between its depth pass and its
+    // picture) the depth target, which is the same size, does as well.
     ID3D11RenderTargetView* rtv = nullptr;
-    g_ctx->OMGetRenderTargets(1, &rtv, nullptr);
-
-    if (rtv == nullptr)
-        return;
+    ID3D11DepthStencilView* dsv = nullptr;
+    g_ctx->OMGetRenderTargets(1, &rtv, &dsv);
 
     ID3D11Resource* resource = nullptr;
     ID3D11Texture2D* target = nullptr;
-    rtv->GetResource(&resource);
-    rtv->Release();
+
+    if (rtv != nullptr)
+    {
+        rtv->GetResource(&resource);
+    }
+    else if (dsv != nullptr)
+    {
+        dsv->GetResource(&resource);
+        InterlockedIncrement(&g_fovByDepth);
+    }
+
+    if (rtv) rtv->Release();
+    if (dsv) dsv->Release();
+
+    if (resource == nullptr)
+    {
+        InterlockedIncrement(&g_fovNoTarget);
+        return;
+    }
 
     if (resource != nullptr)
     {
@@ -813,9 +885,37 @@ void FoveaOn()
     target->GetDesc(&td);
     target->Release();
 
+    // The rates are laid over whatever is drawn into next, tile by tile, and the map has to be the
+    // size of that target. What is bound at this moment is not always it: with DLSS upscaling in a
+    // headset the scene is drawn into a smaller eye texture than the one still bound here, the map
+    // was made for the wrong size, and nothing came of it (while at DLAA, where the two are the
+    // same size, it worked). So the size the game gives for the scene's target is the one used.
+    const uint32_t wantW = (uint32_t) cfg[kFovWide], wantH = (uint32_t) cfg[kFovHigh];
+
+    if (wantW >= 256 && wantH >= 256 && (td.Width != wantW || td.Height != wantH))
+    {
+        static uint32_t saidW = 0, saidH = 0, saidWantW = 0;
+
+        if (saidW != td.Width || saidH != td.Height || saidWantW != wantW)
+        {
+            saidW = td.Width;
+            saidH = td.Height;
+            saidWantW = wantW;
+            Log("foveated shading: a %ux%u target is bound at its moment, the scene's is %ux%u: the rates are made for the scene's", td.Width, td.Height, wantW, wantH);
+        }
+
+        td.Width = wantW;
+        td.Height = wantH;
+        td.SampleDesc.Count = 1;
+        InterlockedIncrement(&g_fovByDepth);
+    }
+
     // (a shadow map, a probe: not the picture)
     if (td.Width < 256 || td.Height < 256)
+    {
+        InterlockedIncrement(&g_fovSmall);
         return;
+    }
 
     const uint32_t tw = (td.Width + NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH - 1) / NV_VARIABLE_PIXEL_SHADING_TILE_WIDTH;
     const uint32_t th = (td.Height + NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT - 1) / NV_VARIABLE_PIXEL_SHADING_TILE_HEIGHT;
@@ -848,6 +948,8 @@ void FoveaOn()
         vd.Format = DXGI_FORMAT_R8_UINT;
         vd.ViewDimension = NV_SRRV_DIMENSION_TEXTURE2D;
         vd.Texture2D.MipSlice = 0;
+
+        Log("foveated shading: rate map for a %ux%u target (%u sample%s)", td.Width, td.Height, td.SampleDesc.Count, td.SampleDesc.Count == 1 ? "" : "s");
 
         if (FAILED(hr) || NvAPI_D3D11_CreateShadingRateResourceView(g_device, g_fov.map, &vd, &g_fov.view) != NVAPI_OK)
         {
@@ -932,11 +1034,70 @@ void FoveaOn()
     one.shadingRateTable[2] = beyond;
     one.shadingRateTable[3] = NV_PIXEL_X0_CULL_RASTER_PIXELS;
 
-    // The same for every viewport the game has set (one, as a rule).
-    D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-    UINT count = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-    g_ctx->RSGetViewports(&count, viewports);
-    count = count < 1 ? 1 : (count > NV_MAX_NUM_VIEWPORTS ? NV_MAX_NUM_VIEWPORTS : count);
+    // The measuring. Every twentieth frame of the scene's camera has the pixel shader's runs
+    // counted over its opaque pass and over its transparent pass (where VaM draws people), and one
+    // in four of those frames is drawn WITHOUT the rates (not while the zones are being shown:
+    // that one frame would fill the hole) -- the counts say what foveation saves here, in this
+    // scene, at this size, and in which pass.
+    bool measure = false, control = false;
+    Fovea::Meter& meter = g_fov.meter[opaque ? 0 : 1];
+
+    if (camera == 0)
+    {
+        if (meter.stage == 2 && meter.query != nullptr)
+        {
+            D3D11_QUERY_DATA_PIPELINE_STATISTICS counted {};
+
+            if (g_ctx->GetData(meter.query, &counted, sizeof(counted), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
+            {
+                InterlockedExchange64(&g_fovPs[opaque ? 0 : 1][meter.control ? 1 : 0], (LONG64) counted.PSInvocations);
+                InterlockedIncrement(&g_fovPsTimes[opaque ? 0 : 1][meter.control ? 1 : 0]);
+                meter.stage = 0;
+            }
+        }
+
+        if (opaque)
+        {
+            g_fov.frameMeasure = ++g_fov.passes % 20 == 0;
+            g_fov.frameControl = g_fov.frameMeasure && cfg[kFovShow] < 0.5f && ++g_fov.measures % 4 == 0;
+        }
+
+        control = g_fov.frameControl;
+
+        if (g_fov.frameMeasure && meter.stage == 0)
+        {
+            if (meter.query == nullptr)
+            {
+                D3D11_QUERY_DESC qd {};
+                qd.Query = D3D11_QUERY_PIPELINE_STATISTICS;
+                g_device->CreateQuery(&qd, &meter.query);
+            }
+
+            measure = meter.query != nullptr;
+        }
+
+        // (the transparent pass is the frame's last: what was decided for the frame ends with it)
+        if (!opaque)
+            g_fov.frameMeasure = g_fov.frameControl = false;
+    }
+
+    if (control)
+    {
+        g_fov.set = true;
+        FoveaOff();
+
+        if (measure)
+        {
+            meter.control = true;
+            g_ctx->Begin(meter.query);
+            meter.stage = 1;
+        }
+
+        return;
+    }
+
+    // The same for every viewport there can be: the game sets them as it goes.
+    UINT count = NV_MAX_NUM_VIEWPORTS;
     NV_D3D11_VIEWPORT_SHADING_RATE_DESC all[NV_MAX_NUM_VIEWPORTS];
 
     for (UINT i = 0; i < count; ++i)
@@ -956,6 +1117,14 @@ void FoveaOn()
     }
 
     g_fov.set = true;
+
+    if (measure)
+    {
+        meter.control = false;
+        g_ctx->Begin(meter.query);
+        meter.stage = 1;
+    }
+
     InterlockedExchange(&g_fovState, 1);
     InterlockedExchange(&g_fovW, (LONG) td.Width);
     InterlockedExchange(&g_fovH, (LONG) td.Height);
@@ -3330,8 +3499,8 @@ void __stdcall OnRenderEvent(int eventId)
     // The two that a camera raises itself, every frame, with nothing queued for them.
     if ((eventId & kEventMask) == kEventFovea)
     {
-        if ((eventId & 0xFFFF) == 1)
-            FoveaOn();
+        if ((eventId & 0xFF) == 1)
+            FoveaOn((uint32_t) (eventId >> 8) & 0xF, (eventId & 0x1000) != 0);
         else
             FoveaOff();
 
@@ -3576,6 +3745,30 @@ VWS_EXPORT int vws_fovea_event(uint32_t on)
     return kEventFovea | (on != 0 ? 1 : 2);
 }
 
+// "On" for a camera by number (0: the one the scene is seen through) and for which of its passes.
+VWS_EXPORT int vws_fovea_event_for(uint32_t camera, uint32_t opaque)
+{
+    return kEventFovea | 1 | (int) ((camera & 0xF) << 8) | (opaque != 0 ? 0x1000 : 0);
+}
+
+// The pixel shader's runs as last counted over the scene camera's passes, four numbers: the opaque
+// pass with the rates in force and without, then the transparent pass with and without; and how
+// many times each has been counted.
+VWS_EXPORT void vws_fovea_measured(uint64_t* runs, uint32_t* times)
+{
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        for (int without = 0; without < 2; ++without)
+        {
+            if (runs != nullptr)
+                runs[pass * 2 + without] = (uint64_t) g_fovPs[pass][without];
+
+            if (times != nullptr)
+                times[pass * 2 + without] = (uint32_t) g_fovPsTimes[pass][without];
+        }
+    }
+}
+
 // What "on" works from (FovField), and any texture of the game's device. Main thread, every frame.
 VWS_EXPORT void vws_fovea_configure(const float* values, uint32_t count, void* anyTexture)
 {
@@ -3610,6 +3803,29 @@ VWS_EXPORT void vws_fovea_status(int32_t* state, uint32_t* width, uint32_t* heig
 
     if (ons != nullptr)
         *ons = (uint32_t) g_fovOns;
+}
+
+// How often it was asked to switch on and did not: with nothing bound to draw into, and with a
+// target too small to be the picture; and how often it went by the depth target's size.
+VWS_EXPORT void vws_fovea_asked(uint32_t* asked, uint32_t* noDevice)
+{
+    if (asked != nullptr)
+        *asked = (uint32_t) g_fovAsked;
+
+    if (noDevice != nullptr)
+        *noDevice = (uint32_t) g_fovNoDevice;
+}
+
+VWS_EXPORT void vws_fovea_misses(uint32_t* noTarget, uint32_t* small_, uint32_t* byDepth)
+{
+    if (noTarget != nullptr)
+        *noTarget = (uint32_t) g_fovNoTarget;
+
+    if (small_ != nullptr)
+        *small_ = (uint32_t) g_fovSmall;
+
+    if (byDepth != nullptr)
+        *byDepth = (uint32_t) g_fovByDepth;
 }
 
 // ---- the wearer's hands ---------------------------------------------------------------------------

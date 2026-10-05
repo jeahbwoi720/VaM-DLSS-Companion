@@ -40,7 +40,7 @@ if (-not ((Test-Path (Join-Path $deps 'onnxruntime_c_api.h')) -and (Test-Path (J
 
 $common = '/nologo /std:c++17 /O2 /W4 /EHsc /MT /DUNICODE /D_UNICODE'
 $dll = "cl $common /LD `"$here\vws.cpp`" /Fo`"$out\\`" /Fe`"$out\VamDlssNrWorkScaleNative.dll`" /link /NOLOGO d3d11.lib dxgi.lib dxguid.lib user32.lib `"$here\deps\nvapi\nvapi64.lib`""
-$test = "cl $common `"$here\vws_test.cpp`" /Fo`"$out\\`" /Fe`"$out\vws_test.exe`" /link /NOLOGO d3d11.lib dxguid.lib user32.lib"
+$test = "cl $common `"$here\vws_test.cpp`" /Fo`"$out\\`" /Fe`"$out\vws_test.exe`" /link /NOLOGO d3d11.lib dxguid.lib user32.lib d3dcompiler.lib"
 
 cmd /c "`"$vcvars`" >nul && $dll"
 if ($LASTEXITCODE -ne 0) { throw 'native DLL build failed' }

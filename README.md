@@ -217,6 +217,11 @@ it. Off by default. Used on a PlayStation VR2; not yet tried on other headsets.
 
 It is drawn over the picture, so a figure standing between you and the menu no longer hides it.
 
+Some scene plugins give the menu to a camera of their own, drawn after the scene (MacGruber's
+PostMagic does, to keep its image effects off the menu). With DLSS upscaling in a headset that
+camera's picture never reaches the headset and the menu was simply gone; the plugin now draws the
+menu onto DLSS's picture in that case, whether this switch is on or off.
+
 ## Passthrough (PlayStation VR2)
 
 *Passthrough (headset)* shows your room, through the headset's cameras, wherever the scene has a
@@ -232,6 +237,9 @@ background of that colour and the person stands in your room.
   show the cut-out on its own, which is the quickest way to set them. With black as the key, keep
   the tolerance low (0.02), or dark hair and shadows go with it.
 - With *Headset menu at full size* on, the menu stays in front of the room.
+- *Passthrough depth (experimental)*: the plugin works out how far away the room is from the two
+  cameras, and lets whatever in it is nearer than the figure show in front of the figure -- a hand
+  held out before it covers it. Rough at the edges, and it costs some frame rate.
 
 It needs the headset's cameras to reach SteamVR. On a PlayStation VR2 that takes
 [PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit) **1.0.0-experimental** or later. The
@@ -253,13 +261,16 @@ may work, but the lens model was measured on a PlayStation VR2 and nothing else 
 | `FollowHead` | false | mode 1: carry the camera's picture to where the head is now. Not tried since its last fix |
 | `View` | 0 | 1 = the cut-out alone, 2 = the camera everywhere |
 | `OverlayOtherShape`, `CutOutPose`, `CutOutTimingMs` | false, 0, 0 | for troubleshooting an overlay that sits wrong |
+| `Depth` | false | experimental: things in the room that are nearer than the figure show in front of it |
+| `DepthMargin`, `DepthSoftness` | 0.25, 0.1 | how much nearer a thing must be to show in front (as a difference of one over the distance), and over how much more it fades in |
+| `DepthUpsideDown` | false | for troubleshooting: take the scene's depth the other way up |
 
 ## Flip-model window and frame pacing (monitor)
 
 Unity 2018 presents VaM's window the old way: every frame is copied to the desktop compositor.
 Anything that needs a flip-model window cannot take it — NVIDIA's **RTX HDR**, for one. With
-*Monitor: flip-model window* on (it is by default), the window is made flip-model when VaM starts in
-monitor mode (`-vrmode None`). To the game nothing changes: it still draws into a back buffer of the
+*Monitor: flip-model window* on (it is off until you switch it on), the window is made flip-model
+when VaM starts in monitor mode (`-vrmode None`). To the game nothing changes: it still draws into a back buffer of the
 kind it asked for, and that is copied onto the real one at every present. In a headset nothing is
 done.
 
@@ -279,8 +290,8 @@ DLSS's own *space frames evenly* off with it. It adds up to about one rendered f
 
 | `[Presentation]` setting | Default | |
 |---|---|---|
-| `FlipModel` | true | the flip-model window, in monitor mode; read when VaM starts |
-| `FramePacing` | true | generated frames spread by the window's queue |
+| `FlipModel` | false | the flip-model window, in monitor mode; read when VaM starts |
+| `FramePacing` | true | generated frames spread by the window's queue (only with the flip-model window and frame generation on) |
 
 ## Foveated shading
 
@@ -288,6 +299,11 @@ DLSS's own *space frames evenly* off with it. It adds up to about one rendered f
 coarsely around that — variable rate shading, on a GTX 16 / RTX 20 series card or later. Edges and
 depth stay at full resolution; only the shading inside surfaces gets coarser. With eye tracking that
 reaches SteamVR it follows the gaze, otherwise it is centred on each lens.
+
+**Known limit:** in a headset it takes effect at DLAA and with DLSS off. With a DLSS upscaling
+mode (Quality, Balanced, Performance ...) it currently has no visible effect; that is on the
+roadmap. The status box says what it measures: `N% fewer pixels shaded (measured)`, or that there
+is no effect.
 
 It applies to the scene camera's own geometry: shadows, image effects, DLSS, Neural Rendering and
 the menu are untouched. It saves the graphics card's time, not the processor's — where VaM is held
@@ -318,15 +334,30 @@ with the plugin.
   follows the cameras. **Tracked hands**: the cameras have every hand they see. VaM's own hand
   models are driven (through VaM's Leap Motion path), so they touch and push what the controllers'
   hands do.
-- *Point and pinch menus* — while a tracked hand drives VaM's hand: a line from the hand points at
-  VaM's menus (it is aimed from the shoulder through the hand, so the arm points, not the fingers);
-  pinch thumb and index to click, hold the pinch to drag a slider or scroll. Turn the **left palm to
-  your face and pinch** to open or close the menu.
+- *Point and pinch menus* — **not working yet.** The idea: a line from the hand points at VaM's
+  menus, a pinch of thumb and index clicks and drags, and the left palm turned to your face with a
+  pinch opens or closes the menu. It is in the build, off unless switched on, and does not do its
+  job at present.
 
-This is the roughest part of the plugin. Finger poses are approximate — a fist and single raised
-fingers are the weak spots — a hand is lost when it leaves the cameras' view, and the cameras need
-light: in the dark an infra-red lamp works if it lights the side of your hands that faces you (from
-behind or above you, not from the desk in front).
+This is the roughest part of the plugin, and experimental throughout. Finger poses are approximate
+— a fist and single raised fingers are the weak spots — a hand is lost when it leaves the cameras'
+view, and the cameras need light: in the dark an infra-red lamp helps if it lights the side of your
+hands that faces you (from behind or above you, not from the desk in front).
+
+| `[Hands]` setting | Default | |
+|---|---|---|
+| `Tracking` | false | the switch |
+| `Drive` | 1 | who moves VaM's hands: 0 the controllers, 1 auto, 2 the tracked hands |
+| `ShowSkeleton` | true | draw the 21 points of each tracked hand |
+| `BothHands` | true | look for two hands, not one |
+| `EveryNthFrame` | 2 | look at every n-th camera frame (the cameras give 60 a second) |
+| `Steadiness`, `Quickness` | 1.5, 20 | smoothing: how slow a movement counts as jitter, and how much less a fast hand is smoothed |
+| `SwapLeftRight` | false | if left and right come out the wrong way round |
+| `Menus` | false | pointing and pinching at the menus (not working yet) |
+
+*Save a camera frame* and *record 8 s* on the Hands page write what the cameras saw into the
+plugin's folder, for reporting a hand that is not picked up. They are pictures of your room: delete
+them when done.
 
 ## In-headset controls
 

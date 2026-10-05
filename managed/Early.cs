@@ -6,7 +6,7 @@
 // loaded long after that, when the swap chain exists and can no longer be made any other way.
 //
 // All it does is load the plugin's native half and arm its flip-model presentation (see
-// native\vws_flip.h), in monitor mode and unless the plugin's settings say no.
+// native\vws_flip.h), in monitor mode and only if the plugin's settings say so.
 
 using System;
 using System.Collections.Generic;
@@ -54,7 +54,7 @@ namespace VamDlssNrWorkScale.Early
 
                 if (!Wanted())
                 {
-                    log.LogInfo("flip-model window: switched off ([Presentation] FlipModel = false)");
+                    log.LogInfo("flip-model window: not switched on ([Presentation] FlipModel)");
                     return;
                 }
 
@@ -109,14 +109,14 @@ namespace VamDlssNrWorkScale.Early
         }
 
         // The plugin's own settings file, read as text: the plugin is not loaded yet, and a second
-        // owner of the file would write over what the first one saves. On unless it says off.
+        // owner of the file would write over what the first one saves. Off unless it says on.
         private static bool Wanted()
         {
             string path = Path.Combine(Paths.ConfigPath, PluginGuid + ".cfg");
 
             if (!File.Exists(path))
             {
-                return true;
+                return false;
             }
 
             bool inSection = false;
@@ -132,11 +132,11 @@ namespace VamDlssNrWorkScale.Early
                 else if (inSection && line.StartsWith("FlipModel", StringComparison.OrdinalIgnoreCase))
                 {
                     int eq = line.IndexOf('=');
-                    return eq < 0 || !string.Equals(line.Substring(eq + 1).Trim(), "false", StringComparison.OrdinalIgnoreCase);
+                    return eq >= 0 && string.Equals(line.Substring(eq + 1).Trim(), "true", StringComparison.OrdinalIgnoreCase);
                 }
             }
 
-            return true;
+            return false;
         }
     }
 }

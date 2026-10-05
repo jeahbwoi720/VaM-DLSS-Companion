@@ -898,7 +898,7 @@ namespace VamDlssNrWorkScale
                 Page(p, "Hands");
                 Toggle(p, Left, "Hand tracking (experimental)", Hands.CfgOn);
                 Choice(p, Left, "Hand tracking: VaM's hands follow", HandDrive.CfgMode, new[] { "Controllers", "Auto", "Tracked hands" }, new[] { 0, 1, 2 });
-                Toggle(p, Left, "Hand tracking: point and pinch menus", HandUi.CfgOn);
+                Toggle(p, Left, "Hand tracking: menus (not working yet)", HandUi.CfgOn);
                 Toggle(p, Left, "Hand tracking: show skeleton", Hands.CfgShow);
                 Toggle(p, Left, "Hand tracking: both hands", Hands.CfgBoth);
                 Choice(p, Left, "Hand tracking: looks a second", Hands.CfgEvery, new[] { "60", "30", "20", "15" }, new[] { 1, 2, 3, 4 });

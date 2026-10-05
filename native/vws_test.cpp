@@ -10,6 +10,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <d3dcompiler.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -2536,6 +2537,158 @@ static void TestFovea(HMODULE dll)
     Drain(true);
 }
 
+// ---- foveated shading on a real card ---------------------------------------------------------------
+//
+// With "show the zones" on, beyond the outer radius nothing is shaded at all: a white picture drawn
+// with the rates in force stays black out there. That is a thing a readback can see. It is done at
+// one size, then at another (the map has to be made anew, as when DLSS's quality mode changes the
+// size of the eye texture), then at the first again -- it has to go on working through that.
+static bool FoveaDraws(void (*configure)(const float*, uint32_t, void*), int onId, int offId, ID3D11VertexShader* vs, ID3D11PixelShader* ps,
+                       uint32_t w, uint32_t h, const char* what)
+{
+    ID3D11Texture2D* target = MakeTexture(w, h, DXGI_FORMAT_R8G8B8A8_UNORM, kRT);
+    ID3D11RenderTargetView* rtv = nullptr;
+    g_dev->CreateRenderTargetView(target, nullptr, &rtv);
+    const float black[4] = { 0, 0, 0, 1 };
+    g_ctx->ClearRenderTargetView(rtv, black);
+    g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    D3D11_VIEWPORT vp { 0, 0, (float) w, (float) h, 0, 1 };
+    g_ctx->RSSetViewports(1, &vp);
+    g_ctx->RSSetState(nullptr);
+    g_ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    g_ctx->OMSetDepthStencilState(nullptr, 0);
+    g_ctx->IASetInputLayout(nullptr);
+    g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g_ctx->VSSetShader(vs, nullptr, 0);
+    g_ctx->PSSetShader(ps, nullptr, 0);
+
+    float cfg[16] = {};
+    cfg[0] = 1.0f;                                  // on
+    cfg[1] = cfg[2] = cfg[3] = cfg[4] = 0.5f;       // each eye looks at its middle
+    cfg[5] = 0.10f;                                 // full rate within
+    cfg[6] = 0.20f;                                 // nothing beyond (show the zones)
+    cfg[7] = 1.0f;
+    cfg[8] = 1.0f;
+    cfg[10] = (float) w;
+    cfg[11] = (float) h;
+    configure(cfg, 16, target);
+
+    g_event(onId);
+    g_ctx->Draw(3, 0);
+    g_event(offId);
+    g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+
+    const Bytes got = ReadBytes(target);
+    const uint8_t middle = got.at(w / 4, h / 2)[0];      // where the left eye looks
+    const uint8_t corner = got.at(8, 8)[0];              // far beyond the outer radius
+    const uint8_t between = got.at(w / 2, h / 2)[0];     // between the eyes: beyond both
+    CHECK(middle > 200 && corner < 50 && between < 50,
+          "%s (%ux%u): shaded where the eye looks and not beyond (middle %u, corner %u, between the eyes %u)", what, w, h, middle, corner, between);
+
+    rtv->Release();
+    target->Release();
+    return middle > 200 && corner < 50;
+}
+
+static void TestFoveaReal(HMODULE dll)
+{
+    if (g_warp)
+        return;
+
+    printf("[foveated shading on this card: the rates take effect, and go on doing so when the target's size changes]\n");
+
+    typedef int (*EventIdFn)(uint32_t);
+    typedef void (*FovConfigureFn)(const float*, uint32_t, void*);
+    typedef void (*FovStatusFn)(int32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*, uint32_t*);
+    const EventIdFn eventId = (EventIdFn) GetProcAddress(dll, "vws_fovea_event");
+    const FovConfigureFn configure = (FovConfigureFn) GetProcAddress(dll, "vws_fovea_configure");
+    const FovStatusFn status = (FovStatusFn) GetProcAddress(dll, "vws_fovea_status");
+
+    if (!eventId || !configure || !status)
+        return;
+
+    static const char* const source =
+        "void VS(uint id : SV_VertexID, out float4 pos : SV_Position) { pos = float4((id == 2) ? 3.0 : -1.0, (id == 1) ? 3.0 : -1.0, 0.5, 1.0); }\n"
+        "float4 PS() : SV_Target { return float4(1.0, 1.0, 1.0, 1.0); }\n";
+    ID3DBlob* vsCode = nullptr;
+    ID3DBlob* psCode = nullptr;
+    ID3D11VertexShader* vs = nullptr;
+    ID3D11PixelShader* ps = nullptr;
+
+    if (FAILED(D3DCompile(source, strlen(source), nullptr, nullptr, nullptr, "VS", "vs_5_0", 0, 0, &vsCode, nullptr)) ||
+        FAILED(D3DCompile(source, strlen(source), nullptr, nullptr, nullptr, "PS", "ps_5_0", 0, 0, &psCode, nullptr)))
+    {
+        CHECK(false, "the test's own shaders compile");
+        return;
+    }
+
+    g_dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &vs);
+    g_dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &ps);
+    vsCode->Release();
+    psCode->Release();
+
+    const int onId = eventId(1), offId = eventId(0);
+
+    // Is there variable rate shading at all? (asked by switching it on once)
+    {
+        ID3D11Texture2D* probe = MakeTexture(1024, 512, DXGI_FORMAT_R8G8B8A8_UNORM, kRT);
+        ID3D11RenderTargetView* rtv = nullptr;
+        g_dev->CreateRenderTargetView(probe, nullptr, &rtv);
+        g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+        float cfg[16] = {};
+        cfg[0] = 1.0f;
+        cfg[1] = cfg[2] = cfg[3] = cfg[4] = 0.5f;
+        cfg[5] = 0.2f;
+        cfg[6] = 0.4f;
+        configure(cfg, 16, probe);
+        g_event(onId);
+        g_event(offId);
+        g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        rtv->Release();
+        probe->Release();
+    }
+
+    int32_t state = -1;
+    status(&state, nullptr, nullptr, nullptr, nullptr, nullptr);
+
+    if (state != 1)
+    {
+        printf("  (no variable rate shading on this card: state %d)\n", state);
+    }
+    else
+    {
+        FoveaDraws(configure, onId, offId, vs, ps, 3136, 1600, "the first size");
+        FoveaDraws(configure, onId, offId, vs, ps, 3136, 1600, "the same size again");
+        FoveaDraws(configure, onId, offId, vs, ps, 1568, 800, "a smaller target");
+        FoveaDraws(configure, onId, offId, vs, ps, 1818, 927, "another size");
+        FoveaDraws(configure, onId, offId, vs, ps, 3136, 1600, "back at the first size");
+
+        // ...and with the rates off again, the whole picture is drawn
+        ID3D11Texture2D* target = MakeTexture(1568, 800, DXGI_FORMAT_R8G8B8A8_UNORM, kRT);
+        ID3D11RenderTargetView* rtv = nullptr;
+        g_dev->CreateRenderTargetView(target, nullptr, &rtv);
+        const float black[4] = { 0, 0, 0, 1 };
+        g_ctx->ClearRenderTargetView(rtv, black);
+        g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+        D3D11_VIEWPORT vp { 0, 0, 1568.0f, 800.0f, 0, 1 };
+        g_ctx->RSSetViewports(1, &vp);
+        g_ctx->Draw(3, 0);
+        g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        const Bytes got = ReadBytes(target);
+        CHECK(got.at(8, 8)[0] > 200, "switched off, nothing is left out (corner %u)", got.at(8, 8)[0]);
+        rtv->Release();
+        target->Release();
+    }
+
+    float off[16] = {};
+    configure(off, 16, nullptr);
+    g_event(onId);
+    g_ctx->ClearState();
+    vs->Release();
+    ps->Release();
+    Drain(true);
+}
+
 // ---- the flip-model window ------------------------------------------------------------------------
 //
 // The game asks for a swap chain the old way (one sRGB buffer, bit-block transfer). Armed, the DLL
@@ -3250,6 +3403,7 @@ int wmain(int argc, wchar_t** argv)
     TestOverlay(dll);
     TestHands(dll);
     TestFovea(dll);
+    TestFoveaReal(dll);
     TestFlip(dll);
     Drain(true);
     TestStereoSeam();
