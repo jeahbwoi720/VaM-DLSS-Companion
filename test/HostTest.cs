@@ -129,6 +129,7 @@ public static class HostTest
             NativeCalls(pluginDir);
             Extents();
             GazeFollowing();
+            EyeSizes();
         }
         catch (Exception ex)
         {
@@ -331,6 +332,79 @@ public static class HostTest
 
     // The window following the eye: the arithmetic that decides where it is aimed, with the eye
     // tracker's part played by hand. (The tracker itself is SteamVR's and is not here.)
+    // The headset's picture size as VaM DLSS measured it, against SteamVR's and the eye texture.
+    private static void EyeSizes()
+    {
+        Console.WriteLine("eye size:");
+
+        // a healthy session: measured at full size, then run at a third
+        Check(EyeSize.Judge(2040, 2080, 1f, 2040, 2080, 2040, 2080, 1f) == EyeSize.Fine, "a right measurement at full size is left alone");
+        Check(EyeSize.Judge(2040, 2080, 1f, 2040, 2080, 680, 693, 0.3333f) == EyeSize.Fine, "a right measurement is left alone under a DLSS mode");
+        Check(EyeSize.Judge(3060, 3120, 1.5f, 2040, 2080, 3060, 3120, 1.5f) == EyeSize.Fine, "a measurement taken at VaM's render scale 1.5 is the same headset");
+        Check(EyeSize.Judge(2040, 2080, 1f, 2040, 2080, 2040, 2080, 0.3333f) == EyeSize.Fine, "a right measurement stays right while the texture has yet to follow the scale");
+        Check(EyeSize.Judge(2038, 2079, 1f, 2040, 2080, 2038, 2079, 1f) == EyeSize.Fine, "a pixel or two of rounding is no difference");
+
+        // the session that went wrong: half the size measured, the textures right a moment later
+        Check(EyeSize.Judge(1020, 1040, 1f, 2040, 2080, 680, 693, 0.3333f) == EyeSize.AnchorWrong, "half the headset's size measured, both witnesses against it");
+        Check(EyeSize.Judge(1020, 1040, 1f, 2040, 2080, 2040, 2080, 1f) == EyeSize.AnchorWrong, "half the headset's size measured, seen at full scale");
+        Check(EyeSize.Judge(1020, 1040, 1f, 2040, 2080, 1020, 1040, 1f) == EyeSize.Unsettled, "while the eye texture is itself not SteamVR's size nothing is decided");
+        Check(EyeSize.Judge(1020, 1040, 1f, 2040, 2080, 340, 347, 0.3333f) == EyeSize.Unsettled, "an eye texture that agrees with the measurement and not with SteamVR decides nothing");
+
+        // nothing to judge by
+        Check(EyeSize.Judge(0, 0, 0f, 2040, 2080, 2040, 2080, 1f) == EyeSize.Fine, "nothing measured yet: nothing to put right");
+        Check(EyeSize.Judge(1020, 1040, 1f, 0, 0, 680, 693, 0.3333f) == EyeSize.Fine, "without SteamVR's size nothing is judged");
+        Check(EyeSize.Judge(1020, 1040, 1f, 2040, 2080, 0, 0, 0.3333f) == EyeSize.Fine, "without an eye texture nothing is judged");
+
+        // only a lasting difference, against one and the same size
+        EyeSize.Patience patience = new EyeSize.Patience();
+        int fired = 0, at = -1;
+
+        for (int i = 0; i < 44; i++)
+        {
+            fired += patience.Step(true, 2040, 2080) ? 1 : 0;
+        }
+
+        Check(fired == 0, "a wrong measurement is not written anew before it has lasted");
+        fired += patience.Step(false, 2040, 2080) ? 1 : 0;
+
+        for (int i = 0; i < 44; i++)
+        {
+            fired += patience.Step(true, 2040, 2080) ? 1 : 0;
+        }
+
+        Check(fired == 0, "a frame of doubt starts the wait again");
+        fired += patience.Step(true, 2448, 2496) ? 1 : 0;
+
+        for (int i = 0; i < 60 && at < 0; i++)
+        {
+            if (patience.Step(true, 2448, 2496))
+            {
+                at = i;
+            }
+        }
+
+        Check(fired == 0 && at == 43, "another size from SteamVR starts the wait again, and 45 frames of it are enough: fired at " + at);
+
+        fired = 0;
+
+        for (int i = 0; i < 200; i++)
+        {
+            fired += patience.Step(false, 2448, 2496) ? 1 : 0;
+        }
+
+        Check(fired == 0, "a right measurement is never written anew");
+
+        // the scale VaM DLSS takes for the user's own, against VaM's Render Scale
+        Check(!EyeSize.ScaleWrong(1f, 0.3333f, 0.3333f, 1f), "the user's scale as VaM has it is left alone");
+        Check(!EyeSize.ScaleWrong(1.5f, 0.75f, 0.75f, 1.5f), "and so at a render scale of 1.5");
+        Check(EyeSize.ScaleWrong(0.3333f, 0.1111f, 0.1111f, 1f), "its own DLSS scale taken for the user's is wrong");
+        Check(EyeSize.ScaleWrong(0.5f, 0.1667f, 0.1667f, 1f), "and so is half");
+        Check(!EyeSize.ScaleWrong(0.5f, 0.5f, 0.5f, 1f), "without upscaling the scale is not ours to judge");
+        Check(!EyeSize.ScaleWrong(0.3333f, 0.1111f, 1f, 1f), "a scale somebody has just written is VaM DLSS's to take first");
+        Check(!EyeSize.ScaleWrong(0.3333f, 0.1111f, 0.1111f, 0f), "without VaM's preference nothing is judged");
+        Check(!EyeSize.ScaleWrong(0f, 0f, 1f, 1f), "nothing held yet: nothing to put right");
+    }
+
     private static void GazeFollowing()
     {
         Console.WriteLine("[gaze following]");
@@ -386,6 +460,7 @@ public static class HostTest
         // A window fitted to the people in view, on a 2560x1440 screen with the area of a
         // 45% x 90% window (1152 x 1296 pixels) for the network. Boxes are pixels, y up.
         FitTracker fit = new FitTracker();
+        fit.Lead = 0f; // (these are the window's ways at rest; what it does while the picture moves fast is checked below)
         const float area = 1152f * 1296f;
         int shapeW, shapeH;
 
@@ -434,6 +509,63 @@ public static class HostTest
         fitState = fit.Update(8f, false, nobody, area, 2560, 1440, 1f, 8f);
         Check(fitState == FitTracker.AtRest && fit.Shape == 2 && fit.Zoom == 1f && Math.Abs(fit.CentreX - 1280f) < 0.5f && Math.Abs(fit.CentreY - 720f) < 0.5f,
             "and then rests in the middle at its plain size, shape kept: state " + fitState + " shape " + fit.Shape + " zoom " + fit.Zoom);
+
+        // The camera swung fast: the figures cross the screen and their box turns from upright to
+        // wide and back. No new shape while that lasts (each is a rebuild), the window held around
+        // the box's middle and drawn a little larger; a shape that fits better once it is over.
+        FitTracker swing = new FitTracker();
+        swing.Update(0f, true, standing, area, 2560, 1440, 1f, 8f);
+        bool reshaped = false;
+        float off = 0f;
+
+        for (int i = 1; i <= 40; i++)
+        {
+            float t = i * 0.05f, x = 300f + 1500f * Math.Abs((float)Math.Sin(t * 3.0));
+            float[] moving = (i / 5) % 2 == 0 ? new[] { x, 500f, x + 700f, 1000f } : new[] { x, 300f, x + 350f, 1300f };
+            swing.Update(t, true, moving, area, 2560, 1440, 1f, 8f);
+            reshaped = reshaped || swing.Shape != 0;
+
+            if (i == 40)
+            {
+                off = Math.Abs(swing.CentreX - (moving[0] + moving[2]) * 0.5f);
+            }
+        }
+
+        Check(!reshaped && swing.Moving(2f), "no new shape while the picture moves fast: shape " + swing.Shape + ", moving " + swing.Moving(2f));
+        Check(off < 2560f * 0.03f, "the window is held around the box's middle while it moves: " + off + " px off");
+        swing.Update(2.1f, true, lying, area, 2560, 1440, 1f, 8f);
+        swing.Update(5f, true, lying, area, 2560, 1440, 1f, 8f);
+        Check(swing.Shape == 2 && !swing.Moving(5f), "and the shape that fits is taken once it is over: shape " + swing.Shape);
+
+        // Flown towards a figure: its box hardly moves across the screen, it grows and changes its
+        // proportions (a whole body, then head and shoulders). No new shape while it does; one,
+        // when the view has come to rest.
+        FitTracker flown = new FitTracker();
+        flown.Update(0f, true, standing, area, 2560, 1440, 1f, 8f);
+        bool early = false;
+
+        for (int i = 1; i <= 100; i++)
+        {
+            float t = i * 0.05f, g = i * 9f;
+            flown.Update(t, true, new[] { 1000f - g, 700f - g * 0.3f, 1400f + g, 1300f }, area, 2560, 1440, 1f, 8f);
+            early = early || flown.Shape != 0;
+        }
+
+        Check(!early, "no new shape while the view is being changed: shape " + flown.Shape);
+        float[] close = { 100f, 430f, 2300f, 1300f };
+        flown.Update(5.05f, true, close, area, 2560, 1440, 1f, 8f);
+        flown.Update(5.5f, true, close, area, 2560, 1440, 1f, 8f);
+        Check(flown.Shape == 0, "nor the moment it stops: shape " + flown.Shape);
+        flown.Update(6.2f, true, close, area, 2560, 1440, 1f, 8f);
+        Check(flown.Shape == 2, "but once it has been at rest for a second: shape " + flown.Shape);
+
+        // A figure lost for a moment is not a new figure: no new shape at once when it is back.
+        FitTracker blink = new FitTracker();
+        blink.Update(0f, true, standing, area, 2560, 1440, 1f, 8f);
+        blink.Update(1f, true, standing, area, 2560, 1440, 1f, 8f);
+        blink.Update(1.1f, false, nobody, area, 2560, 1440, 1f, 8f);
+        blink.Update(1.3f, true, new[] { 900f, 500f, 1500f, 1000f }, area, 2560, 1440, 1f, 8f);
+        Check(blink.Shape == 0, "a figure back after a fifth of a second keeps the shape: shape " + blink.Shape);
 
         // With the model resolution at a half the window may shrink to where the raster is 1:1.
         FitTracker small = new FitTracker();

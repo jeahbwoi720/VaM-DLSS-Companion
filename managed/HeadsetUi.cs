@@ -85,6 +85,17 @@ namespace VamDlssNrWorkScale
         // The interface's layers are not the scene camera's this frame but another camera's (see
         // the top): nothing was taken off, and nothing is to be put back.
         private static bool _borrowed, _pendingBorrowed, _wasBorrowed;
+
+        // The scene's interface atoms (see SceneUi): their layer, taken off the scene's camera
+        // beside the interface's and drawn before it, under the scene's depth.
+        private static Camera _atomsCamera;
+        private static int _atomsOff, _pendingAtoms;
+        private static UnityEngine.Rendering.CommandBuffer _fill;
+
+        internal static bool Failed
+        {
+            get { return _failed; }
+        }
         private static Camera[] _cameras = new Camera[16];
         private static int _nElsewhere;
 
@@ -266,9 +277,19 @@ namespace VamDlssNrWorkScale
 
             Camera camera = Hooks.CameraOf(__instance);
 
-            if (camera == null || !camera.stereoEnabled)
+            if (camera == null)
             {
                 _live = false;
+                return;
+            }
+
+            int atoms = SceneUi.Mask(camera);
+
+            // On the monitor the interface is VaM DLSS's to draw apart; the atoms are ours.
+            if (!camera.stereoEnabled)
+            {
+                _live = false;
+                TakeAtoms(camera, SceneUi.OnMonitor(camera, atoms));
                 return;
             }
 
@@ -287,10 +308,19 @@ namespace VamDlssNrWorkScale
                 _borrowed = true;
                 _presented = false;
                 _nElsewhere++;
+
+                // (the atoms too, unless that camera draws their layer as well)
+                if (_live && (other.cullingMask & atoms) == 0)
+                {
+                    TakeAtoms(camera, atoms);
+                }
+
                 return;
             }
 
-            if (!Wanted())
+            bool menu = Wanted();
+
+            if (!menu && atoms == 0)
             {
                 _live = false;
                 return;
@@ -302,19 +332,32 @@ namespace VamDlssNrWorkScale
                 return;
             }
 
-            int removed = camera.cullingMask & layers;
+            int removed = menu ? camera.cullingMask & layers : 0;
+            TakeAtoms(camera, atoms);
 
-            if (removed == 0)
+            if (removed == 0 && _atomsOff == 0)
             {
                 _nNoLayers++;
                 return;
             }
 
-            camera.cullingMask &= ~layers;
+            camera.cullingMask &= ~removed;
             _stripped = camera;
             _removed = removed;
             _presented = false;
             _nOff++;
+        }
+
+        private static void TakeAtoms(Camera camera, int mask)
+        {
+            int off = camera.cullingMask & mask;
+
+            if (off != 0)
+            {
+                camera.cullingMask &= ~off;
+                _atomsCamera = camera;
+                _atomsOff = off;
+            }
         }
 
         // VamDlssNr measures the headset's picture size once -- its "anchor" -- and reconstructs to
@@ -324,7 +367,9 @@ namespace VamDlssNrWorkScale
         // all. The eye texture Unity allocates is the headset's size times the eye scale in force,
         // so the anchor can be checked against it every frame, and the mismatch said. (Clearing
         // the anchor to make VamDlssNr measure again was tried and made it worse: it measured
-        // while its own reduced scale was still in force, and took that for the headset's.)
+        // while its own reduced scale was still in force, and took that for the headset's. EyeSize
+        // now writes it anew from SteamVR's size, sooner than this speaks: what is said here is
+        // what that could not or was told not to put right.)
         private static int _anchorWrong;
         private static float _anchorSaidAt = -100f;
         internal static string AnchorNote = "";
@@ -438,7 +483,20 @@ namespace VamDlssNrWorkScale
             _dst = null;
             _presented = false;
 
-            if ((!Wanted() && !_borrowed) || __1 == null || !stereo)
+            // The scene's depth for the atoms, while it is still this camera's.
+            try
+            {
+                SceneUi.Composing(camera, stereo, _atomsOff != 0);
+            }
+            catch (Exception ex)
+            {
+                if (Hooks.Warn != null)
+                {
+                    Hooks.Warn("scene UI atoms: the scene's depth could not be kept (" + ex.GetType().Name + ": " + ex.Message + ")");
+                }
+            }
+
+            if ((!Wanted() && !_borrowed && !SceneUi.Wanted) || __1 == null || !stereo)
             {
                 return;
             }
@@ -624,7 +682,7 @@ namespace VamDlssNrWorkScale
             }
 
             Restore();
-            _live = (object)_capture != null && _presented && Wanted();
+            _live = (object)_capture != null && _presented && (Wanted() || SceneUi.Wanted);
             _capture = null;
             _dst = null;
         }
@@ -642,6 +700,17 @@ namespace VamDlssNrWorkScale
                 _removed = 0;
             }
 
+            if ((object)_atomsCamera != null)
+            {
+                if (_atomsCamera != null)
+                {
+                    _atomsCamera.cullingMask |= _atomsOff;
+                }
+
+                _atomsCamera = null;
+            }
+
+            _atomsOff = 0;
             _borrowed = false;
         }
 
@@ -690,9 +759,9 @@ namespace VamDlssNrWorkScale
             _nNoted++;
             _pendingBorrowed = _borrowed;
 
-            if (Method() == 2 && !_borrowed)
+            if (Method() == 2 && !_borrowed && _atomsOff == 0)
             {
-                return Guarded(delegate { Draw(_stripped, _removed, eyes, frame, Hooks.NetIsTopDown(), true); });
+                return Guarded(delegate { Draw(_stripped, _removed, eyes, frame, Hooks.NetIsTopDown(), true, false); });
             }
 
             // Not now: while a single-pass stereo camera is rendering -- and its image effects are
@@ -702,6 +771,7 @@ namespace VamDlssNrWorkScale
             _pendingFrame = Time.frameCount;
             _pendingMain = _stripped;
             _pendingLayers = _removed;
+            _pendingAtoms = _atomsOff;
             _pendingDst = _dst;
             _pendingPerEye = eyes != null;
             _pendingEyes[0] = eyes != null ? eyes[0] : null;
@@ -743,7 +813,7 @@ namespace VamDlssNrWorkScale
                 // The reconstructed eyes, which lie the way VamDlssNr's FlipY says.
                 if (_pendingEyes[0] != null && _pendingEyes[1] != null && _pendingEyes[0].IsCreated() && _pendingEyes[1].IsCreated())
                 {
-                    Guarded(delegate { Draw(main, _pendingLayers, _pendingEyes, null, Hooks.NetIsTopDown(), keywordOff); });
+                    Guarded(delegate { DrawBoth(main, _pendingEyes, null, Hooks.NetIsTopDown(), keywordOff, true); });
                     _nDrawnEyes++;
 
                     // And the camera's own frame as well. The reconstructed eyes reach the headset
@@ -754,9 +824,9 @@ namespace VamDlssNrWorkScale
                     // accessible", only where the frame rate is low), and the menu was gone for as
                     // long as it did. Drawn into both, it is there whichever of the two is shown.
                     // (not where another camera has drawn it into the frame already)
-                    if (!_failed && !_pendingBorrowed && dst != null && dst.IsCreated())
+                    if (!_failed && dst != null && dst.IsCreated())
                     {
-                        Guarded(delegate { Draw(main, _pendingLayers, null, dst, false, keywordOff); });
+                        Guarded(delegate { DrawBoth(main, null, dst, false, keywordOff, !_pendingBorrowed); });
                         _perEye = true;
                     }
 
@@ -766,10 +836,7 @@ namespace VamDlssNrWorkScale
                 else if (dst != null && dst.IsCreated())
                 {
                     // the eyes went away between the frame's composing and its end: the frame, then
-                    if (!_pendingBorrowed)
-                    {
-                        Guarded(delegate { Draw(main, _pendingLayers, null, dst, false, keywordOff); });
-                    }
+                    Guarded(delegate { DrawBoth(main, null, dst, false, keywordOff, !_pendingBorrowed); });
 
                     MatteAfterMenu(dst, null, false);
                     _nEyesGone++;
@@ -785,10 +852,7 @@ namespace VamDlssNrWorkScale
                 // The camera's own target, which VamDlssNr has filled by now: a render texture
                 // like any other, first row at the bottom. (Where the interface is another
                 // camera's, that camera has drawn it there by now, and the frame is what is shown.)
-                if (!_pendingBorrowed)
-                {
-                    Guarded(delegate { Draw(main, _pendingLayers, null, dst, false, keywordOff); });
-                }
+                Guarded(delegate { DrawBoth(main, null, dst, false, keywordOff, !_pendingBorrowed); });
 
                 MatteAfterMenu(dst, null, false);
                 _nDrawnFrame++;
@@ -799,7 +863,24 @@ namespace VamDlssNrWorkScale
             }
 
             _pendingEyes[0] = _pendingEyes[1] = null;
+            _pendingAtoms = 0;
             _wasBorrowed = _pendingBorrowed;
+        }
+
+        // The scene's interface atoms first, under the scene's depth; then the interface itself,
+        // over everything.
+        private static void DrawBoth(Camera main, RenderTexture[] eyes, RenderTexture wide, bool topDown, bool keywordOff, bool menu)
+        {
+            if (_pendingAtoms != 0)
+            {
+                Draw(main, _pendingAtoms, eyes, wide, topDown, keywordOff, true);
+                SceneUi.Drawn();
+            }
+
+            if (menu && _pendingLayers != 0)
+            {
+                Draw(main, _pendingLayers, eyes, wide, topDown, keywordOff, false);
+            }
         }
 
         // How often VamDlssNr's submit hook did not put the reconstructed eyes in the frame's
@@ -883,14 +964,16 @@ namespace VamDlssNrWorkScale
         // Draws the layers once per eye: onto `eyes` when given, else onto the two halves of
         // `wide`. `topDown` says the target's first row is the top of the picture: a camera drawing
         // into a render texture lays it down first row at the bottom, so there the projection is
-        // turned over, and the winding with it.
-        private static void Draw(Camera main, int layers, RenderTexture[] eyes, RenderTexture wide, bool topDown, bool keywordOff)
+        // turned over, and the winding with it. `atoms`: these are the scene's interface atoms,
+        // which get the scene's depth laid under them first (see SceneUi), so that they are hidden
+        // by what stands in front of them; the interface is drawn over everything.
+        private static void Draw(Camera main, int layers, RenderTexture[] eyes, RenderTexture wide, bool topDown, bool keywordOff, bool atoms)
         {
             int method = Method();
             _perEye = eyes != null;
 
             RenderTexture active = RenderTexture.active;
-            bool report = method != _reportedMethod || CaptureWanted;
+            bool report = !atoms && (method != _reportedMethod || CaptureWanted);
             bool keyword = keywordOff && Shader.IsKeywordEnabled(StereoKeyword);
 
             if (report)
@@ -942,13 +1025,37 @@ namespace VamDlssNrWorkScale
 
                     ui.rect = eyes != null ? new Rect(0f, 0f, 1f, 1f) : new Rect(eye * 0.5f, 0f, 0.5f, 1f);
 
+                    // After the camera has cleared its depth and before it draws.
+                    bool filled = false;
+
+                    if (atoms)
+                    {
+                        if (_fill == null)
+                        {
+                            _fill = new UnityEngine.Rendering.CommandBuffer();
+                            _fill.name = "VamDlssNrWorkScale scene depth";
+                        }
+
+                        filled = SceneUi.Fill(_fill, eye, topDown);
+
+                        if (filled)
+                        {
+                            ui.AddCommandBuffer(UnityEngine.Rendering.CameraEvent.BeforeForwardOpaque, _fill);
+                        }
+                    }
+
                     GL.invertCulling = topDown;
                     ui.Render();
                     GL.invertCulling = false;
                     ui.targetTexture = null;
+
+                    if (filled)
+                    {
+                        ui.RemoveCommandBuffer(UnityEngine.Rendering.CameraEvent.BeforeForwardOpaque, _fill);
+                    }
                 }
 
-                if (CaptureWanted)
+                if (CaptureWanted && !atoms)
                 {
                     CaptureWanted = false;
                     Capture(wide, eyes);
@@ -958,6 +1065,7 @@ namespace VamDlssNrWorkScale
             {
                 GL.invertCulling = false;
                 ui.targetTexture = null;
+                ui.RemoveAllCommandBuffers();
 
                 if (keyword)
                 {
@@ -1093,6 +1201,11 @@ namespace VamDlssNrWorkScale
             if (AnchorNote.Length != 0)
             {
                 return AnchorNote;
+            }
+
+            if (EyeSize.Note.Length != 0)
+            {
+                return EyeSize.Note;
             }
 
             if (_wasBorrowed)

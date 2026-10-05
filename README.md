@@ -15,6 +15,8 @@ It began as one slider and has grown since:
 - **[Sharpening](#sharpening)** — a filter over the finished frame
 - **[Headset menu at full size](#headset-menu-at-full-size)** — VaM's menu drawn after DLSS and
   Neural Rendering, at the headset's own resolution
+- **[Scene UI atoms after DLSS](#scene-ui-atoms-after-dlss)** — a scene's own buttons, sliders and
+  texts drawn after DLSS and Neural Rendering too, and still hidden behind whoever stands in front
 - **[Passthrough](#passthrough-playstation-vr2)** — your room behind the person, through a
   PlayStation VR2's cameras
 - **[Flip-model window and frame pacing](#flip-model-window-and-frame-pacing-monitor)** — on the
@@ -46,6 +48,41 @@ sees a quarter of the pixels.
 what the network *changed* is enlarged and laid back over the untouched full-size frame. The picture
 underneath keeps all of its own detail whatever the slider says; what softens is the network's own
 fine structure, which is synthesised small. Its broader work — tone, shading, skin — survives.
+
+The options for this are in the in-headset panel, folded away under *Below 100% model resolution:
+options* on the Neural Rendering page, and in the plugin's settings file.
+
+**Edit follows edges** (on; costs a little frame rate). Enlarged
+plainly, what the network did at its smaller size is a blur: across an edge it runs out on both
+sides, in steps a network pixel wide, and inside a surface it is softer than the network made it.
+With this on, each full-size pixel takes the edit from the network pixels that were looking at the
+same thing it shows, so the edit stays on its own side of every edge, to the pixel. It is then
+sharpened by an amount that follows the scale (*edit sharpening*; none at 100%), held within what
+the neighbouring network pixels hold so that nothing rings. `[Neural Rendering] EditFollowsEdges`,
+`EditEdgeTolerance` (0.08), `EditSharpening` (1.0), `EditSharpeningReach` (0.5).
+
+**Edit kept over frames** (on). The
+network is run afresh on every frame and does not answer quite the same twice; at a lower model
+resolution each of its pixels is several of the screen's, and the difference shows as a crawl over
+skin. With this on, each new frame's edit is blended into the edit kept from the frames before,
+which is first carried to where things have moved to by the network's own motion vectors and is not
+believed where the new frame says something else. `[Neural Rendering] EditKeptOverFrames`,
+`EditNewShare` (0.2: lower is steadier, slower to follow a change of light, and the first to leave a
+trail behind somebody moving — go back up if you see one).
+
+**Edit denoise** (0 = off). Run small, the network's grain is coarser, each speck of it several of
+the frame's pixels, and can read as noise. This blends the edit towards a blur of itself: tone and
+shading stay, speckle goes. It is the opposite of the sharpening and is taken off it, so set *edit
+sharpening* to 0 to judge it alone. `[Neural Rendering] EditDenoise`.
+
+**Input sharpening** (0 = off, experimental). Gives the network a slightly sharper shrink of the
+frame to work from than the plain average. `[Neural Rendering] InputSharpening`.
+
+**Build detail over frames** (off, experimental). At a half, a third or a quarter each way, the
+network's raster is shifted a little every frame and the edit is gathered at the frame's full size,
+so that what holds still gains detail finer than the network's own pixels. It costs a full-size pass
+and video memory, does little where things move, and can leave a faint trail behind a moving person.
+`[Neural Rendering] EditDetailOverFrames`, `EditDetailStrength` (0.6).
 
 ![The slider in VaM DLSS's panel](docs/panel.png)
 
@@ -188,6 +225,7 @@ renamed to that on the first start):
 | `[Focus window] EdgeSoftness` | 0.35 | how far in from the window's edge the fade runs, as a fraction of its half-size |
 | `[Focus window] OffsetX`, `OffsetY` | 0 | nudge the window from the lens centre: towards the nose, and up |
 | `[Focus window] OnMonitor` | false | use a focus window on the monitor too |
+| `[Focus window] ShowOutline` | false | for testing: draw the window into the picture, its edge in magenta and in cyan the line inside which the network's work lands whole |
 | `[Focus window] MonitorWidth`, `MonitorHeight` | 0.45, 0.9 | the monitor window's share of the screen's width and height |
 | `[Focus window] MonitorFollowPerson` | true | aim the monitor's window at the person in view rather than the middle of the screen |
 | `[Focus window] MonitorDeadZone` | 0.04 | how far the figure may move before the monitor's window starts after it |
@@ -197,6 +235,7 @@ renamed to that on the first start):
 | `[Focus window] GazeHoldSeconds`, `GazeReturnSeconds` | 0.4, 0.3 | how long the window waits when the eye is lost (a blink), and how long it takes back to the lens centre |
 | `[Picture] Sharpening` | 0 | the [sharpening filter](#sharpening); 0 = off |
 | `[Interface] FullSizeInHeadset` | false | draw [VaM's menu at full size](#headset-menu-at-full-size) in a headset |
+| `[SceneUi] …` | | see [Scene UI atoms after DLSS](#scene-ui-atoms-after-dlss) |
 | `[Passthrough] …` | | see [Passthrough](#passthrough-playstation-vr2) |
 
 ## Sharpening
@@ -221,6 +260,50 @@ Some scene plugins give the menu to a camera of their own, drawn after the scene
 PostMagic does, to keep its image effects off the menu). With DLSS upscaling in a headset that
 camera's picture never reaches the headset and the menu was simply gone; the plugin now draws the
 menu onto DLSS's picture in that case, whether this switch is on or off.
+
+## Headset picture size, kept right
+
+VaM DLSS measures the size of the headset's picture once and reconstructs to it for the rest of
+the session. Started with a DLSS upscaling mode already on, VaM can still have eye textures of half
+the size at that moment, and the headset then gets a coarse, pixelated picture whatever is chosen
+afterwards; and after a change of quality VaM DLSS has been seen to take its own reduced eye scale
+for yours, so that Ultra Performance renders at a ninth of the size instead of a third. Until now
+only moving VaM's own *Render Scale* slider, or a restart, put either right.
+
+The plugin now checks both, on SteamVR headsets: the measured size against the size SteamVR gives
+for an eye (written anew only where the eye texture Unity has agrees with SteamVR), and the eye
+scale against VaM's Render Scale. Each correction is said in `BepInEx\LogOutput.log`, and so is
+every change of these numbers (lines beginning `eye size:`), which is what to send along if a
+session comes out pixelated all the same. `[Headset] CorrectEyeSize` and `EyeSizeLog` in the
+plugin's settings turn the two off.
+
+## Scene UI atoms after DLSS
+
+The atoms a scene's own interface is built with — UIButton, UIButtonImage, UISlider, UIToggle,
+UIText, UIImage — are not on VaM's interface layer but in the scene itself. So neither VaM DLSS (on
+the monitor) nor *Headset menu at full size* keeps them out of the frame: their text is rendered
+small by a DLSS quality mode, enlarged, and reworked by Neural Rendering with everything around it.
+
+With *Scene UI atoms: after DLSS / NR* on, they are left out of the scene's frame and drawn
+afterwards onto the finished picture, at its full resolution — in a headset and on the monitor,
+while VaM DLSS is at work. Off by default. New, and so far tried only by its own checks.
+
+Unlike the menu, a button on a wall has to stay behind a person standing in front of it. The
+scene's depth is kept and laid under the atoms before they are drawn, so they are hidden as in
+plain VaM. With a DLSS quality mode that depth is as coarse as the scene was rendered, and the edge
+where something covers an atom follows it.
+
+How it is done: their canvases are moved to a layer VaM does not use (19), which every camera of
+the game's draws like the scene's own, so mirrors and screenshots show them as before.
+
+| Setting | Default | |
+|---|---|---|
+| `[SceneUi] AfterDlss` | false | the switch |
+| `[SceneUi] HiddenBehindPeople` | true | lay the scene's depth under them; off: always on top |
+| `[SceneUi] Atoms` | the six above | the kinds of atom, by VaM's names, separated by commas |
+| `[SceneUi] Layer` | 19 | the layer they are moved to; one of VaM's unused ones: 3, 6, 7, 18, 19 |
+| `[SceneUi] DepthSlack` | 0.01 | how far back the scene's depth is pushed (fraction of its distance); raise it if a panel lying on a surface is cut into stripes |
+| `[SceneUi] DepthUpsideDown` | false | turn on if they are hidden by things above or below them instead of in front |
 
 ## Passthrough (PlayStation VR2)
 
@@ -328,6 +411,16 @@ cameras to reach SteamVR ([PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2
 [ONNX Runtime](https://github.com/microsoft/onnxruntime) and MediaPipe's two hand models, which come
 with the plugin.
 
+**A better model for a headset's cameras (optional).** MediaPipe's models were made for colour
+pictures from a phone or a webcam, and on the headset's wide, dark, monochrome pictures they turn a
+hand over or lose it. *Hand tracking: Mercury model* follows a hand, once found, with the keypoint
+network of Mercury, [Monado](https://monado.freedesktop.org/)'s hand tracking, which
+was made for exactly these cameras; on the development machine it is plainly steadier. Its model
+file states no licence, so the release does not carry it: download `grayscale_keypoint_jan18.onnx`
+from Monado's [hand-tracking-models](https://gitlab.freedesktop.org/monado/utilities/hand-tracking-models),
+name it `hand-mercury.onnx`, put it in `BepInEx\plugins\VamDlssNrWorkScale\`, switch the option on
+and restart VaM. Without the file the option does nothing.
+
 - *Hand tracking: show skeleton* draws what it sees: the 21 points of each hand.
 - *VaM's hands follow* — **Controllers**: the tracked hands are only shown. **Auto**: a controller
   that is being moved or squeezed has its hand; a hand the cameras see, whose controller lies still,
@@ -347,6 +440,9 @@ hands that faces you (from behind or above you, not from the desk in front).
 | `[Hands]` setting | Default | |
 |---|---|---|
 | `Tracking` | false | the switch |
+| `Mercury` | false | read when tracking is first switched on after VaM starts: once a hand is found, follow it with Mercury's keypoint network (from Monado) instead of MediaPipe's. Made for a headset's own cameras; on a recording of a hand dark against a window it does not turn the hand over as MediaPipe does, and does not take a cloth or a screen for a hand. Needs `hand-mercury.onnx` beside the plugin, which the release does not carry (see *Building*) |
+| `PinchAssist`, `PinchClosed`, `PinchOpen` | true, 0.035, 0.06 | close the thumb and index finger of VaM's hand when the tracker has their tips within `PinchClosed` metres, partly up to `PinchOpen`: the tracker's fingertips stop short of touching |
+| `FullModel` | false | read when tracking is first switched on after VaM starts: MediaPipe's full-size landmark model instead of the small one. About twice the processor time a look. Needs `hand-points-full.onnx` beside the plugin, which the release does not carry yet (see *Building*); without it the small one is used |
 | `Drive` | 1 | who moves VaM's hands: 0 the controllers, 1 auto, 2 the tracked hands |
 | `ShowSkeleton` | true | draw the 21 points of each tracked hand |
 | `BothHands` | true | look for two hands, not one |
@@ -379,7 +475,10 @@ UI**, as VaM's own sliders, toggles and popups, where the controllers' pointer r
 - a live status box — what is running, at what size, the frame pacing — and reset buttons
 
 The panel is in pages, one for each of these, with tabs along the top; passthrough's own key colour
-is picked with VaM's colour picker. (The picture below is of the earlier, single-page panel.)
+is picked with VaM's colour picker. Rest the pointer on a control for half a second and the status
+box says what it does; the text stays while you read or scroll it. Options most people leave alone
+are folded away under a button (*Below 100% model resolution: options*). (The picture below is of
+the earlier, single-page panel.)
 
 ![The panel in a session plugin's UI](docs/session-panel.png)
 
@@ -436,6 +535,16 @@ pwsh install.ps1 -VamDir D:\path\to\VaM        # copy dist\ into the game
 
 The first build fetches what is not in the repository — ONNX Runtime, the two hand models and
 NVIDIA's NVAPI — with `native\fetch-deps.ps1`, which checks each against a fixed SHA-256.
+
+The full-size hand landmark model (`[Hands] FullModel`) is not fetched: it is MediaPipe's
+`hand_landmark_full.tflite` (Apache-2.0) converted with tf2onnx (`python -m tf2onnx.convert --tflite
+hand_landmark_full.tflite --output handpose-full.onnx --opset 13`). Put the result in `native\deps\`
+and the build carries it along as `hand-points-full.onnx`.
+
+Mercury's keypoint network (`[Hands] Mercury`) is not fetched either: it is
+`grayscale_keypoint_jan18.onnx` from Monado's
+[hand-tracking-models](https://gitlab.freedesktop.org/monado/utilities/hand-tracking-models), whose states no licence for the model files (Monado's code is BSL-1.0). Put it in
+`native\deps\` as `hand-mercury.onnx` and the build carries it along.
 
 The session script under `vam\` is compiled by VaM itself, with an older compiler; the build compiles
 it too, as C# 3 against VaM's assemblies, so a mistake in it fails the build rather than a session.

@@ -20,6 +20,9 @@ namespace VamDlssNrWorkScale
         internal static ConfigEntry<float> CfgSmoothing, CfgQuick;
 
         internal static string Status = "";
+        internal static BepInEx.Configuration.ConfigEntry<bool> CfgFull, CfgMercury;
+        private static string _model = "small model";
+        private static bool _mercury;
 
         // The panel's button: the camera's next frame is saved beside the plugin, to try the tracker on.
         internal static bool CaptureWanted;
@@ -38,7 +41,7 @@ namespace VamDlssNrWorkScale
         private const int Count = 2, Points = 21, Floats = 4 + Points * 3;
 
         // The tracker's numbers (vwshand::Setting), the ones without a setting as vwshand::Defaults has them.
-        private const int SPitch = 0, SReach = 1, SPalmMin = 2, SHandMin = 3, SGapMost = 4, SLookEvery = 5, SCutoff = 6, SBeta = 7, SSwap = 8, SHold = 9, SMost = 10, SBright = 11, SBrightNear = 12, SExposure = 15, SExposureNear = 16, SBrightLow = 17;
+        private const int SPitch = 0, SReach = 1, SPalmMin = 2, SHandMin = 3, SGapMost = 4, SLookEvery = 5, SCutoff = 6, SBeta = 7, SSwap = 8, SHold = 9, SMost = 10, SBright = 11, SBrightNear = 12, SExposure = 15, SExposureNear = 16, SBrightLow = 17, SDepthRight = 18, SDoubt = 19, STurnMost = 20, SMercury = 21, SMercuryLast = 22, SMercurySteady = 23;
         private static readonly float[] _set = new float[24];
         private static readonly float[] _hands = new float[Count * Floats];
 
@@ -88,7 +91,7 @@ namespace VamDlssNrWorkScale
 
             if (!_loaded)
             {
-                if (!Native.HandLoad())
+                if (!Native.HandLoad(CfgFull != null && CfgFull.Value, CfgMercury != null && CfgMercury.Value))
                 {
                     _failed = true;
                     Status = "hand tracking is off: " + Native.HandError();
@@ -102,6 +105,9 @@ namespace VamDlssNrWorkScale
                 }
 
                 _loaded = true;
+                _model = Native.HandFull() ? "full-size model" : (CfgFull != null && CfgFull.Value ? "small model (hand-points-full.onnx is not beside the plugin)" : "small model");
+                _mercury = Native.HandMercury();
+                _model += _mercury ? " + Mercury" : (CfgMercury != null && CfgMercury.Value ? " (hand-mercury.onnx is not beside the plugin)" : "");
             }
 
             _set[SPitch] = 0.35f;
@@ -122,6 +128,14 @@ namespace VamDlssNrWorkScale
             _set[SBrightNear] = 0.6f;
             _set[SExposure] = 1f;
             _set[SExposureNear] = 1f;
+            _set[SDepthRight] = 0f;
+            // A sudden turn-over is the first network misreading the hand, and is held back long;
+            // Mercury's two lenses agree on a turn when it is real, and it is believed sooner.
+            _set[SDoubt] = _mercury ? 4f : 12f;
+            _set[STurnMost] = _mercury ? 2.1f : 1.4f;
+            _set[SMercury] = _mercury ? 1f : 0f;
+            _set[SMercuryLast] = 0f;
+            _set[SMercurySteady] = 0.12f;
             Native.HandConfigure(true, CfgEvery.Value, _set);
             _on = true;
 
@@ -149,6 +163,7 @@ namespace VamDlssNrWorkScale
             uint serial, micros, inRoom;
             float age;
             Native.HandRead(_hands, out serial, out micros, out age, out inRoom);
+            Native.HandCurls(HandDrive.CurlsIn);
 
             // Frames that have stopped coming say nothing of where a hand is now.
             bool fresh = age >= 0f && age < 300f && inRoom != 0;
@@ -182,7 +197,7 @@ namespace VamDlssNrWorkScale
                     !fresh ? (inRoom == 0 ? "the camera's frames come without the head's place" : "the camera's frames have stopped") :
                     live == 0 ? "no hand in view" :
                     live + (live == 1 ? " hand (" + Side(0) + Side(1) + ")" : " hands")) +
-                    ", " + rate.ToString("0") + " looks a second, " + (micros / 1000f).ToString("0") + " ms each" + (HandDrive.Note.Length != 0 ? "\n" + HandDrive.Note : "") + _saved;
+                    ", " + rate.ToString("0") + " looks a second, " + (micros / 1000f).ToString("0") + " ms each, " + _model + (HandDrive.Note.Length != 0 ? "\n" + HandDrive.Note : "") + (HandDrive.PinchNote.Length != 0 ? "\n" + HandDrive.PinchNote : "") + _saved;
             }
         }
 

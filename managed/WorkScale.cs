@@ -51,7 +51,7 @@ namespace VamDlssNrWorkScale
     internal static class Native
     {
         private const string Dll = "VamDlssNrWorkScaleNative";
-        private const uint ExpectedAbi = 21;
+        private const uint ExpectedAbi = 32;
 
         internal const uint Frame = 1, Proxy = 2, Model = 4, Result = 8;
         internal const int ReadyDown = 1, ReadyResolve = 2, ReadyGuide = 4; // ReadyGuide << n for guide n
@@ -97,6 +97,10 @@ namespace VamDlssNrWorkScale
         private static PushGuideFn _pushGuide;
         private delegate int PushSharpenFn(IntPtr texture, float strength, uint eyes);
         private static PushSharpenFn _pushSharpen;
+        private delegate int PushDepthFillFn(IntPtr depth, float u0, float uw, uint flip, float slack, uint reversed);
+        private static PushDepthFillFn _pushDepthFill;
+        private delegate void DepthFillStatusFn(out uint done, out uint noTarget, out uint failed);
+        private static DepthFillStatusFn _depthFillStatus;
         private delegate void CamConfigureFn([In] float[] values, uint count);
         private delegate int CamStartFn(IntPtr getFrameBuffer, ulong handle, uint width, uint height);
         private delegate void CamStopFn();
@@ -136,6 +140,18 @@ namespace VamDlssNrWorkScale
         private delegate void HandConfigureFn(uint on, uint every, [In] float[] values, uint count);
         private delegate int HandReadFn([Out] float[] hands, uint capacity, out uint serial, out uint micros, out float ageMs, out uint inRoom);
         private static HandLoadFn _handLoad;
+        private delegate void HandPreferFn(uint which);
+        private static HandPreferFn _handPrefer;
+        private delegate int HandFullFn();
+        private static HandFullFn _handFull, _handMercury;
+        private delegate void HandCurlsFn([Out] float[] curls);
+        private static HandCurlsFn _handCurls;
+        private delegate void ResolveOptionsFn(uint follow, float edge, float sharpen, float halo, uint outline);
+        private delegate int PushSteadyFn(uint set, uint eyes, IntPtr motion, float take, uint topDown, [In] float[] window, uint pass, uint fresh, uint full, float shiftX, float shiftY, float own);
+        private static PushSteadyFn _pushSteady;
+        private delegate void DownOptionsFn(float sharpen, float shiftX, float shiftY);
+        private static DownOptionsFn _downOptions;
+        private static ResolveOptionsFn _resolveOptions;
         private static HandErrorFn _handError;
         private static HandConfigureFn _handConfigure;
         private static HandReadFn _handRead;
@@ -213,6 +229,8 @@ namespace VamDlssNrWorkScale
                 _pushRegisterGuide = (PushRegisterGuideFn)Bind(module, "vws_push_register_guide", typeof(PushRegisterGuideFn));
                 _pushGuide = (PushGuideFn)Bind(module, "vws_push_guide", typeof(PushGuideFn));
                 _pushSharpen = (PushSharpenFn)Bind(module, "vws_push_sharpen", typeof(PushSharpenFn));
+                _pushDepthFill = (PushDepthFillFn)Bind(module, "vws_push_depth_fill", typeof(PushDepthFillFn));
+                _depthFillStatus = (DepthFillStatusFn)Bind(module, "vws_depth_fill_status", typeof(DepthFillStatusFn));
                 _camConfigure = (CamConfigureFn)Bind(module, "vws_cam_configure", typeof(CamConfigureFn));
                 _camStart = (CamStartFn)Bind(module, "vws_cam_start", typeof(CamStartFn));
                 _camStop = (CamStopFn)Bind(module, "vws_cam_stop", typeof(CamStopFn));
@@ -235,6 +253,13 @@ namespace VamDlssNrWorkScale
                 _flipPace = (FlipPaceFn)Bind(module, "vws_flip_pace", typeof(FlipPaceFn));
                 _flipPaceStatus = (FlipPaceStatusFn)Bind(module, "vws_flip_pace_status", typeof(FlipPaceStatusFn));
                 _handLoad = (HandLoadFn)Bind(module, "vws_hand_load", typeof(HandLoadFn));
+                _handPrefer = (HandPreferFn)Bind(module, "vws_hand_prefer", typeof(HandPreferFn));
+                _handFull = (HandFullFn)Bind(module, "vws_hand_full", typeof(HandFullFn));
+                _handMercury = (HandFullFn)Bind(module, "vws_hand_mercury", typeof(HandFullFn));
+                _handCurls = (HandCurlsFn)Bind(module, "vws_hand_curls", typeof(HandCurlsFn));
+                _resolveOptions = (ResolveOptionsFn)Bind(module, "vws_resolve_options", typeof(ResolveOptionsFn));
+                _pushSteady = (PushSteadyFn)Bind(module, "vws_push_steady", typeof(PushSteadyFn));
+                _downOptions = (DownOptionsFn)Bind(module, "vws_down_options", typeof(DownOptionsFn));
                 _handError = (HandErrorFn)Bind(module, "vws_hand_error", typeof(HandErrorFn));
                 _handConfigure = (HandConfigureFn)Bind(module, "vws_hand_configure", typeof(HandConfigureFn));
                 _handRead = (HandReadFn)Bind(module, "vws_hand_read", typeof(HandReadFn));
@@ -292,10 +317,44 @@ namespace VamDlssNrWorkScale
             return _pushGuide(set, (uint)index, (uint)eyes, window, previous, topDown ? 1u : 0u);
         }
 
+        // How much sharper than its exact average the network's input is made when the frame is shrunk for it.
+        // ...and by how much of the frame's pixels the network's raster is shifted in the next shrink pushed.
+        internal static void DownOptions(float sharpen, float shiftX, float shiftY)
+        {
+            _downOptions(sharpen, shiftX, shiftY);
+        }
+
+        // Before a resolve of the same set: this pass's edit is blended into what was kept of it from
+        // the frames before, carried by the model-size motion vectors (see Steady in the native half).
+        // `full`: kept at the frame's size, this frame's shrink having been made shifted by shiftX, shiftY.
+        internal static int PushSteady(uint set, int eyes, IntPtr motion, float take, bool topDown, float[] window, int pass, bool fresh, bool full, float shiftX, float shiftY, float own)
+        {
+            return _pushSteady(set, (uint)eyes, motion, take, topDown ? 1u : 0u, window, (uint)pass, fresh ? 1u : 0u, full ? 1u : 0u, shiftX, shiftY, own);
+        }
+
+        // How the resolve enlarges a smaller model's edit: plainly, or along the frame's own edges
+        // and sharpened (see EditFollowing in the native half's shader).
+        internal static void ResolveOptions(bool follow, float edge, float sharpen, float halo, bool outline)
+        {
+            _resolveOptions(follow ? 1u : 0u, edge, sharpen, halo, outline ? 1u : 0u);
+        }
+
         // Sharpens that texture where it lies; `eyes` 2 for a double-wide stereo frame.
         internal static int PushSharpen(IntPtr texture, float strength, int eyes)
         {
             return _pushSharpen(texture, strength, (uint)eyes);
+        }
+
+        // The scene's depth into the depth target bound when the event runs (see SceneUi.cs): for a
+        // camera's command buffer, not for Issue.
+        internal static int PushDepthFill(IntPtr depth, float u0, float uw, bool flip, float slack, bool reversed)
+        {
+            return _pushDepthFill(depth, u0, uw, flip ? 1u : 0u, slack, reversed ? 1u : 0u);
+        }
+
+        internal static void DepthFillStatus(out uint done, out uint noTarget, out uint failed)
+        {
+            _depthFillStatus(out done, out noTarget, out failed);
         }
 
         // The passthrough pass and the camera worker behind it (see Passthrough.cs).
@@ -394,10 +453,29 @@ namespace VamDlssNrWorkScale
             _flipPaceStatus(out rate, out refresh, out each, out queue, out dropped);
         }
 
-        // ONNX Runtime and the two hand models, from beside the native DLL.
-        internal static bool HandLoad()
+        // ONNX Runtime and the hand models, from beside the native DLL. `full`: the full-size
+        // landmark model instead of the small one; `mercury`: Mercury's keypoint network for
+        // following a hand once it is found -- each where its file is there.
+        internal static bool HandLoad(bool full, bool mercury)
         {
+            _handPrefer((full ? 1u : 0u) | (mercury ? 2u : 0u));
             return _handLoad(IntPtr.Zero) != 0;
+        }
+
+        internal static bool HandMercury()
+        {
+            return _handMercury() != 0;
+        }
+
+        // How far each finger of each hand is bent, by Mercury: 12 floats, six a hand in HandRead's order.
+        internal static void HandCurls(float[] curls)
+        {
+            _handCurls(curls);
+        }
+
+        internal static bool HandFull()
+        {
+            return _handFull() != 0;
         }
 
         internal static string HandError()
@@ -760,6 +838,29 @@ namespace VamDlssNrWorkScale
         internal float Slack = 1.15f;  // how much room to spare before the window shrinks
         internal float Dwell = 2f;     // how long a shape is kept at the least
 
+        // While the picture moves fast (the camera swung with the keys: the figures cross the
+        // screen, change size, leave and come back) nothing about them is worth a new shape:
+        // each one is a rebuild, a fifth of a second, and the next is already on its way -- which
+        // was a stutter for as long as the movement lasted. So a shape is kept while the figures'
+        // box moves faster than Fast (screen widths a second) and for a moment after, and a
+        // figure lost for under Regain seconds is not a new figure. And where the window was
+        // pushed along by the box's leading edge, its faded edge lay on the figure's outline for
+        // as long as it moved: while moving, the window is drawn Lead larger and held around the
+        // box's middle instead.
+        //
+        // That was not enough (a session's log: four rebuilds, 150 to 190 ms each, while the camera
+        // was flown about with the keys): flying towards a figure or around it hardly moves its
+        // box across the screen, it changes the box's SIZE and proportions -- and each new
+        // proportion was a new shape as soon as the last one's two seconds were up. So a new
+        // shape now waits until the box has been calm -- neither its middle nor its size changing
+        // by more than Calm screen widths a second -- for CalmFor seconds: while the view is being
+        // changed nothing is rebuilt, and when it comes to rest the shape is chosen once.
+        internal float Fast = 0.35f;
+        internal float Calm = 0.04f;
+        internal float CalmFor = 1f;
+        internal float Regain = 1f;
+        internal float Lead = 1f;      // 0: pushed along no further than it must, as when at rest
+
         internal int Shape = 1;
         internal float CentreX, CentreY, Zoom = 1f;
 
@@ -767,11 +868,20 @@ namespace VamDlssNrWorkScale
         private float _lostAt = -1f;
         private float _fromX, _fromY, _fromZoom;
         private float _shapeSince = -1e9f;
+        private bool _haveBox;
+        private float _boxX, _boxY, _boxW, _boxH, _boxAt, _fastUntil = -1e9f, _activeAt = -1e9f, _leading;
+
+        internal bool Moving(float now)
+        {
+            return now < _fastUntil;
+        }
 
         internal void Reset()
         {
             _have = false;
             _lostAt = -1f;
+            _haveBox = false;
+            _leading = 0f;
         }
 
         // The shape's size in pixels for an area of `area` pixels, inside a w x h frame.
@@ -838,10 +948,42 @@ namespace VamDlssNrWorkScale
             if (valid)
             {
                 float boxW = Mathf.Max(box[2] - box[0], 1f), boxH = Mathf.Max(box[3] - box[1], 1f);
+                float midX = (box[0] + box[2]) * 0.5f, midY = (box[1] + box[3]) * 0.5f;
                 bool fresh = !_have || _lostAt >= 0f;
-                int shape = ShapeFor(boxW, boxH, area, w, h, zoomMin, zoomCap, fresh);
+                bool anew = !_have || (_lostAt >= 0f && now - _lostAt > Regain);
+                float step = 0f;
 
-                if (shape != Shape && (fresh || now - _shapeSince >= Dwell))
+                if (_haveBox && now > _boxAt)
+                {
+                    step = Mathf.Min(now - _boxAt, 0.1f);
+                    float dx = midX - _boxX, dy = midY - _boxY;
+                    float speed = Mathf.Sqrt(dx * dx + dy * dy) / (now - _boxAt);
+                    float growth = (Mathf.Abs(boxW - _boxW) + Mathf.Abs(boxH - _boxH)) / (now - _boxAt);
+
+                    if (speed > Fast * w)
+                    {
+                        _fastUntil = now + 0.6f;
+                    }
+
+                    if (speed > Calm * w || growth > Calm * w)
+                    {
+                        _activeAt = now;
+                    }
+                }
+
+                _haveBox = true;
+                _boxX = midX;
+                _boxY = midY;
+                _boxW = boxW;
+                _boxH = boxH;
+                _boxAt = now;
+                bool moving = now < _fastUntil;
+                _leading = Mathf.MoveTowards(_leading, moving ? 1f : 0f, step * (moving ? 6f : 2f));
+                float lead = _leading * Mathf.Clamp01(Lead);
+
+                int shape = ShapeFor(boxW, boxH, area, w, h, zoomMin, zoomCap, anew);
+
+                if (shape != Shape && !moving && (anew || (now - _activeAt >= CalmFor && now - _shapeSince >= Dwell)))
                 {
                     Shape = shape;
                     _shapeSince = now;
@@ -849,7 +991,7 @@ namespace VamDlssNrWorkScale
 
                 ShapeSize(Shape, area, w, h, out shapeW, out shapeH);
                 float zoomMax = Mathf.Max(zoomMin, Mathf.Min(zoomCap, Mathf.Min(w / (float)shapeW, h / (float)shapeH)));
-                float need = Mathf.Clamp(Mathf.Max(boxW / shapeW, boxH / shapeH), zoomMin, zoomMax);
+                float need = Mathf.Clamp(Mathf.Max(boxW / shapeW, boxH / shapeH) * (1f + 0.15f * lead), zoomMin, zoomMax);
 
                 if (fresh)
                 {
@@ -871,6 +1013,10 @@ namespace VamDlssNrWorkScale
                 float winW = shapeW * Zoom, winH = shapeH * Zoom;
                 CentreX = winW >= boxW ? Mathf.Clamp(CentreX, box[2] - winW * 0.5f, box[0] + winW * 0.5f) : (box[0] + box[2]) * 0.5f;
                 CentreY = winH >= boxH ? Mathf.Clamp(CentreY, box[3] - winH * 0.5f, box[1] + winH * 0.5f) : (box[1] + box[3]) * 0.5f;
+
+                // (moving fast: around the box's middle, so that its edges are as far from the window's as they can be)
+                CentreX += (midX - CentreX) * lead;
+                CentreY += (midY - CentreY) * lead;
 
                 _have = true;
                 _lostAt = -1f;
@@ -1191,6 +1337,40 @@ namespace VamDlssNrWorkScale
         internal RenderTexture Result;
         internal int FrameW, FrameH, WorkW, WorkH;
         internal int Eyes = 1;
+        private int _steadyFrame = -1, _steadyPass;
+
+        // The shift of the network's raster this frame, in the frame's pixels (see PSGather): for a
+        // network at 1/n of the frame each way, n x n places half... a whole of the frame's pixels
+        // apart, taken in turn, so that after n x n frames every one of the frame's pixels has
+        // been at the middle of a network pixel once.
+        internal float ShiftX, ShiftY;
+        internal bool Detail;
+
+        internal void Shift(bool wanted, int frameW, int workW)
+        {
+            int n = workW > 0 ? Mathf.RoundToInt(frameW / (float)workW) : 1;
+            Detail = wanted && n >= 2 && n <= 4;
+            ShiftX = ShiftY = 0f;
+
+            if (!Detail)
+            {
+                return;
+            }
+
+            int phase = Time.frameCount % (n * n), x = phase % n, y = phase / n;
+
+            // (for two by two: the diagonal first, so that two frames already cover both rows and both columns)
+            if (n == 2)
+            {
+                x = phase == 1 || phase == 2 ? 1 : 0;
+                y = phase == 1 || phase == 3 ? 1 : 0;
+            }
+
+            ShiftX = x - (n - 1) * 0.5f;
+            ShiftY = y - (n - 1) * 0.5f;
+        }
+        private readonly int[] _steadyLast = { -100, -100, -100, -100 };
+        private bool _steadyFull;
         internal bool Live;
         internal int LiveFrame = -1;
         internal float LastUsed;
@@ -1817,6 +1997,39 @@ namespace VamDlssNrWorkScale
                 _regOutput = output;
             }
 
+            // The edit kept over frames. The model's own motion vectors (the first of its guides, at
+            // its size) say where each of its pixels was a frame ago; each of its passes over a
+            // frame has an edit of its own to keep.
+            if ((Hooks.CfgEditSteady != null && Hooks.CfgEditSteady.Value) || Detail)
+            {
+                if (_steadyFrame != Time.frameCount)
+                {
+                    _steadyFrame = Time.frameCount;
+                    _steadyPass = 0;
+                }
+
+                int pass = Mathf.Min(_steadyPass++, _steadyLast.Length - 1);
+                RenderTexture motion = Hooks.GuideFields != null && Hooks.GuideFields[0] != null ? Hooks.GuideFields[0].GetValue(Capture) as RenderTexture : null;
+                motion = motion ?? _guides[0];
+                IntPtr pMotion = motion != null && motion.IsCreated() ? motion.GetNativeTexturePtr() : IntPtr.Zero;
+
+                if (pMotion != IntPtr.Zero)
+                {
+                    float take = Hooks.CfgEditSteadyTake != null ? Hooks.CfgEditSteadyTake.Value : 0.2f;
+                    bool full = Detail && !Windowed;
+                    Native.IssuePass(Native.PushSteady(Set, Eyes, pMotion, take, TopDown, Windowed ? Window : null, pass, Time.frameCount - _steadyLast[pass] > 1 || full != _steadyFull, full, ShiftX, ShiftY,
+                        Hooks.CfgEditDetailOwn != null ? Hooks.CfgEditDetailOwn.Value : 0.6f));
+                    _steadyFull = full;
+                    _steadyLast[pass] = Time.frameCount;
+                }
+            }
+
+            // A smaller model's edit: enlarged along the frame's edges, and sharpened by how far it is enlarged.
+            float scale = Hooks.CfgScale != null ? Mathf.Clamp(Hooks.Quantise(Hooks.CfgScale.Value, 2f), 0.1f, 1f) : 1f;
+            Native.ResolveOptions(Hooks.CfgEditFollow != null && Hooks.CfgEditFollow.Value, Hooks.CfgEditEdge != null ? Hooks.CfgEditEdge.Value : 0.08f,
+                (Hooks.CfgEditSharpen != null ? Hooks.CfgEditSharpen.Value : 1f) * (1f / scale - 1f) - (scale < 1f && Hooks.CfgEditDenoise != null ? Hooks.CfgEditDenoise.Value : 0f),
+                Hooks.CfgEditHalo != null ? Hooks.CfgEditHalo.Value : 0.5f,
+                Hooks.CfgWindowOutline != null && Hooks.CfgWindowOutline.Value);
             Native.IssuePass(Native.PushPass(true, Set, Eyes, 1f, mode, Windowed ? Window : null, Feather));
             Live = true;
             LiveFrame = Time.frameCount;
@@ -1871,6 +2084,10 @@ namespace VamDlssNrWorkScale
         internal static Action<string> Error = delegate { };
 
         internal static ConfigEntry<float> CfgScale;
+        internal static ConfigEntry<bool> CfgEditFollow, CfgEditSteady, CfgEditDetail, CfgWindowOutline;
+        internal static ConfigEntry<float> CfgEditDetailOwn, CfgEditDenoise;
+        internal static ConfigEntry<float> CfgEditSteadyTake, CfgInputSharpen;
+        internal static ConfigEntry<float> CfgEditEdge, CfgEditSharpen, CfgEditHalo;
         internal static ConfigEntry<bool> CfgStills;
         internal static ConfigEntry<int> CfgEnlargement;
         internal static ConfigEntry<int> CfgDebugView;
@@ -2659,6 +2876,10 @@ namespace VamDlssNrWorkScale
                 }
 
                 view.HandGuidesBack();
+                // Detail built up over frames: the network's raster shifted by a part of one of its
+                // pixels, differently every frame (not with a window, which has its own way of moving).
+                view.Shift(CfgEditDetail != null && CfgEditDetail.Value && !windowed, w, ww);
+                Native.DownOptions(CfgInputSharpen != null ? CfgInputSharpen.Value : 0f, view.ShiftX, view.ShiftY);
                 view.Downsample();
 
                 // Only now, with nothing left that can fail, does the method see the smaller frame.
@@ -3159,7 +3380,7 @@ namespace VamDlssNrWorkScale
     public class WorkScalePlugin : BaseUnityPlugin
     {
         public const string Guid = "jeahbwoi720.vamdlssnr.workscale";
-        public const string Version = "1.7.0";
+        public const string Version = "1.8.0";
 
         // What every build's settings file is called after its owner prefix.
         private const string SettingsSuffix = ".vamdlssnr.workscale.cfg";
@@ -3221,6 +3442,49 @@ namespace VamDlssNrWorkScale
                 "1.0 is VamDlssNr exactly as it ships. Works the same on the monitor and in a headset (per eye), and multiplies with everything else that sets the network's input size: with Run before DLSS on, this is a fraction of the DLSS render extent.\n\n" +
                 "Applied when the slider is let go, because every change rebuilds the network.",
                 new AcceptableValueRange<float>(Hooks.MinScale, supersample.Value ? 2f : 1f)));
+
+            Hooks.CfgEditFollow = Config.Bind("Neural Rendering", "EditFollowsEdges", true,
+                "Below 100% Model resolution: enlarge the network's edit along the full-size frame's own edges instead of plainly. " +
+                "Enlarged plainly, what the network did at its smaller size is a blur: across an edge it runs out on both sides (the lift it gave a face spills onto the wall behind, in steps a network pixel wide), and inside a surface it is softer than the network made it. " +
+                "With this on, each full-size pixel takes the edit from the network pixels that were looking at the same thing it shows, so the edit stays on its own side of every edge, to the pixel. It is the dearer of the two improvements (it reads the network's pixels one by one, in every pass): where the frame rate matters more than edges, leave it off and keep EditSharpening.");
+            Hooks.CfgEditEdge = Config.Bind("Neural Rendering", "EditEdgeTolerance", 0.08f, new ConfigDescription(
+                "With EditFollowsEdges: how unlike a full-size pixel a network pixel's input may be and still be listened to (0..1 of the picture's range). Lower follows fainter edges and can make flat, noisy areas blocky; higher goes back towards the plain enlargement.",
+                new AcceptableValueRange<float>(0.01f, 0.5f)));
+            Hooks.CfgEditSharpen = Config.Bind("Neural Rendering", "EditSharpening", 1f, new ConfigDescription(
+                "Below 100% Model resolution: how much the fine part of the network's edit -- pores, the grain of skin, which it drew small and which comes out of the enlargement soft -- is strengthened, at 50% Model resolution (it follows the scale: none at 100%, more the lower it goes). Works with EditFollowsEdges on or off; off is the cheaper. 0 = none, and costs nothing.",
+                new AcceptableValueRange<float>(0f, 4f)));
+            Hooks.CfgEditHalo = Config.Bind("Neural Rendering", "EditSharpeningReach", 0.5f, new ConfigDescription(
+                "With EditSharpening: how far the strengthened edit may stand out. With EditFollowsEdges, past what the network pixels around it hold, as a share of their range; without, as a cap on what the sharpening adds. 0 is the least effect and no ringing along edges; higher lets fine detail stand out more and edges begin to ring.",
+                new AcceptableValueRange<float>(0f, 2f)));
+
+            Hooks.CfgEditSteady = Config.Bind("Neural Rendering", "EditKeptOverFrames", true,
+                "Below 100% Model resolution (and with a focus window): keep the network's edit from frame to frame and blend each new frame's into it, instead of laying each frame's on alone. " +
+                "The network is run afresh on every frame and does not answer quite the same twice; at a lower model resolution each of its pixels is several of the screen's, and the difference shows as a crawl over skin. " +
+                "What is kept is carried to where things have moved to by the network's own motion vectors, and is not believed where the new frame's edit says something else, so moving things should not trail ghosts. " +
+                "Costs one small pass at the network's size a pass, and a little video memory.");
+            Hooks.CfgEditSteadyTake = Config.Bind("Neural Rendering", "EditNewShare", 0.2f, new ConfigDescription(
+                "With EditKeptOverFrames: how much of each new frame's edit is taken. 0.2 makes a still picture's edit the mean of about the last nine frames; lower is steadier and slower to follow a change of light, 1 keeps nothing.",
+                new AcceptableValueRange<float>(0.05f, 1f)));
+
+            Hooks.CfgEditDetail = Config.Bind("Neural Rendering", "EditDetailOverFrames", false,
+                "Experimental. Below 100% Model resolution, where the network runs at a half, a third or a quarter of the frame each way (and not with a focus window): build up detail finer than the network's own pixels over a few frames. " +
+                "The network's raster is shifted by a part of one of its pixels, differently every frame, so that in turn every pixel of the frame is looked at from the middle of a network pixel; the edit is kept at the frame's full size, and each pixel keeps what it got in the frame in which it was the one looked at. " +
+                "It works where things hold still for a few frames: a person moving by their own animation gets that frame's edit, as without this. It costs a full-size pass a frame and video memory for two full-size pictures for each pass of the network (about 120 MB at 2560x1440 with two passes, more in a headset), " +
+                "and the network sees a picture that is never in quite the same place twice, which it may or may not take well: look for shimmer.");
+            Hooks.CfgEditDetailOwn = Config.Bind("Neural Rendering", "EditDetailStrength", 0.6f, new ConfigDescription(
+                "With EditDetailOverFrames: how much each pixel of the frame keeps to the frame in which it was the one the network looked at. At 1 it takes all of the edit then and nothing of it in the frames between (the most detail, and the most to shimmer if the network does not answer alike from frame to frame); at 0 it is little more than the edit kept over frames.",
+                new AcceptableValueRange<float>(0f, 1f)));
+            Hooks.CfgWindowOutline = Config.Bind("Focus window", "ShowOutline", false,
+                "Draw the focus window into the picture, for seeing where it is and what it does as the view changes: its edge in magenta, and in cyan the line inside which the network's work lands whole (between the two it fades out). For the headset's window and the monitor's.");
+            Hooks.CfgEditDenoise = Config.Bind("Neural Rendering", "EditDenoise", 0f, new ConfigDescription(
+                "Below 100% Model resolution: take grain out of the network's edit. Run small, the network's grain is coarser -- each speck of it covers several of the frame's pixels -- and reads as noise. " +
+                "This blends the edit towards a blur of itself over a few of the network's pixels; its tone and shading stay, its speckle goes. It is the opposite of EditSharpening and is taken off it (set that to 0 to judge this alone); 1 is the blur outright. " +
+                "For noise that changes from frame to frame, EditKeptOverFrames is the better tool: it averages over time and keeps what is really there.",
+                new AcceptableValueRange<float>(0f, 1f)));
+            Hooks.CfgInputSharpen = Config.Bind("Neural Rendering", "InputSharpening", 0f, new ConfigDescription(
+                "Below 100% Model resolution: how much sharper than its exact average the network's input is made. The exact average is the honest shrink and the softest: fine contrast between the frame's pixels is gone before the network has seen it. " +
+                "This gives some back, so the network has more to work from. The frame itself is not sharpened by it -- the network's edit is still measured against the same input. 0 = the plain average. Experimental: whether the network answers better or only differently is for the eye to say.",
+                new AcceptableValueRange<float>(0f, 1.5f)));
 
             Hooks.CfgStills = Config.Bind("Neural Rendering", "ApplyToScreenshots", true,
                 "Use the same model resolution for VaM's screenshot cameras (the screenshot key, save thumbnails, SuperShot). A SuperShot frame is several times the screen's size, so this is where the saving is largest; turn it off to have stills always run the network at full size.");
@@ -3351,6 +3615,24 @@ namespace VamDlssNrWorkScale
             Hands.CfgOn = Config.Bind("Hands", "Tracking", false,
                 "Experimental. Find the wearer's hands in the headset's cameras (a PlayStation VR2 with PSVR2Toolkit 1.0.0 or later; the same cameras passthrough uses). For now they are only shown, as a skeleton in the scene, to judge the tracking by. " +
                 "The finding is done on the processor (ONNX Runtime, two background threads), not the graphics card. It needs onnxruntime.dll, hand-palm.onnx and hand-points.onnx beside the plugin.");
+            Hands.CfgFull = Config.Bind("Hands", "FullModel", false,
+                "Read when hand tracking is first switched on after VaM starts: find the fingers with MediaPipe's full-size landmark model instead of the small one. " +
+                "It tells fingers apart better and costs about twice the processor time a look. Needs hand-points-full.onnx beside the plugin; without that file the small model is used.");
+            Hands.CfgMercury = Config.Bind("Hands", "Mercury", false,
+                "Read when hand tracking is first switched on after VaM starts: follow a hand, once it is found, with Mercury's keypoint network (from Monado, the open-source VR runtime) instead of MediaPipe's. " +
+                "It was made for a headset's own cameras -- grey, wide, the hand often a dark shape against a window -- and on such pictures it does not turn the hand over as the other does, nor take a cloth or a screen for a hand. " +
+                "Needs hand-mercury.onnx beside the plugin (Monado's grayscale_keypoint_jan18.onnx, renamed); without that file nothing changes.");
+            HandDrive.CfgCurls = Config.Bind("Hands", "FingersByCurl", true,
+                "With Mercury following: bend VaM's fingers by what Mercury says of each finger as a whole (how far it is bent), not by where it puts the finger's joints in the picture. " +
+                "For a finger folded into a fist those places are guesses; the one number is what tells a fist, a thumb held up, or two fingers held out from an open hand.");
+            HandDrive.CfgPinch = Config.Bind("Hands", "PinchAssist", true,
+                "Bring the thumb's tip and the index finger's together on VaM's hand when the tracker has them nearly touching (PinchClosed), and part of the way up to PinchOpen. The tracker's fingertips stop short of touching, and VaM's hand has fingers of its own lengths: while the tracker has a pinch, VaM's own two fingertips are measured and curled until they meet.");
+            HandDrive.CfgPinchClosed = Config.Bind("Hands", "PinchClosed", 0.045f, new ConfigDescription(
+                "Metres between the tracker's thumb tip and index tip under which the pinch is closed. On recordings a real pinch read 2 to 4.5 cm (under 3.5 cm in only three frames of sixty of the last one).",
+                new AcceptableValueRange<float>(0.005f, 0.08f)));
+            HandDrive.CfgPinchOpen = Config.Bind("Hands", "PinchOpen", 0.08f, new ConfigDescription(
+                "Metres from which the two fingers are left as the tracker has them.",
+                new AcceptableValueRange<float>(0.02f, 0.15f)));
             Hands.CfgShow = Config.Bind("Hands", "ShowSkeleton", true,
                 "Draw the tracked hands in the scene: lines along the fingers, a dot at each joint. Blue is the left hand, orange the right.");
             Hands.CfgBoth = Config.Bind("Hands", "BothHands", true,
@@ -3385,6 +3667,24 @@ namespace VamDlssNrWorkScale
             Foveation.CfgMonitor = Config.Bind("Foveation", "OnMonitor", false,
                 "Also in desktop mode, around the middle of the window.");
 
+            SceneUi.CfgOn = Config.Bind("SceneUi", "AfterDlss", false,
+                "Keep the scene's interface atoms (the UIButton, UISlider, UIToggle, UIText and UIImage a scene is built with) out of what DLSS and Neural Rendering work on: " +
+                "they are drawn afterwards onto the finished picture, at its full size, as the menu is. Without it their text is rendered small by a DLSS quality mode, upscaled, and reworked by Neural Rendering with the rest of the scene. " +
+                "In a headset and on the monitor, while VaM DLSS is at work.");
+            SceneUi.CfgOcclude = Config.Bind("SceneUi", "HiddenBehindPeople", true,
+                "Lay the scene's depth under them before they are drawn, so that a button on a wall stays behind whoever stands in front of it, as in plain VaM. " +
+                "With a DLSS quality mode the edge where something covers them follows the lower size the scene is rendered at. Off: they are always on top.");
+            SceneUi.CfgAtoms = Config.Bind("SceneUi", "Atoms", "UIButton,UIButtonImage,UISlider,UIToggle,UIText,UIImage",
+                "The kinds of atom this is done for, by VaM's name for them, separated by commas.");
+            SceneUi.CfgLayer = Config.Bind("SceneUi", "Layer", 19, new ConfigDescription(
+                "The layer their canvases are moved to while this is on. It has to be one VaM leaves unused: 3, 6, 7, 18 or 19. Change it if another plugin uses 19.",
+                new AcceptableValueRange<int>(1, 31)));
+            SceneUi.CfgSlack = Config.Bind("SceneUi", "DepthSlack", 0.01f, new ConfigDescription(
+                "How far back the scene's depth is pushed before they are drawn, as a fraction of its distance. It keeps a panel that lies close on a surface from being cut into stripes; raise it if you see that, lower it if they show through things just in front of them.",
+                new AcceptableValueRange<float>(0f, 0.2f)));
+            SceneUi.CfgFlip = Config.Bind("SceneUi", "DepthUpsideDown", false,
+                "Turn on if they are hidden by things above or below them instead of things in front of them.");
+
             Presentation.CfgFlip = Config.Bind("Presentation", "FlipModel", false,
                 "Monitor mode only, and read when VaM starts: present the game's window with the flip model instead of Unity's old bit-block copy. " +
                 "With the old way the desktop compositor drops most frames above the base rate -- frame generation renders more frames and the picture gets no smoother -- and RTX HDR cannot take the window. " +
@@ -3396,6 +3696,8 @@ namespace VamDlssNrWorkScale
                 "With this on they wait in the window's queue and come out in rhythm, one every so many screen refreshes, while the game is already rendering the next frame. " +
                 "It costs the time a frame waits (up to about one rendered frame), and it replaces VaM's own VSync setting and VaM DLSS's \"space frames evenly\", which is best switched off with it.");
 
+            ControlPanel.CfgFoldBelow = Config.Bind("Interface", "PanelBelow100Open", false,
+                "Whether the in-headset panel's section of options for a model resolution below 100% is unfolded; it opens as it was left.");
             ControlPanel.CfgPage = Config.Bind("Interface", "PanelPage", 0, new ConfigDescription(
                 "The page the in-headset panel was last on; it opens there again.",
                 new AcceptableValueRange<int>(0, 16)));
@@ -3414,6 +3716,13 @@ namespace VamDlssNrWorkScale
                 "Sharpen the finished frame, after DLSS and Neural Rendering and before the interface is drawn: 0 is off, 1 the most. DLSS has no sharpening of its own any more, and its picture -- DLAA's most of all -- is on the soft side.\n\n" +
                 "The filter is contrast-adaptive: soft detail gains the most, flat areas and edges that are already hard are left nearly alone, and nothing is pushed beyond the darkest and brightest of its neighbours, so it does not ring.",
                 new AcceptableValueRange<float>(0f, 1f)));
+
+            EyeSize.CfgCorrect = Config.Bind("Headset", "CorrectEyeSize", true,
+                "VaM DLSS measures the size of the headset's picture once and reconstructs to it for the rest of the session. Started with a DLSS upscaling mode already on, VaM can still have eye textures of half the size at that moment, and the headset then gets a coarse, pixelated picture whatever is chosen afterwards (until VaM's own Render Scale is moved, or VaM is restarted). " +
+                "On: the measurement is checked against the size SteamVR gives for an eye, and written anew where SteamVR and the eye texture Unity has both say otherwise. " +
+                "Likewise the eye scale VaM DLSS multiplies its DLSS ratio onto: where it has come to hold another than VaM's Render Scale (seen after changing the quality: Ultra Performance at a ninth of the size instead of a third), it is given VaM's. Said in the log when either happens. SteamVR headsets only.");
+            EyeSize.CfgLog = Config.Bind("Headset", "EyeSizeLog", true,
+                "Write a line to the log whenever the headset's eye texture, its eye scale, SteamVR's size for an eye, VaM's Render Scale or VaM DLSS's own measurement changes (lines beginning 'eye size:'; 160 a session at most). For finding out how a session came to a wrong picture size.");
 
             HeadsetUi.CfgMethod = Config.Bind("Interface", "HeadsetDrawWhen", 0, new ConfigDescription(
                 "When FullSizeInHeadset draws the interface: 0 at the end of the frame, with the single-pass stereo shader keyword off (the way that works); 1 at the end of the frame with the keyword left alone; 2 at once, inside VaM DLSS's own frame. For finding what a given headset runtime needs -- leave at 0.",
@@ -3518,6 +3827,7 @@ namespace VamDlssNrWorkScale
         {
             Hands.Stop();
             Passthrough.Stop();
+            SceneUi.Stop();
         }
 
         // The headset's interface is drawn once every camera has rendered (see HeadsetUi).
@@ -3532,6 +3842,13 @@ namespace VamDlssNrWorkScale
             }
         }
 
+        // VaM's own fingertips brought together while the tracker has a pinch (see HandDrive.Late):
+        // after every Update, VaM's included.
+        private void LateUpdate()
+        {
+            HandDrive.Late(Time.unscaledTime);
+        }
+
         private void Update()
         {
             // Nothing, unless the panel's button started a probe.
@@ -3539,6 +3856,8 @@ namespace VamDlssNrWorkScale
 
             Foveation.Tick(Time.unscaledTime);
             Presentation.Tick(Time.unscaledTime);
+            SceneUi.Tick(Time.unscaledTime);
+            EyeSize.Tick(Time.unscaledTime);
 
             // The wearer's hands, when they are being tracked: it holds the camera, so before the tick
             // that would give it back.

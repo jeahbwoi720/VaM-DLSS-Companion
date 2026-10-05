@@ -225,6 +225,12 @@ namespace VamDlssNrWorkScale
             internal readonly List<UIDynamicButton> Tabs = new List<UIDynamicButton>();
             internal Color TabColour = Color.white;
             internal int Building, Page;
+
+            // Sections of a page that fold away under a button: which section each folded control
+            // is in, whether each is open, and the one being built (-1: none).
+            internal readonly Dictionary<GameObject, int> Folded = new Dictionary<GameObject, int>();
+            internal readonly List<ConfigEntry<bool>> Folds = new List<ConfigEntry<bool>>();
+            internal int Folding = -1;
             internal readonly List<Binding> Bindings = new List<Binding>();
             internal readonly List<Binding> RegionBindings = new List<Binding>();
             internal int Region = 1;
@@ -240,6 +246,7 @@ namespace VamDlssNrWorkScale
 
         // The page the panel was last on: it opens there again.
         internal static ConfigEntry<int> CfgPage;
+        internal static ConfigEntry<bool> CfgFoldBelow;
 
         // Set when Tick has thrown: the panel is then left alone for the rest of the session.
         internal static bool Off;
@@ -358,13 +365,156 @@ namespace VamDlssNrWorkScale
             hi = range != null ? range.MaxValue : 1f;
         }
 
+        // What a control is for, shown in the panel's status box when it is pointed at: the
+        // description its setting has in the .cfg, which is a long way off from inside a headset.
+        // Only the two pointer events are taken -- a component that took them all would keep the
+        // wheel and the drag from the panel's own scrolling.
+        //
+        // The descriptions are long and the box has to be scrolled, and the way to the box leads
+        // over other controls. So a control has to be pointed at for half a second before its
+        // text takes the box, and the text then stays: for as long as the pointer is on the box
+        // itself, and for some seconds after it has left everything.
+        internal sealed class Hint : MonoBehaviour, UnityEngine.EventSystems.IPointerEnterHandler, UnityEngine.EventSystems.IPointerExitHandler
+        {
+            internal const float Dwell = 0.5f, Stay = 6f;
+
+            internal string Title, Text;
+            internal bool Box;            // this one is the status box itself, not a control
+            internal static Hint Over;    // the control whose text is shown
+            internal static bool Changed;
+            private static Hint _pointed; // what the pointer is on now, and since when
+            private static float _pointedAt, _leftAt;
+            private static bool _onBox;
+
+            internal static void OnBox(UIDynamic box)
+            {
+                if (box != null && box.gameObject.GetComponent<Hint>() == null)
+                {
+                    box.gameObject.AddComponent<Hint>().Box = true;
+                }
+            }
+
+            // Every frame: a control pointed at long enough takes the box; what is shown goes when it has been left long enough.
+            internal static void Step(float now)
+            {
+                if ((object)_pointed != null && !ReferenceEquals(_pointed, Over) && now - _pointedAt >= Dwell)
+                {
+                    Over = _pointed;
+                    Changed = true;
+                }
+
+                if ((object)Over != null && (object)_pointed == null && !_onBox && now - _leftAt > Stay)
+                {
+                    Over = null;
+                    Changed = true;
+                }
+            }
+
+            internal static void On(UIDynamic ui, string title, BepInEx.Configuration.ConfigDescription described)
+            {
+                if (ui == null || described == null || string.IsNullOrEmpty(described.Description))
+                {
+                    return;
+                }
+
+                Hint hint = ui.gameObject.GetComponent<Hint>();
+                hint = hint != null ? hint : ui.gameObject.AddComponent<Hint>();
+                hint.Title = title;
+                hint.Text = described.Description;
+            }
+
+            public void OnPointerEnter(UnityEngine.EventSystems.PointerEventData data)
+            {
+                if (Box)
+                {
+                    _onBox = true;
+                    return;
+                }
+
+                _pointed = this;
+                _pointedAt = Time.unscaledTime;
+            }
+
+            public void OnPointerExit(UnityEngine.EventSystems.PointerEventData data)
+            {
+                _leftAt = Time.unscaledTime;
+
+                if (Box)
+                {
+                    _onBox = false;
+                }
+                else if (ReferenceEquals(_pointed, this))
+                {
+                    _pointed = null;
+                }
+            }
+
+            // The text for the status box, or null when nothing is pointed at.
+            internal static string Shown()
+            {
+                Hint hint = Over;
+
+                if ((object)hint == null || hint == null || !hint.isActiveAndEnabled)
+                {
+                    Over = null;
+                    _pointed = ReferenceEquals(_pointed, hint) ? null : _pointed;
+                    return null;
+                }
+
+                return hint.Title + "\n\n" + hint.Text;
+            }
+        }
+
         // Every control belongs to the page that was being built when it was made.
         private static void Put(Panel p, UIDynamic ui)
         {
             if (ui != null)
             {
                 p.Items.Add(new KeyValuePair<GameObject, int>(ui.gameObject, p.Building));
+
+                if (p.Folding >= 0)
+                {
+                    p.Folded[ui.gameObject] = p.Folding;
+                }
             }
+        }
+
+        // A section that folds away: a button across the column, and under it whatever is made
+        // until EndFold -- shown only while the section is open, which is remembered. For the
+        // settings that most people leave alone, so that the page is not a wall of sliders.
+        private static void BeginFold(Panel p, bool right, string title, ConfigEntry<bool> open)
+        {
+            if (open == null)
+            {
+                return;
+            }
+
+            UIDynamicButton ui = p.Script.CreateButton((open.Value ? "- " : "+ ") + title, right);
+            Put(p, ui);
+            int index = p.Folds.Count;
+            p.Folds.Add(open);
+            p.Folding = index;
+
+            if (ui != null && ui.button != null)
+            {
+                ui.buttonColor = new Color(0.82f, 0.82f, 0.9f);
+                ui.button.onClick.AddListener(delegate
+                {
+                    open.Value = !open.Value;
+
+                    if (ui.buttonText != null)
+                    {
+                        ui.buttonText.text = (open.Value ? "- " : "+ ") + title;
+                    }
+
+                    Show(p, p.Page);
+                });
+            }
+        }
+
+        private static void EndFold(Panel p)
+        {
+            p.Folding = -1;
         }
 
         private static FloatBinding Slider(Panel p, bool right, string label, Func<ConfigEntry<float>> entry, string format)
@@ -394,6 +544,7 @@ namespace VamDlssNrWorkScale
                 ui.rangeAdjustEnabled = false;
             }
 
+            Hint.On(ui, label, first.Description);
             Put(p, ui);
             p.Bindings.Add(b);
             return b;
@@ -424,6 +575,7 @@ namespace VamDlssNrWorkScale
                 ui.label = label;
             }
 
+            Hint.On(ui, label, entry.Description);
             Put(p, ui);
             p.Bindings.Add(b);
         }
@@ -450,6 +602,7 @@ namespace VamDlssNrWorkScale
                 ui.label = label;
             }
 
+            Hint.On(ui, label, entry.Description);
             Put(p, ui);
             p.Bindings.Add(b);
         }
@@ -544,9 +697,17 @@ namespace VamDlssNrWorkScale
             {
                 GameObject go = p.Items[i].Key;
 
-                if (go != null && go.activeSelf != (p.Items[i].Value == page))
+                if (go == null)
                 {
-                    go.SetActive(p.Items[i].Value == page);
+                    continue;
+                }
+
+                int fold;
+                bool on = p.Items[i].Value == page && (!p.Folded.TryGetValue(go, out fold) || p.Folds[fold].Value);
+
+                if (go.activeSelf != on)
+                {
+                    go.SetActive(on);
                 }
             }
 
@@ -689,6 +850,16 @@ namespace VamDlssNrWorkScale
 
             Toggle(p, Left, "Neural Rendering", nr);
             Slider(p, Left, "NR model resolution (applies when let go)", Hooks.CfgScale, "F2");
+            BeginFold(p, Left, "Below 100% model resolution: options", CfgFoldBelow);
+                Toggle(p, Left, "Edit follows edges (costs fps)", Hooks.CfgEditFollow);
+            Slider(p, Left, "Edit sharpening (0 = off)", Hooks.CfgEditSharpen, "F1");
+            Slider(p, Left, "Edit denoise (0 = off)", Hooks.CfgEditDenoise, "F2");
+            Toggle(p, Left, "Edit kept over frames (steadier)", Hooks.CfgEditSteady);
+            Slider(p, Left, "Kept over frames: share of each new frame", Hooks.CfgEditSteadyTake, "F2");
+            Toggle(p, Left, "Build detail over frames (experimental)", Hooks.CfgEditDetail);
+            Slider(p, Left, "Detail over frames: strength", Hooks.CfgEditDetailOwn, "F2");
+            Slider(p, Left, "Input sharpening (0 = off)", Hooks.CfgInputSharpen, "F2");
+                EndFold(p);
             Slider(p, Left, "NR intensity", intensity, "F2");
             Slider(p, Left, "NR local tone", tone, "F2");
             Slider(p, Left, "NR local structure", structure, "F2");
@@ -776,6 +947,7 @@ namespace VamDlssNrWorkScale
                 Slider(p, Right, "Monitor window height", Hooks.CfgMonitorHeight, "F2");
                 Toggle(p, Right, "Monitor window: follow", Hooks.CfgMonitorFollow);
                 Toggle(p, Right, "Monitor window: fit people", Hooks.CfgMonitorFit);
+                Toggle(p, Right, "Show the window's outline (for testing)", Hooks.CfgWindowOutline);
             }
 
             // ---- DLSS and the picture on the left, its sign switches on the right ----
@@ -796,6 +968,11 @@ namespace VamDlssNrWorkScale
             if (HeadsetUi.Hooked && HeadsetUi.CfgOn != null)
             {
                 Toggle(p, Left, "Headset menu at full size", HeadsetUi.CfgOn);
+            }
+
+            if (HeadsetUi.Hooked && SceneUi.CfgOn != null)
+            {
+                Toggle(p, Left, "Scene UI atoms: after DLSS / NR", SceneUi.CfgOn);
             }
 
             Toggle(p, Left, "Frame generation (monitor only)", Mod<bool>("CfgFrameGen"));
@@ -899,6 +1076,10 @@ namespace VamDlssNrWorkScale
                 Toggle(p, Left, "Hand tracking (experimental)", Hands.CfgOn);
                 Choice(p, Left, "Hand tracking: VaM's hands follow", HandDrive.CfgMode, new[] { "Controllers", "Auto", "Tracked hands" }, new[] { 0, 1, 2 });
                 Toggle(p, Left, "Hand tracking: menus (not working yet)", HandUi.CfgOn);
+                Toggle(p, Left, "Hand tracking: Mercury model (restart)", Hands.CfgMercury);
+                Toggle(p, Left, "Hand tracking: full-size model (restart)", Hands.CfgFull);
+                Toggle(p, Left, "Hand tracking: fingers by curl (Mercury)", HandDrive.CfgCurls);
+                Toggle(p, Left, "Hand tracking: pinch assist", HandDrive.CfgPinch);
                 Toggle(p, Left, "Hand tracking: show skeleton", Hands.CfgShow);
                 Toggle(p, Left, "Hand tracking: both hands", Hands.CfgBoth);
                 Choice(p, Left, "Hand tracking: looks a second", Hands.CfgEvery, new[] { "60", "30", "20", "15" }, new[] { 1, 2, 3, 4 });
@@ -943,6 +1124,7 @@ namespace VamDlssNrWorkScale
             Panel p = new Panel();
             p.Script = script;
             p.Status = status;
+            Hint.OnBox(status.dynamicText);
             Build(p);
 
             if (attachedField != null && attachedField.FieldType == typeof(bool))
@@ -1108,6 +1290,11 @@ namespace VamDlssNrWorkScale
                 sb.Append(Passthrough.Status).Append('\n');
             }
 
+            if (SceneUi.Status.Length != 0)
+            {
+                sb.Append(SceneUi.Status).Append('\n');
+            }
+
             if (Presentation.Status.Length != 0)
             {
                 sb.Append(Presentation.Status).Append('\n');
@@ -1187,14 +1374,17 @@ namespace VamDlssNrWorkScale
                 SaveNow();
             }
 
-            if (_panels.Count == 0 || now < _nextPull)
+            Hint.Step(now);
+
+            if (_panels.Count == 0 || (now < _nextPull && !Hint.Changed))
             {
                 return;
             }
 
             _nextPull = now + 0.2f;
-            bool statusDue = now >= _nextStatus;
-            string text = null;
+            bool statusDue = now >= _nextStatus || Hint.Changed;
+            string text = Hint.Shown();
+            Hint.Changed = false;
 
             for (int i = _panels.Count - 1; i >= 0; i--)
             {

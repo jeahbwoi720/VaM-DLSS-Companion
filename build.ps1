@@ -32,6 +32,10 @@ New-Item -ItemType Directory -Force $patchers | Out-Null
 Copy-Item (Join-Path $here 'managed\out\VamDlssNrWorkScale.Early.dll') $patchers
 # The hand tracker's outside parts, beside the native DLL that loads them, with their licences.
 Copy-Item (Join-Path $here 'native\out\onnxruntime.dll'), (Join-Path $here 'native\out\hand-palm.onnx'), (Join-Path $here 'native\out\hand-points.onnx') $plugin
+$fullModel = Join-Path $here 'native\out\hand-points-full.onnx'
+if (Test-Path $fullModel) { Copy-Item $fullModel $plugin }
+$mercuryModel = Join-Path $here 'native\out\hand-mercury.onnx'
+if (Test-Path $mercuryModel) { Copy-Item $mercuryModel $plugin }
 Copy-Item (Join-Path $here 'THIRD-PARTY.md') (Join-Path $dist 'VamDlssNrWorkScale-THIRD-PARTY.md')
 Copy-Item (Join-Path $here 'README.md') (Join-Path $dist 'VamDlssNrWorkScale-README.md')
 Copy-Item (Join-Path $here 'LICENSE') (Join-Path $dist 'VamDlssNrWorkScale-LICENSE.txt')
@@ -40,9 +44,19 @@ Copy-Item (Join-Path $here 'LICENSE') (Join-Path $dist 'VamDlssNrWorkScale-LICEN
 if ($LASTEXITCODE -ne 0) { throw 'the .var package could not be built' }
 
 if ($Zip) {
+    # The release does not carry the two models the build only takes along when they have been put
+    # in native\deps by hand (see the README, Building): the zip is made from a copy without them.
     $zipPath = Join-Path $here "VamDlssNrWorkScale-v$version.zip"
     if (Test-Path $zipPath) { Remove-Item $zipPath -Force -Confirm:$false }
-    Compress-Archive -Path (Join-Path $dist '*') -DestinationPath $zipPath
+    $stage = Join-Path ([IO.Path]::GetTempPath()) "VamDlssNrWorkScale-zip-$PID"
+    if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -Confirm:$false }
+    Copy-Item $dist $stage -Recurse
+    foreach ($optional in 'hand-points-full.onnx', 'hand-mercury.onnx') {
+        $path = Join-Path $stage "BepInEx\plugins\VamDlssNrWorkScale\$optional"
+        if (Test-Path $path) { Remove-Item $path -Force -Confirm:$false }
+    }
+    Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zipPath
+    Remove-Item $stage -Recurse -Force -Confirm:$false
     Get-Item $zipPath | Select-Object Name, Length
 }
 

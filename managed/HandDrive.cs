@@ -308,7 +308,25 @@ namespace VamDlssNrWorkScale
                         {
                             int f = at + 4 + p * 3;
                             // SteamVR's room is right-handed, Unity's left: z turns round
-                            _points[side][p] = room.TransformPoint(new Vector3(hands[f], hands[f + 1], -hands[f + 2]));
+                            _local[p] = new Vector3(hands[f], hands[f + 1], -hands[f + 2]);
+                        }
+
+                        _close[side] = Closeness(_local);
+                        _curlOk[side] = CurlsIn[i * 6] > 0.5f;
+
+                        for (int k = 0; k < 5; k++)
+                        {
+                            _curl[side, k] = CurlsIn[i * 6 + 1 + k];
+                        }
+
+                        if (CfgPinch != null && CfgPinch.Value)
+                        {
+                            ClosePinch(_local);
+                        }
+
+                        for (int p = 0; p < Points; p++)
+                        {
+                            _points[side][p] = room.TransformPoint(_local[p]);
                         }
 
                         _seenAt[side] = now;
@@ -507,6 +525,326 @@ namespace VamDlssNrWorkScale
             bone.Length = length;
             bone.Direction = V(length > 1e-6f ? along / length : turn * Vector3.forward);
             bone.Rotation = Q(turn);
+        }
+
+        internal static BepInEx.Configuration.ConfigEntry<bool> CfgPinch;
+        internal static BepInEx.Configuration.ConfigEntry<float> CfgPinchClosed, CfgPinchOpen;
+        private static readonly Vector3[] _local = new Vector3[Points];
+
+        // The thumb's tip and the index finger's brought together when they nearly are.
+        //
+        // The tracker's fingertips stop short of each other: on a recording of a hand pinching,
+        // the two tips it gives are one and a half to two centimetres apart at their closest, and
+        // VaM's hand, built from them, never closes (with Mercury following they read 2.5 to 3.5
+        // cm). So a gap under PinchClosed is taken for a pinch and closed, and between that and
+        // PinchOpen it is closed in part, so that nothing jumps: each
+        // of the two fingers is turned, whole, about its own knuckle (the thumb about its second
+        // joint), far enough that its tip comes to where the two are to meet. Metres, in the
+        // room, before the game's own scale.
+        private static void ClosePinch(Vector3[] p)
+        {
+            float closed = CfgPinchClosed != null ? CfgPinchClosed.Value : 0.045f;
+            float open = Mathf.Max(closed + 0.005f, CfgPinchOpen != null ? CfgPinchOpen.Value : 0.08f);
+            float gap = (p[4] - p[8]).magnitude;
+
+            if (gap >= open || gap < 1e-4f)
+            {
+                return;
+            }
+
+            float left = gap <= closed ? 0f : (gap - closed) / (open - closed);
+            left = left * left * (3f - 2f * left);
+            Vector3 middle = (p[4] + p[8]) * 0.5f;
+
+            Turn(p, 2, 4, Vector3.Lerp(middle, p[4], left));
+            Turn(p, 5, 8, Vector3.Lerp(middle, p[8], left));
+        }
+
+        // How nearly the tracker's thumb tip and index tip touch: 1 from PinchClosed down, 0 from
+        // PinchOpen up.
+        private static float Closeness(Vector3[] p)
+        {
+            float closed = CfgPinchClosed != null ? CfgPinchClosed.Value : 0.045f;
+            float open = Mathf.Max(closed + 0.005f, CfgPinchOpen != null ? CfgPinchOpen.Value : 0.08f);
+            float apart = Mathf.Clamp01(((p[4] - p[8]).magnitude - closed) / (open - closed));
+            return 1f - apart * apart * (3f - 2f * apart);
+        }
+
+        // ---- VaM's own fingertips, brought together ------------------------------------------
+        //
+        // Closing the pinch in the tracker's points is not enough: VaM's hand is not built from
+        // points but from an angle a joint, on fingers of its own lengths, and with the same
+        // angles its fingertips end up somewhere else -- the wearer's thumb and index touch, VaM's
+        // stay apart. So the gap is closed where it shows: while the tracker has a pinch, the
+        // distance between the tips of VaM's own thumb and index finger is measured each frame,
+        // and both are curled a little further for as long as that brings them nearer. Curl that
+        // stops helping (the tips passing each other) is taken back to where it helped most.
+        internal static BepInEx.Configuration.ConfigEntry<bool> CfgCurls;
+        internal static readonly float[] CurlsIn = new float[12];
+        private static readonly float[,] _curl = new float[2, 5];
+        private static readonly bool[] _curlOk = new bool[2];
+        private static readonly float[] _saidAt = new float[2];
+
+        // Mercury's bend of a finger (radians, more bent = more negative) as a share of a fist:
+        // what it reads for an open hand and for a fist, finger by finger, on recordings.
+        private static readonly float[] CurlOpen = { 0.4f, 0.4f, 0.5f, 0.9f, 1.0f };
+        private static readonly float[] CurlFist = { 1.2f, 1.6f, 2.2f, 2.0f, 2.1f };
+
+        private static float Share(int side, int finger)
+        {
+            float s = Mathf.Clamp01((-_curl[side, finger] - CurlOpen[finger]) / (CurlFist[finger] - CurlOpen[finger]));
+            // (a finger is mostly out or mostly in: the middle is where the number is least to be trusted)
+            s = Mathf.Clamp01((s - 0.1f) / 0.8f);
+            return s * s * (3f - 2f * s);
+        }
+
+        private static readonly float[] _close = new float[2];
+        private static readonly float[] _extra = new float[2], _nearest = new float[] { 1e9f, 1e9f }, _nearestAt = new float[2];
+        private static readonly bool[] _past = new bool[2], _added = new bool[2];
+        private static readonly MeshVR.Hands.HandOutput[] _fingers = new MeshVR.Hands.HandOutput[2];
+        private static bool _loopFailed;
+        internal static string PinchNote = "";
+
+        // After every Update has run: VaM has set its fingers from the hand's input by now.
+        internal static void Late(float now)
+        {
+            if (_loopFailed)
+            {
+                return;
+            }
+
+            try
+            {
+                PinchNote = "";
+                SuperController sc = SuperController.singleton;
+
+                if (sc == null)
+                {
+                    return;
+                }
+
+                bool wanted = _active && CfgPinch != null && CfgPinch.Value;
+                float dt = Mathf.Min(Time.unscaledDeltaTime, 0.05f);
+
+                for (int side = 0; side < 2; side++)
+                {
+                    bool on = wanted && _use[side] && now - _seenAt[side] < 0.3f;
+
+                    if (!on && !_added[side])
+                    {
+                        _extra[side] = 0f;
+                        _curlOk[side] = false;
+                        continue;
+                    }
+
+                    Transform hand = side == 0 ? sc.leftHand : sc.rightHand;
+
+                    if (_fingers[side] == null || !_fingers[side].isActiveAndEnabled)
+                    {
+                        _fingers[side] = FindFingers(side, hand, now);
+                    }
+
+                    MeshVR.Hands.HandOutput f = _fingers[side];
+
+                    if (f == null || f.indexProximal == null || f.indexMiddle == null || f.indexDistal == null || f.thumbProximal == null || f.thumbMiddle == null || f.thumbDistal == null)
+                    {
+                        _added[side] = false;
+
+                        if (on && _close[side] > 0.5f)
+                        {
+                            PinchNote = "pinch: VaM's hand has no finger joints to curl (" + (hand == null ? "no hand" : hand.name) + ")";
+                        }
+
+                        continue;
+                    }
+
+                    // The tips: a joint's place is where its bone begins, so each tip is a bone's length past the last joint.
+                    Vector3 indexTip = f.indexDistal.transform.position + (f.indexDistal.transform.position - f.indexMiddle.transform.position) * 0.75f;
+                    Vector3 thumbTip = f.thumbDistal.transform.position + (f.thumbDistal.transform.position - f.thumbMiddle.transform.position) * 0.85f;
+                    float bone = (f.indexMiddle.transform.position - f.indexProximal.transform.position).magnitude;
+
+                    if (bone < 1e-6f)
+                    {
+                        continue;
+                    }
+
+                    // metres on a hand of ordinary size (whose index finger's first bone is 4 cm), whatever the game's scale
+                    float apart = (indexTip - thumbTip).magnitude / bone * 0.04f;
+                    float close = on ? _close[side] : 0f;
+
+                    if (close < 0.02f)
+                    {
+                        _extra[side] = Mathf.MoveTowards(_extra[side], 0f, 150f * dt);
+                        _past[side] = false;
+                        _nearest[side] = 1e9f;
+                    }
+                    else
+                    {
+                        // touching when the pinch is closed, up to 5 cm apart as it opens
+                        float error = apart - (0.006f + (1f - close) * 0.05f);
+
+                        if (apart < _nearest[side] - 0.0005f)
+                        {
+                            _nearest[side] = apart;
+                            _nearestAt[side] = _extra[side];
+                        }
+
+                        if (!_past[side] && error > 0f && _extra[side] > _nearestAt[side] + 10f && apart > _nearest[side] + 0.004f)
+                        {
+                            _past[side] = true;
+                        }
+
+                        if (_past[side])
+                        {
+                            _extra[side] = Mathf.MoveTowards(_extra[side], _nearestAt[side], 90f * dt);
+                        }
+                        else
+                        {
+                            _extra[side] = Mathf.Clamp(_extra[side] + Mathf.Clamp(error * 5000f, -150f, 150f) * dt, 0f, 45f);
+                        }
+
+                        if (close < 0.3f)
+                        {
+                            _past[side] = false;
+                            _nearest[side] = 1e9f;
+                        }
+
+                        PinchNote += (PinchNote.Length != 0 ? "; " : "pinch: ") + (side == 0 ? "left" : "right") + " " + (apart * 1000f).ToString("0") + " mm between VaM's fingertips, +" +
+                            _extra[side].ToString("0") + " deg" + (_past[side] ? " (no nearer with more)" : "");
+                    }
+
+                    float x = _extra[side];
+                    bool left = side == 0;
+
+                    // What VaM has each joint at from the hand's input (the tracker's points, through its Leap rig)...
+                    float ip = left ? MeshVR.Hands.HandInput.leftIndexProximalBend : MeshVR.Hands.HandInput.rightIndexProximalBend;
+                    float im = left ? MeshVR.Hands.HandInput.leftIndexMiddleBend : MeshVR.Hands.HandInput.rightIndexMiddleBend;
+                    float id = left ? MeshVR.Hands.HandInput.leftIndexDistalBend : MeshVR.Hands.HandInput.rightIndexDistalBend;
+                    float mp = left ? MeshVR.Hands.HandInput.leftMiddleProximalBend : MeshVR.Hands.HandInput.rightMiddleProximalBend;
+                    float mm = left ? MeshVR.Hands.HandInput.leftMiddleMiddleBend : MeshVR.Hands.HandInput.rightMiddleMiddleBend;
+                    float md = left ? MeshVR.Hands.HandInput.leftMiddleDistalBend : MeshVR.Hands.HandInput.rightMiddleDistalBend;
+                    float rp = left ? MeshVR.Hands.HandInput.leftRingProximalBend : MeshVR.Hands.HandInput.rightRingProximalBend;
+                    float rm = left ? MeshVR.Hands.HandInput.leftRingMiddleBend : MeshVR.Hands.HandInput.rightRingMiddleBend;
+                    float rd = left ? MeshVR.Hands.HandInput.leftRingDistalBend : MeshVR.Hands.HandInput.rightRingDistalBend;
+                    float pp = left ? MeshVR.Hands.HandInput.leftPinkyProximalBend : MeshVR.Hands.HandInput.rightPinkyProximalBend;
+                    float pm = left ? MeshVR.Hands.HandInput.leftPinkyMiddleBend : MeshVR.Hands.HandInput.rightPinkyMiddleBend;
+                    float pd = left ? MeshVR.Hands.HandInput.leftPinkyDistalBend : MeshVR.Hands.HandInput.rightPinkyDistalBend;
+                    float tp = left ? MeshVR.Hands.HandInput.leftThumbProximalBend : MeshVR.Hands.HandInput.rightThumbProximalBend;
+                    float tm = left ? MeshVR.Hands.HandInput.leftThumbMiddleBend : MeshVR.Hands.HandInput.rightThumbMiddleBend;
+                    float td = left ? MeshVR.Hands.HandInput.leftThumbDistalBend : MeshVR.Hands.HandInput.rightThumbDistalBend;
+                    bool byCurl = on && _curlOk[side] && CfgCurls != null && CfgCurls.Value;
+
+                    // ...and, with Mercury, each finger bent as a whole by its share of a fist (VaM's
+                    // own fist, from a controller's grip, is 100 at every joint; the thumb's 60).
+                    if (byCurl)
+                    {
+                        float si = Share(side, 1), sm = Share(side, 2), sr = Share(side, 3), sp = Share(side, 4), st = Share(side, 0);
+                        ip = 85f * si; im = 100f * si; id = 80f * si;
+                        mp = 85f * sm; mm = 100f * sm; md = 80f * sm;
+                        rp = 85f * sr; rm = 100f * sr; rd = 80f * sr;
+                        pp = 85f * sp; pm = 100f * sp; pd = 80f * sp;
+                        tm = 60f * st; td = 60f * st;
+                    }
+
+                    Bend(f.indexProximal, ip + x * 0.45f);
+                    Bend(f.indexMiddle, im + x);
+                    Bend(f.indexDistal, id + x * 0.6f);
+                    Bend(f.thumbProximal, tp + x * 0.25f);
+                    Bend(f.thumbMiddle, tm + x * 0.5f);
+                    Bend(f.thumbDistal, td + x * 0.5f);
+
+                    if (f.middleProximal != null && f.middleMiddle != null && f.middleDistal != null && f.ringProximal != null && f.ringMiddle != null && f.ringDistal != null &&
+                        f.pinkyProximal != null && f.pinkyMiddle != null && f.pinkyDistal != null)
+                    {
+                        Bend(f.middleProximal, mp); Bend(f.middleMiddle, mm); Bend(f.middleDistal, md);
+                        Bend(f.ringProximal, rp); Bend(f.ringMiddle, rm); Bend(f.ringDistal, rd);
+                        Bend(f.pinkyProximal, pp); Bend(f.pinkyMiddle, pm); Bend(f.pinkyDistal, pd);
+                    }
+
+                    _added[side] = x > 0.01f || byCurl;
+
+                    // For reading afterwards: there is no looking into a headset from outside.
+                    if (on && now - _saidAt[side] > 2f)
+                    {
+                        _saidAt[side] = now;
+                        Say((left ? "left" : "right") + " fingers: " + (byCurl ? "by curl" : "by points") +
+                            (_curlOk[side] ? ", Mercury T " + _curl[side, 0].ToString("0.00") + " I " + _curl[side, 1].ToString("0.00") + " M " + _curl[side, 2].ToString("0.00") + " R " + _curl[side, 3].ToString("0.00") + " L " + _curl[side, 4].ToString("0.00") : ", no curls") +
+                            "; index bends " + f.indexProximal.currentBend.ToString("0") + "/" + f.indexMiddle.currentBend.ToString("0") + "/" + f.indexDistal.currentBend.ToString("0") +
+                            ", thumb " + f.thumbProximal.currentBend.ToString("0") + "/" + f.thumbMiddle.currentBend.ToString("0") + "/" + f.thumbDistal.currentBend.ToString("0") +
+                            "; pinch " + close.ToString("0.00") + ", VaM's fingertips " + (apart * 1000f).ToString("0") + " mm apart, +" + x.ToString("0") + " deg" + (_past[side] ? " (no nearer with more)" : ""));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _loopFailed = true;
+                PinchNote = "";
+                Say("VaM's fingertips are left as they are: closing the pinch on them failed (" + ex.GetType().Name + ": " + ex.Message + ")");
+            }
+        }
+
+        // The finger joints of the wearer's own hand model. They are not under the hand's transform:
+        // the model is a body of its own, held to that transform by a joint (which is why a search
+        // down from it found nothing, and neither the finger bends nor the pinch ever reached
+        // VaM's hand -- a session's log had not one line from here). So every hand output in the
+        // scene is looked at: the one for this side that is switched on and belongs to no atom
+        // (a person's hands have them too). Looked for once a second at most while there is none.
+        private static readonly float[] _soughtAt = { -100f, -100f };
+
+        private static MeshVR.Hands.HandOutput FindFingers(int side, Transform hand, float now)
+        {
+            MeshVR.Hands.HandOutput found = hand != null ? hand.GetComponentInChildren<MeshVR.Hands.HandOutput>() : null;
+
+            if (found != null || now - _soughtAt[side] < 1f)
+            {
+                return found;
+            }
+
+            _soughtAt[side] = now;
+            MeshVR.Hands.HandOutput.Hand wanted = side == 0 ? MeshVR.Hands.HandOutput.Hand.Left : MeshVR.Hands.HandOutput.Hand.Right;
+            int seen = 0;
+
+            foreach (MeshVR.Hands.HandOutput output in UnityEngine.Object.FindObjectsOfType<MeshVR.Hands.HandOutput>())
+            {
+                seen++;
+
+                if (output != null && output.hand == wanted && output.isActiveAndEnabled && output.GetComponentInParent<Atom>() == null)
+                {
+                    found = output;
+                    break;
+                }
+            }
+
+            Say((side == 0 ? "left" : "right") + " fingers: " + (found != null ? "VaM's hand model is '" + found.name + "'" :
+                "no hand model with finger joints found for this side (" + seen + " hand outputs in the scene) -- VaM's fingers stay as its own input has them"));
+            return found;
+        }
+
+        private static void Bend(MeshVR.Hands.FingerOutput finger, float bend)
+        {
+            if (Mathf.Abs(finger.currentBend - bend) > 0.01f)
+            {
+                finger.currentBend = bend;
+                finger.UpdateOutput();
+            }
+        }
+
+        // The joints after `root` up to `tip`, turned about `root` so that the tip points at `to`.
+        private static void Turn(Vector3[] p, int root, int tip, Vector3 to)
+        {
+            Vector3 was = p[tip] - p[root], want = to - p[root];
+
+            if (was.sqrMagnitude < 1e-8f || want.sqrMagnitude < 1e-8f)
+            {
+                return;
+            }
+
+            Quaternion turn = Quaternion.FromToRotation(was, want);
+
+            for (int i = root + 1; i <= tip; i++)
+            {
+                p[i] = p[root] + turn * (p[i] - p[root]);
+            }
         }
 
         // The tracker's points (wrist 0; thumb 1-4; index 5-8; middle 9-12; ring 13-16; little

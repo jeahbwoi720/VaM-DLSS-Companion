@@ -36,7 +36,9 @@ cbuffer Params : register(b0)
     float  gStrength;   // resolve: how much of the edit lands (1 = all of it)
     uint   gMode;       // resolve: 0 matched residual, 1 classic, 2 show the edit, 3 frame untouched
     float4 gWindow[2];  // per eye: xy = origin, zw = size of the model's window, as fractions of that eye
-    float4 gFade;       // x = how far in from the window's edge the edit fades, as a fraction of its half-size
+    float4 gFade;       // x = how far in from the window's edge the edit fades, as a fraction of its half-size;
+                        // F_FOLLOW: y = how unlike the frame a model texel may be and still be listened to, z = how
+                        // much the enlarged edit is sharpened, w = how far that may carry it past its neighbours
     float4 gPrev[2];    // guide: per eye, the window as it was a frame ago (origin xy, size zw), for F_MOVED
 };
 
@@ -48,10 +50,17 @@ static const uint F_WINDOW        = 16u; // the model works on gWindow, not on t
 static const uint F_MOVED         = 32u; // guide: these are motion vectors and the window is not where, or what size, it was (gPrev)
 static const uint F_TOP_DOWN      = 64u; // guide: the textures' first row is the TOP of the picture (motion's y points up it)
 static const uint F_SQUASH        = 128u; // sharpen: the frame is scene light with no ceiling; bring it under 1 for the filter
+static const uint F_FOLLOW        = 256u; // resolve: a smaller model's edit is enlarged along the frame's own edges (gFade.yz)
+static const uint F_STEADY        = 512u; // resolve: the edit is read from tKept, where it is kept over frames (PSSteady)
+static const uint F_FULL          = 1024u; // resolve: ...kept at the frame's own size, pixel for pixel (PSGather)
+static const uint F_OUTLINE       = 2048u; // resolve: the model's window is drawn in, for seeing where it is
 
 Texture2D<float4> tFrame : register(t0);
 Texture2D<float4> tProxy : register(t1);
 Texture2D<float4> tModel : register(t2);
+Texture2D<float4> tKept  : register(t3);   // the edit kept over frames (rgb), and how bright the model's input was there (a):
+                                            // PSSteady reads last frame's and writes this frame's; the resolve reads this frame's
+Texture2D<float4> tMotion : register(t4);  // PSGather: the model-size motion vectors
 SamplerState      sLinear : register(s0);
 
 // Both saturate first. That bounds the value to what an 8-bit model input can carry, and under
@@ -217,8 +226,35 @@ float4 PSDown(float4 pos : SV_Position) : SV_Target
     // any minification should be.
     const uint e = EyeOf(pos.x, gDstSize.x);
     const Region dst = WholeEye(gDstSize.xy, e);
-    const float4 c = Fetch(tFrame, gFrameSize, WindowIn(gFrameSize.xy, e), floor(pos.xy) - dst.origin, dst.size, e,
-                           (gFlags & F_FRAME_ENCODED) != 0u);
+    const Region src = WindowIn(gFrameSize.xy, e);
+    const float2 q = floor(pos.xy) - dst.origin;
+    const bool decode = (gFlags & F_FRAME_ENCODED) != 0u;
+    float4 c = Fetch(tFrame, gFrameSize, src, q, dst.size, e, decode);
+
+    // The model's raster shifted by a part of one of its pixels (gFade.zw, in the frame's pixels):
+    // a different shift every frame, so that over a few frames the model has looked at every one
+    // of the frame's pixels from the middle of one of its own (see PSGather).
+    const float2 shrink = src.size / dst.size;
+    const float2 shift = shrink.x > 1.0 && shrink.y > 1.0 ? gFade.zw : float2(0.0, 0.0);
+
+    if (shift.x != 0.0 || shift.y != 0.0)
+        c = AreaAverage(tFrame, gFrameSize.xy, clamp(src.origin + q * shrink + shift, src.origin, src.origin + max(src.size - shrink, 0.0)), shrink, decode);
+
+    // A sharper shrink (gFade.y). The exact average is the honest one and the softest: every
+    // model pixel is the mean of the frame's pixels under it, and the fine contrast between them
+    // is gone before the model has seen it. Some of it is given back: the pixel is moved away
+    // from the mean of an area twice as wide around it, in linear light, and never below nothing.
+    // What that does to the picture is the model's to answer for -- its edit is still measured
+    // against this same input, so none of the sharpening itself reaches the frame.
+    const float2 ratio = src.size / dst.size;
+
+    if (gFade.y > 0.0 && ratio.x > 1.0 && ratio.y > 1.0 && ratio.x <= 4.5 && ratio.y <= 4.5)
+    {
+        const float2 from = clamp(src.origin + q * ratio + shift - 0.5 * ratio, src.origin, src.origin + max(src.size - 2.0 * ratio, 0.0));
+        const float3 around = AreaAverage(tFrame, gFrameSize.xy, from, 2.0 * ratio, decode).rgb;
+        c.rgb = max(c.rgb + (c.rgb - around) * gFade.y, 0.0);
+    }
+
     return float4((gFlags & F_OUT_ENCODED) != 0u ? LinearToSrgb(c.rgb) : c.rgb, c.a);
 }
 
@@ -308,6 +344,122 @@ float3 Mix(float3 a, float3 b, float w)
     return w >= 1.0 ? b : lerp(a, b, w);
 }
 
+// A smaller model's edit, enlarged along the frame's own edges.
+//
+// Enlarged plainly, the edit is a blur of what the model did at its own size: across an edge in
+// the picture it runs out on both sides -- the brightening the model gave a face spills onto the
+// wall behind it, in steps as wide as a model texel -- and inside a surface it is softer than the
+// model made it. That is what "rougher" at a lower model resolution is.
+//
+// But the frame is here at full size, and each model texel's own input (the proxy) says what that
+// texel was looking at. So of the four model texels around this pixel, the ones whose input looks
+// like this pixel are listened to and the ones that were looking at something else are not: the
+// edit meant for the face stays on the face, to the pixel. Where all four saw the same thing this
+// is the plain enlargement, exactly.
+//
+// Then it is sharpened. What the model drew small -- pores, the grain of skin -- comes out of
+// any enlargement softer and coarser than the model would have drawn it at full size, and that,
+// more than the edges, is what a lower model resolution looks like. So the edit's own fine part
+// (what it differs by from itself blurred over a model texel and a half each way) is given back
+// stronger: gFade.z, which the caller makes follow the scale. What that may do past the values
+// the four texels hold is limited (gFade.w, as a share of their range), which is what keeps a
+// strong setting from ringing along edges.
+float3 EditSoft(Region work, float2 at, uint e)
+{
+    // four bilinear taps a texel and a half out: sixteen texels' worth of blur
+    const Region eye = WholeEye(gWorkSize.xy, e);
+    float3 sum = 0.0;
+
+    for (int k = 0; k < 4; ++k)
+    {
+        // (turned off the axes and the diagonals, so that no regular pattern lines up with the taps and comes through unblurred)
+        const float2 off = k == 0 ? float2(1.5, 0.5) : (k == 1 ? float2(-0.5, 1.5) : (k == 2 ? float2(-1.5, -0.5) : float2(0.5, -1.5)));
+        float2 uv = (work.origin + clamp(at + off, 0.0, work.size - 1.0) + 0.5) * gWorkSize.zw;
+        uv.x = clamp(uv.x, (eye.origin.x + 0.5) * gWorkSize.z, (eye.origin.x + eye.size.x - 0.5) * gWorkSize.z);
+        if ((gFlags & F_STEADY) != 0u)
+        {
+            sum += tKept.SampleLevel(sLinear, uv, 0).rgb;
+        }
+        else
+        {
+            const float3 mx = tModel.SampleLevel(sLinear, uv, 0).rgb;
+            const float3 px = saturate(tProxy.SampleLevel(sLinear, uv, 0).rgb);
+            sum += ((gFlags & F_MODEL_ENCODED) != 0u ? saturate(mx) : LinearToSrgb(mx)) - ((gFlags & F_PROXY_ENCODED) != 0u ? px : LinearToSrgb(px));
+        }
+    }
+
+    return sum * 0.25;
+}
+
+// The sharpening alone, on the plainly enlarged edit: the cheaper of the two (the edit's own two
+// taps and the blur's eight, no texel-by-texel reading). With no neighbours read there is nothing
+// to hold it within, so what it adds is capped outright instead (gFade.w of an eighth of the range).
+float3 EditSharper(Region work, float2 q, float2 dstSize, float3 edit, uint e)
+{
+    const float2 p = (q + 0.5) * (work.size / dstSize) - 0.5;
+    const float cap = gFade.w * 0.125;
+    return edit + clamp((edit - EditSoft(work, p, e)) * gFade.z, -cap, cap);
+}
+
+float3 EditFollowingRange(Region work, float2 q, float2 dstSize, float3 frameEnc, uint e, out float3 lo, out float3 hi)
+{
+    const float2 ratio = work.size / dstSize;
+    const float2 p = (q + 0.5) * ratio - 0.5;
+    const float2 base = floor(p);
+    const float2 f = p - base;
+    const float2 last = work.size - 1.0;
+    const float tight = 1.0 / max(2.0 * gFade.y * gFade.y, 1e-6);
+    float3 sum = 0.0, mean = 0.0;
+    float total = 0.0;
+    lo = 1e9;
+    hi = -1e9;
+
+    for (int j = 0; j < 2; ++j)
+    {
+        for (int i = 0; i < 2; ++i)
+        {
+            const float2 at = clamp(base + float2((float) i, (float) j), 0.0, last);
+            const int3 texel = int3((int2) (work.origin + at), 0);
+            const float3 px = saturate(tProxy.Load(texel).rgb);
+            const float3 pe = (gFlags & F_PROXY_ENCODED) != 0u ? px : LinearToSrgb(px);
+            float3 texelEdit = tKept.Load(texel).rgb;
+
+            if ((gFlags & F_STEADY) == 0u)
+            {
+                const float3 mx = tModel.Load(texel).rgb;
+                texelEdit = ((gFlags & F_MODEL_ENCODED) != 0u ? saturate(mx) : LinearToSrgb(mx)) - pe;
+            }
+            const float beside = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+            const float3 off = pe - frameEnc;
+            // (never quite nothing: a pixel unlike all four still gets their plain mix)
+            const float w = beside * (exp(-dot(off, off) * tight) + 0.02);
+
+            sum += texelEdit * w;
+            total += w;
+            mean += texelEdit * 0.25;
+            lo = min(lo, texelEdit);
+            hi = max(hi, texelEdit);
+        }
+    }
+
+    float3 edit = sum / max(total, 1e-6);
+
+    // (below nothing it goes the other way, towards its own blur: grain taken out, not put in)
+    if (gFade.z != 0.0)
+    {
+        const float3 room = (hi - lo) * gFade.w;
+        edit = clamp(edit + (edit - EditSoft(work, p, e)) * gFade.z, lo - room, hi + room);
+    }
+
+    return edit;
+}
+
+float3 EditFollowing(Region work, float2 q, float2 dstSize, float3 frameEnc, uint e)
+{
+    float3 lo, hi;
+    return EditFollowingRange(work, q, dstSize, frameEnc, e, lo, hi);
+}
+
 float4 PSResolve(float4 pos : SV_Position) : SV_Target
 {
     const uint2 d = (uint2) pos.xy;
@@ -331,6 +483,23 @@ float4 PSResolve(float4 pos : SV_Position) : SV_Target
             return EmitEncoded(gMode == 2u ? float3(0.5, 0.5, 0.5) : frameEnc, frameA);
 
         weight = WindowWeight((q + 0.5) / window.size);
+
+        // For seeing where the window is: its edge in a colour nothing in a scene has, and, a
+        // little dimmer, the line inside which the model's work lands whole (between the two
+        // it fades out).
+        if ((gFlags & F_OUTLINE) != 0u)
+        {
+            const float2 in_ = min(q, window.size - 1.0 - q);
+            const float2 beside = float2(1.5, 1.5) / window.size;
+            const float least = min(min(WindowWeight((q + 0.5) / window.size + float2(beside.x, 0.0)), WindowWeight((q + 0.5) / window.size - float2(beside.x, 0.0))),
+                                    min(WindowWeight((q + 0.5) / window.size + float2(0.0, beside.y)), WindowWeight((q + 0.5) / window.size - float2(0.0, beside.y))));
+
+            if (min(in_.x, in_.y) < 3.0)
+                return EmitEncoded(float3(1.0, 0.1, 0.8), frameA);
+
+            if (weight >= 1.0 && least < 1.0)
+                return EmitEncoded(float3(0.1, 0.9, 0.9), frameA);
+        }
     }
 
     const Region work = WholeEye(gWorkSize.xy, e);
@@ -345,13 +514,247 @@ float4 PSResolve(float4 pos : SV_Position) : SV_Target
         return EmitEncoded(Mix(frameEnc, modelEnc, weight), alpha);
 
     // The edit. Exactly zero wherever the model left its input alone, so those pixels come back as
-    // the frame itself.
-    const float3 edit = (modelEnc - proxyEnc) * (gStrength * weight);
+    // the frame itself. (Kept over frames, it is in tKept as it stands.)
+    float3 edit = modelEnc - proxyEnc;
+
+    if ((gFlags & F_STEADY) != 0u)
+    {
+        const Region eye = WholeEye(gWorkSize.xy, e);
+        float2 uv = (work.origin + (q + 0.5) * (work.size / window.size)) * gWorkSize.zw;
+        uv.x = clamp(uv.x, (eye.origin.x + 0.5) * gWorkSize.z, (eye.origin.x + eye.size.x - 0.5) * gWorkSize.z);
+        edit = tKept.SampleLevel(sLinear, uv, 0).rgb;
+
+        if (gMode == 1u)
+            return EmitEncoded(Mix(frameEnc, saturate(proxyEnc + edit), weight), alpha);
+    }
+
+    if ((gFlags & F_FULL) != 0u)
+    {
+        // gathered at the frame's own size already, enlarged and sharpened as it was gathered
+        edit = tKept.Load(int3(d, 0)).rgb;
+    }
+    else if (work.size.x < window.size.x || work.size.y < window.size.y)
+    {
+        if ((gFlags & F_FOLLOW) != 0u)
+            edit = EditFollowing(work, q, window.size, frameEnc, e);
+        else if (gFade.z != 0.0)
+            edit = EditSharper(work, q, window.size, edit, e);
+    }
+
+    edit *= gStrength * weight;
 
     if (gMode == 2u)
         return EmitEncoded(saturate(0.5 + edit * 4.0), alpha);
 
     return EmitEncoded(AddEditInGamut(frameEnc, edit), alpha);
+}
+
+// ---- PSSteady ----------------------------------------------------------------------------------
+//
+// The model's edit, kept from frame to frame at the model's own size.
+//
+// The model is run afresh on every frame and does not answer quite the same twice: what it adds
+// to skin shifts a little from one frame to the next, and at a lower model resolution each of
+// its pixels is several of the screen's, so the shifting shows as a crawl. Here its edit (its
+// answer minus what it was shown, tModel - tProxy) is blended into the edit as kept a frame ago
+// (tKept), which is first carried to where things are now by the motion vectors (tFrame, the
+// model-size copy the model itself is given: how far a point has moved since the last frame, in
+// eye widths and heights, y up the picture). gStrength is how much of the new edit is taken: at
+// 0.2 a still picture's edit is the mean of about the last nine.
+//
+// What is kept can be wrong for a pixel: something moved in front, or the picture changed. So
+// before it is used it is brought within what this frame's edit holds in the three by three
+// texels around (and a quarter of that range more) -- stale edit cannot stand where the model
+// now says something else, which is what keeps moving things from trailing ghosts. Where the
+// place a pixel came from is off the picture, and on the first frame (gMode 1), there is nothing
+// kept and the new edit is taken whole.
+//
+// The motion vectors are the camera's, and of things the game moves as whole objects. A person
+// moving by their own animation has none in VaM, and what was kept for the place they were in
+// trailed behind them. So with the edit is kept how bright the model's input was there (in the
+// alpha), and where the place a texel came from was not as bright as the texel is now -- the
+// picture there is no longer the same picture -- less of what was kept is used, down to none at
+// a difference of a twelfth of the range.
+float4 PSSteady(float4 pos : SV_Position) : SV_Target
+{
+    const uint e = EyeOf(pos.x, gWorkSize.x);
+    const Region work = WholeEye(gWorkSize.xy, e);
+    const float2 q = floor(pos.xy) - work.origin;
+    const float2 last = work.size - 1.0;
+    float3 now = 0.0, lo = 1e9, hi = -1e9;
+    float alpha = 0.0;
+    float beside[4] = { 0.0, 0.0, 0.0, 0.0 }; // how bright the model's input is to the left, right, above, below
+
+    for (int j = -1; j <= 1; ++j)
+    {
+        for (int i = -1; i <= 1; ++i)
+        {
+            const int3 texel = int3((int2) (work.origin + clamp(q + float2((float) i, (float) j), 0.0, last)), 0);
+            const float3 m = tModel.Load(texel).rgb;
+            const float3 px = saturate(tProxy.Load(texel).rgb);
+            const float3 pe = (gFlags & F_PROXY_ENCODED) != 0u ? px : LinearToSrgb(px);
+            const float3 one = ((gFlags & F_MODEL_ENCODED) != 0u ? saturate(m) : LinearToSrgb(m)) - pe;
+            const float light = dot(pe, float3(0.299, 0.587, 0.114));
+            lo = min(lo, one);
+            hi = max(hi, one);
+
+            if (i == 0 && j == 0)
+            {
+                now = one;
+                alpha = light;
+            }
+            else if (j == 0)
+            {
+                beside[i < 0 ? 0 : 1] = light;
+            }
+            else if (i == 0)
+            {
+                beside[j < 0 ? 2 : 3] = light;
+            }
+        }
+    }
+
+    if (gMode == 1u)
+        return float4(now, alpha);
+
+    // Where this texel was a frame ago, in the model's raster as it then was.
+    const Region guide = WholeEye(gFrameSize.xy, e);
+    const float2 at = (q + 0.5) / work.size;
+    const float2 moved = tFrame.Load(int3((int2) (guide.origin + clamp(floor(at * guide.size), 0.0, guide.size - 1.0)), 0)).xy *
+                         float2(1.0, (gFlags & F_TOP_DOWN) != 0u ? -1.0 : 1.0);
+    const float2 was = at - moved / ((gFlags & F_WINDOW) != 0u ? max(gWindow[e].zw, 1e-4) : 1.0);
+
+    if (was.x < 0.0 || was.y < 0.0 || was.x > 1.0 || was.y > 1.0)
+        return float4(now, alpha);
+
+    float2 uv = (work.origin + was * work.size) * gWorkSize.zw;
+    uv.x = clamp(uv.x, (work.origin.x + 0.5) * gWorkSize.z, (work.origin.x + work.size.x - 0.5) * gWorkSize.z);
+    const float3 room = (hi - lo) * 0.25 + 1.0 / 255.0;
+    const float4 before = tKept.SampleLevel(sLinear, uv, 0);
+    const float3 kept = clamp(before.rgb, lo - room, hi + room);
+
+    // The picture changed here -- or in the texel beside (an edge moving past: the texel it has
+    // just left looks much as it did, the next one does not); or what was kept is further from
+    // this frame's edit than the model's answer wanders from frame to frame. With a small share
+    // of each new frame what such a texel kept would otherwise stay for a second and more, and
+    // did: at a twentieth it trailed behind people where at a fifth it had not been seen.
+    float differs = abs(before.a - alpha);
+
+    for (int k = 0; k < 4; ++k)
+    {
+        const float2 step = (k == 0 ? float2(-1.0, 0.0) : (k == 1 ? float2(1.0, 0.0) : (k == 2 ? float2(0.0, -1.0) : float2(0.0, 1.0)))) * gWorkSize.zw;
+        differs = max(differs, abs(tKept.SampleLevel(sLinear, uv + step, 0).a - beside[k]));
+    }
+
+    const float3 apart = abs(before.rgb - now);
+    const float stale = saturate((max(apart.r, max(apart.g, apart.b)) - 0.06) / 0.08);
+    const float changed = max(saturate((differs - 0.012) / 0.04), stale);
+    return float4(lerp(kept, now, lerp(saturate(gStrength), 1.0, changed)), alpha);
+}
+
+// ---- PSGather ----------------------------------------------------------------------------------
+//
+// Detail built up over frames: the model's edit kept at the FRAME's size.
+//
+// A model run at half size has one pixel for four of the frame's, and its edit, however it is
+// enlarged, has no more in it than that. But its raster need not lie in the same place every
+// frame. Shifted by half of one of its pixels each way in turn (PSDown, gPrev[0].xy here, in the
+// frame's pixels), over four frames each of the frame's pixels has once been at the very middle
+// of a model pixel -- has had, for that frame, a model pixel of its own. So here each frame's
+// edit is enlarged with that shift taken into account (along the frame's edges and sharpened, as
+// the resolve would), and each of the frame's pixels takes much of it when it lies near a model
+// pixel's middle this frame and little when it lies between -- keeping what it had from the frame
+// in which it was the one looked at. What is kept is carried by the motion vectors (tMotion) and
+// let go where the picture has changed, as in PSSteady; it is held less tightly to this frame's
+// values, since what it is for is to differ from them.
+//
+// A whole frame's worth of history, twice (RGBA16F), and worth it only where things hold still:
+// a person moving by their own animation has no motion vectors here and gets this frame's edit.
+float3 EditPlain(Region work, float2 q, float2 dstSize, uint e)
+{
+    const Region eye = WholeEye(gWorkSize.xy, e);
+    float2 uv = (work.origin + (q + 0.5) * (work.size / dstSize)) * gWorkSize.zw;
+    uv.x = clamp(uv.x, (eye.origin.x + 0.5) * gWorkSize.z, (eye.origin.x + eye.size.x - 0.5) * gWorkSize.z);
+    const float3 mx = saturate(tModel.SampleLevel(sLinear, uv, 0).rgb);
+    const float3 px = saturate(tProxy.SampleLevel(sLinear, uv, 0).rgb);
+    return ((gFlags & F_MODEL_ENCODED) != 0u ? mx : LinearToSrgb(mx)) - ((gFlags & F_PROXY_ENCODED) != 0u ? px : LinearToSrgb(px));
+}
+
+float4 PSGather(float4 pos : SV_Position) : SV_Target
+{
+    const uint2 d = (uint2) pos.xy;
+    const float4 frame = tFrame.Load(int3(d, 0));
+    const float3 frameEnc = (gFlags & F_FRAME_ENCODED) != 0u ? saturate(frame.rgb) : LinearToSrgb(frame.rgb);
+    const float bright = dot(frameEnc, float3(0.299, 0.587, 0.114));
+    const uint e = EyeOf(pos.x, gDstSize.x);
+    const Region window = WholeEye(gDstSize.xy, e);
+    const Region work = WholeEye(gWorkSize.xy, e);
+    const float2 q = floor(pos.xy) - window.origin;
+    const float2 shifted = q - gPrev[0].xy;
+
+    // this frame's edit here, and what the model's pixels around hold
+    float3 lo, hi;
+    float3 now = EditFollowingRange(work, shifted, window.size, frameEnc, e, lo, hi);
+
+    if ((gFlags & F_FOLLOW) == 0u)
+    {
+        now = EditPlain(work, shifted, window.size, e);
+
+        if (gFade.z != 0.0)
+            now = EditSharper(work, shifted, window.size, now, e);
+    }
+
+    if (gMode == 1u)
+        return float4(now, bright);
+
+    // how near the middle of a model pixel this pixel lies this frame: 1 at it, 0 half-way to the next
+    const float2 p = (shifted + 0.5) * (work.size / window.size) - 0.5;
+    const float2 off = abs(p - round(p)) * 2.0;
+    const float near_ = saturate(1.0 - off.x) * saturate(1.0 - off.y);
+
+    // where it was a frame ago
+    const Region guide = WholeEye(gPrev[1].xy, e);
+    const float2 at = (q + 0.5) / window.size;
+    const float2 moved = tMotion.Load(int3((int2) (guide.origin + clamp(floor(at * guide.size), 0.0, guide.size - 1.0)), 0)).xy *
+                         float2(1.0, (gFlags & F_TOP_DOWN) != 0u ? -1.0 : 1.0);
+    const float2 was = at - moved;
+
+    if (was.x < 0.0 || was.y < 0.0 || was.x > 1.0 || was.y > 1.0)
+        return float4(now, bright);
+
+    float2 uv = (window.origin + was * window.size) * gDstSize.zw;
+    uv.x = clamp(uv.x, (window.origin.x + 0.5) * gDstSize.z, (window.origin.x + window.size.x - 0.5) * gDstSize.z);
+    const float4 before = tKept.SampleLevel(sLinear, uv, 0);
+
+    // Has the picture changed here -- or right beside here? A person's edge moving past leaves the
+    // pixels it has just left looking, each on its own, much as they did; the pixel two along has
+    // changed outright. And skin sliding over skin changes no brightness at all, but what was kept
+    // for it then differs from this frame's edit by more than fine detail ever does. Either way
+    // what was kept is stale: it trailed behind people until both were looked for (and until a
+    // pixel that keeps to its own look was made to give way to them).
+    float differs = abs(before.a - bright);
+
+    for (int k = 0; k < 4; ++k)
+    {
+        const float2 step = k == 0 ? float2(2.0, 0.0) : (k == 1 ? float2(-2.0, 0.0) : (k == 2 ? float2(0.0, 2.0) : float2(0.0, -2.0)));
+        const float3 f = tFrame.Load(int3((int2) (window.origin + clamp(q + step, 0.0, window.size - 1.0)), 0)).rgb;
+        const float3 fe = (gFlags & F_FRAME_ENCODED) != 0u ? saturate(f) : LinearToSrgb(f);
+        differs = max(differs, abs(tKept.SampleLevel(sLinear, uv + step * gDstSize.zw, 0).a - dot(fe, float3(0.299, 0.587, 0.114))));
+    }
+
+    const float3 apart = abs(before.rgb - now);
+    // (A stricter guard -- eight taps, a change counted from two levels -- took the last of the trails and
+    // made the picture flicker: wherever what was kept is let go, a pixel shows this frame's edit, and with
+    // the raster shifted every frame that differs a little each time. This is the one before it.)
+    const float stale = saturate((max(apart.r, max(apart.g, apart.b)) - 0.10) / 0.10);
+    const float changed = max(saturate((differs - 0.02) / 0.05), stale);
+    const float3 room = lerp((hi - lo) + 0.16, (hi - lo) * 0.25 + 1.0 / 255.0, changed);
+    const float3 kept = clamp(before.rgb, lo - room, hi + room);
+    // (gPrev[0].z: how much a pixel keeps to its own look -- at 1 it takes all of the edit when it
+    // is at a model pixel's middle and nothing of it when it is half-way to the next)
+    const float own = saturate(gPrev[0].z);
+    const float take = saturate(lerp(lerp(0.15, 0.03, own), lerp(0.3, 1.0, own), near_) * gStrength * 5.0);
+    return float4(lerp(kept, now, lerp(take, 1.0, changed)), bright);
 }
 
 // ---- PSSharpen ---------------------------------------------------------------------------------
@@ -410,6 +813,37 @@ float4 PSSharpen(float4 pos : SV_Position) : SV_Target
     o = squash ? Unsquash(o) : saturate(o);
 
     return float4(o, centre.a);
+}
+
+// ---- PSDepthFill -------------------------------------------------------------------------------
+//
+// The scene's depth, laid under what is drawn after the frame is finished. Scene interface atoms
+// (a button on a wall) are kept out of the frame the networks see and drawn onto the finished
+// picture, whose depth buffer knows nothing of the scene: without this they would show through
+// anyone standing in front of them. tFrame holds the scene's depth as the card made it, one number
+// a texel, at whatever size the scene was rendered; it is written across the viewport in force
+// (gPrev[0]: xy its corner, zw its size, in pixels) from the part of the texture gWindow[0] names
+// (one eye of a double-wide one), turned over where the target lies the other way (F_TOP_DOWN).
+//
+// Read with the bilinear filter: a card's depth is linear across the screen for a flat surface, so
+// between texels this is exact on a wall and a ramp one texel wide at a silhouette. Then pushed
+// back by gStrength of its distance, so that a panel lying close on a surface is not cut into
+// stripes by the little that the scene's sub-pixel jitter moves the texels (gMode 1: nearer is the
+// larger number, as it is on this card).
+
+float4 PSDepthFill(float4 pos : SV_Position, out float depth : SV_Depth) : SV_Target
+{
+    float2 uv = (pos.xy - gPrev[0].xy) / max(gPrev[0].zw, 1.0);
+
+    if ((gFlags & F_TOP_DOWN) != 0u)
+        uv.y = 1.0 - uv.y;
+
+    const float2 lo = gWindow[0].xy + 0.5 * gFrameSize.zw;
+    const float2 hi = gWindow[0].xy + gWindow[0].zw - 0.5 * gFrameSize.zw;
+    const float d = tFrame.SampleLevel(sLinear, clamp(gWindow[0].xy + uv * gWindow[0].zw, lo, hi), 0).r;
+
+    depth = gMode == 1u ? d * (1.0 - gStrength) : d + (1.0 - d) * gStrength;
+    return float4(0.0, 0.0, 0.0, 0.0);
 }
 
 // ---- PSPassthrough -----------------------------------------------------------------------------

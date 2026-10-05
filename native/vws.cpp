@@ -45,6 +45,9 @@
 #include "vws_ps_sharpen.h"
 #include "vws_ps_pass.h"
 #include "vws_ps_matte.h"
+#include "vws_ps_depthfill.h"
+#include "vws_ps_steady.h"
+#include "vws_ps_gather.h"
 #include "vws_ps_overlay.h"
 #include "vws_vs_overlay.h"
 #include "vws_depth.h"
@@ -60,7 +63,7 @@
 
 namespace
 {
-const uint32_t kAbi = 21;
+const uint32_t kAbi = 32;
 const int kEventMagic = 0x57530000; // 'WS'
 const int kEventFovea = 0x57460000; // 'WF': low byte 1 = foveated shading on for what is drawn next, 2 = off;
                                     // bits 8-11 which camera (0 the scene's), bit 12 its opaque pass
@@ -68,6 +71,7 @@ const int kEventMask = 0x7FFF0000;
 const int kSlots = 64;
 const uint32_t kSets = 16;
 const uint32_t kGuides = 3;
+const uint32_t kSteadySlots = 4; // the model's passes over one frame whose edits are each kept over frames
 
 enum Op : uint32_t
 {
@@ -81,6 +85,9 @@ enum Op : uint32_t
     OpSharpen = 8,       // frame = the texture to sharpen where it lies; strength; eyes
     OpPassthrough = 9,   // frame = the texture whose key colour becomes the camera's picture; see Passthrough
     OpMatte = 10,        // frame = the texture whose key colour is written, as a matte, for the overlay; see Matte
+    OpDepthFill = 11,    // frame = the scene's depth; window[0..3] = the part of it; strength = slack; topDown; mode; see DepthFill
+    OpSteady = 12,       // frame = the model-size motion vectors; which = the pass over this frame; strength = how much of
+                         // the new edit is taken; mode 1 = begin anew; eyes, window, topDown; see Steady
 };
 
 enum Error : int
@@ -157,6 +164,10 @@ const uint32_t kFlagWindow = 16;
 const uint32_t kFlagMoved = 32;
 const uint32_t kFlagTopDown = 64;
 const uint32_t kFlagSquash = 128;
+const uint32_t kFlagFollow = 256;
+const uint32_t kFlagSteady = 512;
+const uint32_t kFlagFull = 1024;
+const uint32_t kFlagOutline = 2048;
 
 enum Pass
 {
@@ -203,8 +214,31 @@ struct Set
     VwsStatus status {};
     bool shapeReported = false;
 
+    // The model's edit kept over frames (see Steady): for each of its passes over a frame two
+    // textures of the model's size, written turn and turn about; which of the two holds the
+    // latest; whether anything is in them yet; and the pass whose kept edit the next resolve reads.
+    Surface kept[kSteadySlots][2];
+    uint32_t keptAt[kSteadySlots] {};
+    bool keptPrimed[kSteadySlots] {};
+    int steadyReady = -1;
+    bool steadyFull = false;    // ...which is kept at the frame's size (PSGather), not the model's
+
+    void ReleaseKept()
+    {
+        for (uint32_t s = 0; s < kSteadySlots; ++s)
+        {
+            kept[s][0].Release();
+            kept[s][1].Release();
+            keptAt[s] = 0;
+            keptPrimed[s] = false;
+        }
+
+        steadyReady = -1;
+    }
+
     void Release()
     {
+        ReleaseKept();
         frame.Release();
         proxy.Release();
         model.Release();
@@ -272,8 +306,23 @@ ID3D11PixelShader* g_psGuide = nullptr;
 ID3D11PixelShader* g_psSharpen = nullptr;
 ID3D11PixelShader* g_psPass = nullptr;
 ID3D11PixelShader* g_psMatte = nullptr;
+ID3D11PixelShader* g_psDepthFill = nullptr;
+ID3D11PixelShader* g_psSteady = nullptr;
+ID3D11PixelShader* g_psGather = nullptr;
+float g_downShift[2] = {}; // the shift the next shrink is to be made with (main thread: set, then taken by the push)
+volatile LONG g_steadyRuns = 0, g_steadyFresh = 0, g_steadyFailed = 0;
+ID3D11DepthStencilState* g_depthWrite = nullptr; // every pixel's depth written, whatever is there
+ID3D11BlendState* g_blendNone = nullptr;         // and no colour
+void* g_fillRefused = nullptr;                   // a depth texture the fill could not open, so it is not asked again
+volatile LONG g_fillDone = 0, g_fillNoTarget = 0, g_fillFailed = 0;
 ID3D11Buffer* g_cbPass = nullptr;
 void* g_sharpenRefused = nullptr; // a texture the sharpening pass could not open, so it is not asked again
+
+// How a smaller model's edit is enlarged by the resolve (see EditFollowing in vws.hlsl): set from the
+// main thread, read where the pass is drawn. Plain numbers; a frame drawn with the old ones is no harm.
+volatile LONG g_resolveFollow = 0, g_resolveSaid = -1, g_resolveOutline = 0;
+float g_resolveEdge = 0.08f, g_resolveSharpen = 0.0f, g_resolveHalo = 0.5f;
+float g_downSharpen = 0.0f; // how much sharper than its exact average the model's input is made (see PSDown)
 ID3D11SamplerState* g_sampler = nullptr;
 ID3D11Buffer* g_cb = nullptr;
 ID3D11RasterizerState* g_raster = nullptr;
@@ -511,6 +560,12 @@ void ReleaseDevice()
     ReleaseMatte();
     SafeRelease(g_cbPass);
     SafeRelease(g_psMatte);
+    SafeRelease(g_psDepthFill);
+    SafeRelease(g_psSteady);
+    SafeRelease(g_psGather);
+    SafeRelease(g_depthWrite);
+    SafeRelease(g_blendNone);
+    g_fillRefused = nullptr;
     SafeRelease(g_psPass);
     SafeRelease(g_psSharpen);
     SafeRelease(g_psGuide);
@@ -560,6 +615,15 @@ HRESULT EnsureDevice(ID3D11Device* device)
 
     if (SUCCEEDED(hr))
         hr = g_device->CreatePixelShader(g_vwsPsMatte, sizeof(g_vwsPsMatte), nullptr, &g_psMatte);
+
+    if (SUCCEEDED(hr))
+        hr = g_device->CreatePixelShader(g_vwsPsDepthFill, sizeof(g_vwsPsDepthFill), nullptr, &g_psDepthFill);
+
+    if (SUCCEEDED(hr))
+        hr = g_device->CreatePixelShader(g_vwsPsSteady, sizeof(g_vwsPsSteady), nullptr, &g_psSteady);
+
+    if (SUCCEEDED(hr))
+        hr = g_device->CreatePixelShader(g_vwsPsGather, sizeof(g_vwsPsGather), nullptr, &g_psGather);
 
     // Which adapter this is: the overlay's own device has to be on the same one to share a texture.
     if (SUCCEEDED(hr))
@@ -637,6 +701,24 @@ HRESULT EnsureDevice(ID3D11Device* device)
         dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
         dd.StencilEnable = FALSE;
         hr = g_device->CreateDepthStencilState(&dd, &g_depth);
+    }
+
+    if (SUCCEEDED(hr))
+    {
+        D3D11_DEPTH_STENCIL_DESC dd {};
+        dd.DepthEnable = TRUE;
+        dd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+        dd.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        dd.StencilEnable = FALSE;
+        hr = g_device->CreateDepthStencilState(&dd, &g_depthWrite);
+    }
+
+    if (SUCCEEDED(hr))
+    {
+        D3D11_BLEND_DESC bd {};
+        bd.RenderTarget[0].BlendEnable = FALSE;
+        bd.RenderTarget[0].RenderTargetWriteMask = 0;
+        hr = g_device->CreateBlendState(&bd, &g_blendNone);
     }
 
     if (FAILED(hr))
@@ -1538,6 +1620,53 @@ void DrawPass(Set& set, Pass pass, const VwsCmd& cmd)
         params.flags |= kFlagWindow;
     }
 
+    if (pass == PassDown)
+    {
+        params.fade[1] = g_downSharpen;
+        params.fade[2] = cmd.prev[0];
+        params.fade[3] = cmd.prev[1];
+    }
+
+    // The edit kept over frames, if the pass before this one made it for this resolve (see Steady).
+    const Surface* keptEdit = nullptr;
+
+    if (resolve && set.steadyReady >= 0)
+    {
+        const Surface& k = set.kept[set.steadyReady][set.keptAt[set.steadyReady]];
+
+        const Surface& like = set.steadyFull ? set.result : set.model;
+
+        if (k.srv != nullptr && k.desc.Width == like.desc.Width && k.desc.Height == like.desc.Height)
+        {
+            keptEdit = &k;
+            params.flags |= set.steadyFull ? kFlagFull : kFlagSteady;
+        }
+
+        set.steadyReady = -1;
+    }
+
+    // (the sharpening goes with either way of enlarging; following the edges is the dearer part)
+    if (resolve)
+    {
+        params.flags |= (g_resolveFollow != 0 ? kFlagFollow : 0u) | (g_resolveOutline != 0 && cmd.windowed != 0 ? kFlagOutline : 0u);
+        params.fade[1] = g_resolveEdge;
+        params.fade[2] = g_resolveSharpen;
+        params.fade[3] = g_resolveHalo;
+    }
+
+    // Said when it changes, with the sizes: whether this is in force cannot be seen from outside.
+    if (resolve)
+    {
+        const LONG now = (g_resolveFollow != 0 ? 100000 : 0) + (LONG) (g_resolveSharpen * 100.0f);
+
+        if (now != g_resolveSaid)
+        {
+            g_resolveSaid = now;
+            Log("resolve: a %ux%u model's edit onto %ux%u %s (tolerance %.2f, sharpened %.2f, past its neighbours by %.2f)", work.desc.Width, work.desc.Height,
+                target.desc.Width, target.desc.Height, g_resolveFollow != 0 ? "along the frame's edges" : "enlarged plainly", g_resolveEdge, g_resolveSharpen, g_resolveHalo);
+        }
+    }
+
     // Only a window can have moved, and only motion vectors care.
     if (guide && cmd.windowed != 0 && cmd.moved != 0)
     {
@@ -1585,18 +1714,202 @@ void DrawPass(Set& set, Pass pass, const VwsCmd& cmd)
     c->PSSetConstantBuffers(0, 1, &g_cb);
     c->PSSetSamplers(0, 1, &g_sampler);
 
-    ID3D11ShaderResourceView* inputs[3] = { source.srv, resolve ? set.proxy.srv : nullptr,
-                                            resolve ? set.model.srv : nullptr };
+    ID3D11ShaderResourceView* inputs[3] = { source.srv, resolve ? set.proxy.srv : nullptr, resolve ? set.model.srv : nullptr };
     c->PSSetShaderResources(0, 3, inputs);
+
+    // (the kept edit is a fourth input, beyond what the backup keeps: what was there is put back after)
+    ID3D11ShaderResourceView* fourth = nullptr;
+
+    if (keptEdit != nullptr)
+    {
+        c->PSGetShaderResources(3, 1, &fourth);
+        c->PSSetShaderResources(3, 1, &keptEdit->srv);
+    }
 
     c->Draw(3, 0);
 
+    if (keptEdit != nullptr)
+    {
+        ID3D11ShaderResourceView* nothing = nullptr;
+        c->PSSetShaderResources(3, 1, &nothing);
+    }
+
     backup.Restore(c);
+
+    if (keptEdit != nullptr)
+    {
+        c->PSSetShaderResources(3, 1, &fourth);
+        SafeRelease(fourth);
+    }
 
     if (resolve)
         set.status.resolves++;
     else if (!guide)
         set.status.downsamples++;
+}
+
+// The model's edit of this pass, blended into what was kept of it from the frames before (see
+// PSSteady), ready for the resolve that follows. The motion vectors are opened for this one call
+// and let go: they are the model's own copies, and whose they are next frame is not ours to hold.
+void Steady(Set& set, const VwsCmd& cmd)
+{
+    set.steadyReady = -1;
+
+    if (!set.Complete() || !set.Paired() || cmd.frame == nullptr || g_ctx == nullptr || g_psSteady == nullptr)
+        return;
+
+    // (mode: 1 = nothing kept is to be used; 2 = kept at the frame's size, with the model's raster shifted -- PSGather)
+    const bool full = (cmd.mode & 2) != 0 && g_psGather != nullptr;
+    const uint32_t slot = cmd.which < kSteadySlots ? cmd.which : kSteadySlots - 1;
+    const uint32_t w = full ? set.result.desc.Width : set.proxy.desc.Width, h = full ? set.result.desc.Height : set.proxy.desc.Height;
+    HRESULT hr = S_OK;
+
+    for (int k = 0; k < 2; ++k)
+    {
+        Surface& s = set.kept[slot][k];
+
+        if (s.tex != nullptr && s.desc.Width == w && s.desc.Height == h)
+            continue;
+
+        s.Release();
+        set.keptPrimed[slot] = false;
+
+        D3D11_TEXTURE2D_DESC td {};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+        ID3D11Texture2D* made = nullptr;
+        hr = g_device->CreateTexture2D(&td, nullptr, &made);
+        const bool opened = SUCCEEDED(hr) && OpenSurface(s, made, false, true, true, "the edit kept over frames", &hr) == ErrNone;
+        SafeRelease(made);
+
+        if (!opened)
+        {
+            InterlockedIncrement(&g_steadyFailed);
+            return;
+        }
+    }
+
+    Surface motion;
+
+    if (OpenSurface(motion, cmd.frame, false, true, false, "the motion vectors", &hr) != ErrNone)
+    {
+        InterlockedIncrement(&g_steadyFailed);
+        return;
+    }
+
+    const bool fresh = (cmd.mode & 1) != 0 || !set.keptPrimed[slot];
+    const uint32_t from = set.keptAt[slot], to = 1 - from;
+
+    Params params {};
+    SetSize(params.dstSize, w, h);
+    SetSize(params.workSize, set.proxy.desc.Width, set.proxy.desc.Height);
+    params.eyes = cmd.eyes == 2 ? 2u : 1u;
+    params.strength = cmd.strength < 0.02f ? 0.02f : (cmd.strength > 1.0f ? 1.0f : cmd.strength);
+    params.mode = fresh ? 1u : 0u;
+    params.flags = (set.proxy.Encoded() ? kFlagProxyEncoded : 0) | (set.model.Encoded() ? kFlagModelEncoded : 0) | (cmd.topDown != 0 ? kFlagTopDown : 0);
+
+    if (full)
+    {
+        // the frame is the first input, the motion vectors the fifth; enlarged as the resolve would
+        SetSize(params.frameSize, set.frame.desc.Width, set.frame.desc.Height);
+        SetSize(params.prev[1], motion.desc.Width, motion.desc.Height);
+        params.prev[0][0] = cmd.prev[0];
+        params.prev[0][1] = cmd.prev[1];
+        params.prev[0][2] = cmd.prev[2];
+        params.flags |= (set.frame.Encoded() ? kFlagFrameEncoded : 0) | (g_resolveFollow != 0 ? kFlagFollow : 0);
+        params.fade[1] = g_resolveEdge;
+        params.fade[2] = g_resolveSharpen;
+        params.fade[3] = g_resolveHalo;
+    }
+    else
+    {
+        SetSize(params.frameSize, motion.desc.Width, motion.desc.Height);
+    }
+
+    for (int e = 0; e < 2; ++e)
+    {
+        params.window[e][0] = params.window[e][1] = 0.0f;
+        params.window[e][2] = params.window[e][3] = 1.0f;
+    }
+
+    if (cmd.windowed != 0 && !full)
+    {
+        memcpy(params.window, cmd.window, sizeof(params.window));
+        params.flags |= kFlagWindow;
+    }
+
+    ID3D11DeviceContext* c = g_ctx;
+    D3D11_MAPPED_SUBRESOURCE mapped {};
+    hr = c->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+
+    if (FAILED(hr))
+    {
+        motion.Release();
+        InterlockedIncrement(&g_steadyFailed);
+        return;
+    }
+
+    memcpy(mapped.pData, &params, sizeof(params));
+    c->Unmap(g_cb, 0);
+
+    StateBackup backup;
+    backup.Capture(c);
+
+    // (the fourth and fifth inputs are beyond what the backup keeps: kept here, and put back below)
+    ID3D11ShaderResourceView* beyond[2] {};
+    c->PSGetShaderResources(3, 2, beyond);
+
+    ID3D11ShaderResourceView* none[5] {};
+    c->PSSetShaderResources(0, 5, none);
+    c->OMSetRenderTargets(1, &set.kept[slot][to].rtv, nullptr);
+
+    D3D11_VIEWPORT vp {};
+    vp.Width = (float) w;
+    vp.Height = (float) h;
+    vp.MaxDepth = 1.0f;
+    c->RSSetViewports(1, &vp);
+    c->RSSetState(g_raster);
+    c->OMSetBlendState(g_blend, nullptr, 0xFFFFFFFF);
+    c->OMSetDepthStencilState(g_depth, 0);
+
+    c->IASetInputLayout(nullptr);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->VSSetShader(g_vs, nullptr, 0);
+    c->HSSetShader(nullptr, nullptr, 0);
+    c->DSSetShader(nullptr, nullptr, 0);
+    c->GSSetShader(nullptr, nullptr, 0);
+    c->PSSetShader(full ? g_psGather : g_psSteady, nullptr, 0);
+    c->PSSetConstantBuffers(0, 1, &g_cb);
+    c->PSSetSamplers(0, 1, &g_sampler);
+
+    ID3D11ShaderResourceView* inputs[5] = { full ? set.frame.srv : motion.srv, set.proxy.srv, set.model.srv, fresh ? nullptr : set.kept[slot][from].srv,
+                                            full ? motion.srv : nullptr };
+    c->PSSetShaderResources(0, 5, inputs);
+
+    c->Draw(3, 0);
+
+    c->PSSetShaderResources(3, 2, none);
+    backup.Restore(c);
+    c->PSSetShaderResources(3, 2, beyond);
+    SafeRelease(beyond[0]);
+    SafeRelease(beyond[1]);
+    motion.Release();
+
+    set.keptAt[slot] = to;
+    set.keptPrimed[slot] = true;
+    set.steadyReady = (int) slot;
+    set.steadyFull = full;
+    InterlockedIncrement(&g_steadyRuns);
+
+    if (fresh)
+        InterlockedIncrement(&g_steadyFresh);
 }
 
 // A rigid transform, rows of a 3x4.
@@ -1780,6 +2093,7 @@ float g_handCfg[kCamFloats] {}, g_handHead[12] {}, g_handSet[vwshand::kSettings]
 bool g_handHeadKnown = false, g_handSetGiven = false, g_handOutInRoom = false;
 double g_handAt = 0.0, g_handOutAt = 0.0;
 vwshand::HandOut g_handOut[vwshand::kHands] {};
+float g_handCurls[vwshand::kHands * 6] {};
 
 DWORD WINAPI HandThread(void*)
 {
@@ -1818,8 +2132,12 @@ DWORD WINAPI HandThread(void*)
             spent = 0.0;
         }
 
+        float curls[vwshand::kHands * 6];
+        tracker->Curls(curls);
+
         AcquireSRWLockExclusive(&g_handLock);
         memcpy(g_handOut, out, sizeof(g_handOut));
+        memcpy(g_handCurls, curls, sizeof(g_handCurls));
         g_handOutAt = g_handAt;
         g_handOutInRoom = g_handHeadKnown;
         ReleaseSRWLockExclusive(&g_handLock);
@@ -3424,11 +3742,140 @@ void Sharpen(const VwsCmd& cmd)
     target.Release();
 }
 
+// The scene's depth into the depth target that is bound at this moment, across the viewport in force
+// (see PSDepthFill). Raised by a camera of ours from inside its own render, after it has cleared
+// and before it draws: the camera has set the target and the viewport, so this needs to know
+// neither, and it works the same on an eye texture, on half of a double-wide one and on the
+// window's back buffer. No colour is written and the stencil is left alone.
+void DepthFill(const VwsCmd& cmd)
+{
+    if (cmd.frame == nullptr || cmd.frame == g_fillRefused)
+    {
+        InterlockedIncrement(&g_fillFailed);
+        return;
+    }
+
+    ID3D11Device* device = DeviceOf(cmd.frame);
+
+    if (device == nullptr)
+    {
+        InterlockedIncrement(&g_fillFailed);
+        return;
+    }
+
+    HRESULT hr = EnsureDevice(device);
+    device->Release();
+
+    if (FAILED(hr))
+    {
+        InterlockedIncrement(&g_fillFailed);
+        return;
+    }
+
+    ID3D11DeviceContext* c = g_ctx;
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11DepthStencilView* dsv = nullptr;
+    c->OMGetRenderTargets(1, &rtv, &dsv);
+    SafeRelease(rtv);
+
+    if (dsv == nullptr)
+    {
+        InterlockedIncrement(&g_fillNoTarget);
+        return;
+    }
+
+    UINT count = 1;
+    D3D11_VIEWPORT vp {};
+    c->RSGetViewports(&count, &vp);
+
+    if (count == 0 || !(vp.Width >= 1.0f) || !(vp.Height >= 1.0f))
+    {
+        dsv->Release();
+        InterlockedIncrement(&g_fillNoTarget);
+        return;
+    }
+
+    Surface source;
+
+    if (OpenSurface(source, cmd.frame, false, true, false, "the scene's depth", &hr) != ErrNone)
+    {
+        g_fillRefused = cmd.frame;
+        dsv->Release();
+        InterlockedIncrement(&g_fillFailed);
+        return;
+    }
+
+    Params params {};
+    SetSize(params.frameSize, source.desc.Width, source.desc.Height);
+    SetSize(params.dstSize, (uint32_t) vp.Width, (uint32_t) vp.Height);
+    SetSize(params.workSize, source.desc.Width, source.desc.Height);
+    params.eyes = 1;
+    params.flags = cmd.topDown != 0 ? kFlagTopDown : 0u;
+    params.strength = cmd.strength < 0.0f ? 0.0f : (cmd.strength > 0.5f ? 0.5f : cmd.strength);
+    params.mode = cmd.mode;
+    memcpy(params.window[0], cmd.window, sizeof(float) * 4);
+    params.prev[0][0] = vp.TopLeftX;
+    params.prev[0][1] = vp.TopLeftY;
+    params.prev[0][2] = vp.Width;
+    params.prev[0][3] = vp.Height;
+
+    D3D11_MAPPED_SUBRESOURCE mapped {};
+    hr = c->Map(g_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+
+    if (FAILED(hr))
+    {
+        source.Release();
+        dsv->Release();
+        InterlockedIncrement(&g_fillFailed);
+        return;
+    }
+
+    memcpy(mapped.pData, &params, sizeof(params));
+    c->Unmap(g_cb, 0);
+
+    StateBackup backup;
+    backup.Capture(c);
+
+    // The targets stay as the camera bound them; one viewport, and nothing cut off it.
+    ID3D11ShaderResourceView* none[3] {};
+    c->PSSetShaderResources(0, 3, none);
+    c->RSSetViewports(1, &vp);
+    c->RSSetState(g_raster);
+    c->OMSetBlendState(g_blendNone, nullptr, 0xFFFFFFFF);
+    c->OMSetDepthStencilState(g_depthWrite, 0);
+
+    c->IASetInputLayout(nullptr);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->VSSetShader(g_vs, nullptr, 0);
+    c->HSSetShader(nullptr, nullptr, 0);
+    c->DSSetShader(nullptr, nullptr, 0);
+    c->GSSetShader(nullptr, nullptr, 0);
+    c->PSSetShader(g_psDepthFill, nullptr, 0);
+    c->PSSetConstantBuffers(0, 1, &g_cb);
+    c->PSSetSamplers(0, 1, &g_sampler);
+
+    ID3D11ShaderResourceView* inputs[3] = { source.srv, nullptr, nullptr };
+    c->PSSetShaderResources(0, 3, inputs);
+
+    c->Draw(3, 0);
+
+    backup.Restore(c);
+    source.Release();
+    dsv->Release();
+    InterlockedIncrement(&g_fillDone);
+}
+
 void Execute(const VwsCmd& cmd)
 {
     if (cmd.op == OpSharpen)
     {
         Sharpen(cmd);
+        return;
+    }
+
+    if (cmd.op == OpDepthFill)
+    {
+        DepthFill(cmd);
         return;
     }
 
@@ -3472,6 +3919,10 @@ void Execute(const VwsCmd& cmd)
 
     case OpRegisterGuide:
         RegisterGuide(cmd);
+        break;
+
+    case OpSteady:
+        Steady(set, cmd);
         break;
 
     case OpDownsample:
@@ -3531,6 +3982,33 @@ int Push(const VwsCmd& cmd)
 }
 } // namespace
 
+// How much sharper than its exact average the model's input is made when the frame is shrunk for it
+// (0: the average itself, as it always was; see PSDown).
+// `shiftX`, `shiftY`: the model's raster is shifted by so much of the frame's pixels in the NEXT shrink
+// pushed (one push takes them; see PSDown and PSGather).
+VWS_EXPORT void vws_down_options(float sharpen, float shiftX, float shiftY)
+{
+    g_downSharpen = sharpen < 0.0f ? 0.0f : (sharpen > 2.0f ? 2.0f : sharpen);
+    g_downShift[0] = shiftX;
+    g_downShift[1] = shiftY;
+}
+
+// How the resolve enlarges the edit of a model that worked smaller than the frame. `follow` 0: plainly
+// (as it always did). 1: along the frame's own edges -- `edge` is how unlike the frame's pixel a model
+// texel's input may be and still be listened to (in the encoded 0..1 the model works in; 0.08 is a
+// good start), `sharpen` how much the enlarged edit's fine part is then strengthened (0 none; the
+// caller makes it follow the scale), `halo` how far that may carry it past the values of the model
+// texels around it, as a share of their range (0 not at all).
+// `outline`: the model's window is drawn into the picture (its edge, and the line its work is whole inside).
+VWS_EXPORT void vws_resolve_options(uint32_t follow, float edge, float sharpen, float halo, uint32_t outline)
+{
+    InterlockedExchange(&g_resolveOutline, outline != 0 ? 1 : 0);
+    g_resolveEdge = edge < 0.005f ? 0.005f : (edge > 1.0f ? 1.0f : edge);
+    g_resolveSharpen = sharpen < -1.0f ? -1.0f : (sharpen > 8.0f ? 8.0f : sharpen); // (below nothing: smoothed instead, wholly at -1)
+    g_resolveHalo = halo < 0.0f ? 0.0f : (halo > 4.0f ? 4.0f : halo);
+    InterlockedExchange(&g_resolveFollow, follow != 0 ? 1 : 0);
+}
+
 // Sharpens `texture` where it lies (see Sharpen). `strength` 0..1; `eyes` 2 for a double-wide
 // stereo frame, whose halves are then sharpened each on its own.
 VWS_EXPORT int vws_push_sharpen(void* texture, float strength, uint32_t eyes)
@@ -3541,6 +4019,41 @@ VWS_EXPORT int vws_push_sharpen(void* texture, float strength, uint32_t eyes)
     cmd.strength = strength;
     cmd.eyes = eyes;
     return Push(cmd);
+}
+
+// The scene's depth (`depth`: one number a texel, as the card made it) into whatever depth target is
+// bound when the event runs, across the viewport then in force: for a camera's command buffer (see
+// DepthFill). `u0`, `uw`: the part of the texture's width that is this picture (0, 1 for all of it;
+// one half of a double-wide stereo one). `flip`: the target's first row is the other end of the
+// picture from the texture's. `slack`: how far back the depth is pushed, as a fraction of its
+// distance. `reversed`: nearer is the larger number.
+VWS_EXPORT int vws_push_depth_fill(void* depth, float u0, float uw, uint32_t flip, float slack, uint32_t reversed)
+{
+    VwsCmd cmd {};
+    cmd.op = OpDepthFill;
+    cmd.frame = depth;
+    cmd.window[0] = u0;
+    cmd.window[1] = 0.0f;
+    cmd.window[2] = uw;
+    cmd.window[3] = 1.0f;
+    cmd.strength = slack;
+    cmd.topDown = flip;
+    cmd.mode = reversed != 0 ? 1u : 0u;
+    return Push(cmd);
+}
+
+// How often it has run, how often there was no depth target or viewport to fill, and how often the
+// depth texture could not be used.
+VWS_EXPORT void vws_depth_fill_status(uint32_t* done, uint32_t* noTarget, uint32_t* failed)
+{
+    if (done != nullptr)
+        *done = (uint32_t) g_fillDone;
+
+    if (noTarget != nullptr)
+        *noTarget = (uint32_t) g_fillNoTarget;
+
+    if (failed != nullptr)
+        *failed = (uint32_t) g_fillFailed;
 }
 
 // The numbers the passthrough pass works from (see CamField). Main thread, whenever they change.
@@ -3859,8 +4372,35 @@ VWS_EXPORT int vws_hand_load(const wchar_t* folder)
 
     if (!ok)
         Log("hands: %s", g_handNets.error);
+    else
+        Log("hands: landmark model %s%s", g_handNets.full ? "hand-points-full.onnx (the full-size one)" :
+                                          (g_handNets.wantFull ? "hand-points.onnx (the full-size one was asked for and is not there, or would not load)" : "hand-points.onnx"),
+            g_handNets.mercury != nullptr ? "; a hand once found is followed with hand-mercury.onnx" :
+            (g_handNets.wantMercury ? "; hand-mercury.onnx was asked for and is not there, or would not load" : ""));
 
     return ok ? 1 : 0;
+}
+
+// Before vws_hand_load, which models are to be used where their files are there: 1 the full-size
+// landmark model, 2 Mercury's keypoint network for following a hand.
+VWS_EXPORT void vws_hand_prefer(uint32_t which)
+{
+    AcquireSRWLockExclusive(&g_handLock);
+    g_handNets.wantFull = (which & 1) != 0;
+    g_handNets.wantMercury = (which & 2) != 0;
+    ReleaseSRWLockExclusive(&g_handLock);
+}
+
+// 1 when Mercury's keypoint network is loaded.
+VWS_EXPORT int vws_hand_mercury()
+{
+    return g_handNets.mercury != nullptr ? 1 : 0;
+}
+
+// 1 when the full-size landmark model is the one loaded.
+VWS_EXPORT int vws_hand_full()
+{
+    return g_handNets.full ? 1 : 0;
 }
 
 VWS_EXPORT void vws_hand_error(char* out, uint32_t capacity)
@@ -3963,10 +4503,47 @@ VWS_EXPORT uint32_t vws_hand_solve(const uint8_t* grey, uint32_t width, uint32_t
 // One frame of a run of frames, through a tracker that is kept from call to call (`fresh` starts
 // it anew): a recording played back as the camera would have given it. Returns the microseconds
 // the frame took. For trying the tracker on recorded frames.
+static vwshand::Tracker* g_stepTracker = nullptr;
+
+// How far each finger of each hand is bent, by Mercury (see vwshand::Tracker::Curls): 12 floats, in
+// the order vws_hand_read gives the hands. All zero where Mercury is not following.
+VWS_EXPORT void vws_hand_curls(float* out)
+{
+    if (out == nullptr)
+        return;
+
+    AcquireSRWLockShared(&g_handLock);
+    memcpy(out, g_handCurls, sizeof(g_handCurls));
+    ReleaseSRWLockShared(&g_handLock);
+}
+
+// The same of the tracker vws_hand_step plays a recording through.
+VWS_EXPORT void vws_hand_step_curls(float* out)
+{
+    if (out != nullptr && g_stepTracker != nullptr)
+        g_stepTracker->Curls(out);
+}
+
+// For looking into a played-back frame: for each of the two hands, each lens's depth agreement and
+// spread (see Fuse), each lens's rightness, and whether each lens's reading was turned round: 8
+// floats a hand.
+VWS_EXPORT void vws_hand_step_notes(float* out)
+{
+    if (out == nullptr || g_stepTracker == nullptr)
+        return;
+
+    for (int i = 0; i < vwshand::kHands; ++i)
+    {
+        memcpy(out + i * 8, g_stepTracker->hand[i].note, sizeof(float) * 6);
+        out[i * 8 + 6] = g_stepTracker->hand[i].turned[0] ? 1.0f : 0.0f;
+        out[i * 8 + 7] = g_stepTracker->hand[i].turned[1] ? 1.0f : 0.0f;
+    }
+}
+
 VWS_EXPORT uint32_t vws_hand_step(const uint8_t* grey, uint32_t width, uint32_t height, const float* cfg, const float* settings, const float* head,
                                   double time, uint32_t fresh, float* out)
 {
-    static vwshand::Tracker* tracker = nullptr;
+    vwshand::Tracker*& tracker = g_stepTracker;
 
     if (grey == nullptr || cfg == nullptr || out == nullptr || g_handNets.hand == nullptr)
         return 0;
@@ -4098,6 +4675,14 @@ VWS_EXPORT int vws_push_pass(uint32_t resolve, uint32_t set, uint32_t eyes, floa
     cmd.eyes = eyes;
     cmd.strength = strength;
     cmd.mode = mode;
+
+    if (resolve == 0)
+    {
+        cmd.prev[0] = g_downShift[0];
+        cmd.prev[1] = g_downShift[1];
+        g_downShift[0] = g_downShift[1] = 0.0f;
+    }
+
     return Push(cmd);
 }
 
@@ -4112,6 +4697,13 @@ VWS_EXPORT int vws_push_pass_window(uint32_t resolve, uint32_t set, uint32_t eye
     cmd.eyes = eyes;
     cmd.strength = strength;
     cmd.mode = mode;
+
+    if (resolve == 0)
+    {
+        cmd.prev[0] = g_downShift[0];
+        cmd.prev[1] = g_downShift[1];
+        g_downShift[0] = g_downShift[1] = 0.0f;
+    }
 
     if (window != nullptr)
     {
@@ -4164,6 +4756,54 @@ VWS_EXPORT int vws_push_guide(uint32_t set, uint32_t index, uint32_t eyes, const
     }
 
     return Push(cmd);
+}
+
+// Before a resolve of the same set: the model's edit of this pass is blended into what was kept of it
+// from the frames before, and the resolve then lays that on the frame instead of this frame's edit
+// alone (see Steady). `motion`: the model-size motion vectors (how far each point has moved since the
+// last frame, in eye widths and heights, y up the picture); `topDown`: their first row is the top of
+// the picture. `pass`: which of the model's passes over this frame this is (each has an edit of its
+// own to keep). `take`: how much of the new edit is taken, 0..1. `fresh`: nothing kept is to be used.
+//
+// `full`: kept at the FRAME's size, with this frame's shrink having been made shifted by `shiftX`,
+// `shiftY` of the frame's pixels -- detail built up over frames (see PSGather). Not with a window.
+// `own`: with `full`, how much each of the frame's pixels keeps to the frame in which it was the one looked at, 0..1.
+VWS_EXPORT int vws_push_steady(uint32_t set, uint32_t eyes, void* motion, float take, uint32_t topDown, const float* window, uint32_t pass, uint32_t fresh,
+                               uint32_t full, float shiftX, float shiftY, float own)
+{
+    VwsCmd cmd {};
+    cmd.op = OpSteady;
+    cmd.set = set;
+    cmd.eyes = eyes;
+    cmd.frame = motion;
+    cmd.strength = take;
+    cmd.topDown = topDown;
+    cmd.which = pass;
+    cmd.mode = (fresh != 0 ? 1u : 0u) | (full != 0 && window == nullptr ? 2u : 0u);
+    cmd.prev[0] = shiftX;
+    cmd.prev[1] = shiftY;
+    cmd.prev[2] = own;
+
+    if (window != nullptr)
+    {
+        memcpy(cmd.window, window, sizeof(cmd.window));
+        cmd.windowed = 1;
+    }
+
+    return Push(cmd);
+}
+
+// How often the edit has been kept over frames, how often of those it began anew, and how often it could not be.
+VWS_EXPORT void vws_steady_status(uint32_t* runs, uint32_t* fresh, uint32_t* failed)
+{
+    if (runs != nullptr)
+        *runs = (uint32_t) g_steadyRuns;
+
+    if (fresh != nullptr)
+        *fresh = (uint32_t) g_steadyFresh;
+
+    if (failed != nullptr)
+        *failed = (uint32_t) g_steadyFailed;
 }
 
 // set >= kSets releases everything, the device objects included.

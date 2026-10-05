@@ -640,6 +640,558 @@ static void TestEditTransfer()
 
 // The cube scaling: an edit that would push a channel past white is scaled as a whole, so the
 // result stays inside the cube and keeps the edit's direction.
+// A smaller model's edit enlarged along the frame's own edges: an edit the model gave the bright
+// side of an edge stays on the bright side, to the pixel, where the plain enlargement spills it
+// over; and where there is nothing to follow the two are the same.
+static void TestFollow(HMODULE dll)
+{
+    printf("[half scale, the edit enlarged along the frame's edges]\n");
+
+    typedef void (*OptionsFn)(uint32_t, float, float, float, uint32_t);
+    OptionsFn options = (OptionsFn) GetProcAddress(dll, "vws_resolve_options");
+    CHECK(options != nullptr, "the resolve's options are exported");
+
+    if (options == nullptr)
+        return;
+
+    Rig rig;
+    rig.Make(64, 48, 32, 24);
+
+    // Dark up to column 30, bright from 31: the edge falls inside model texel 15 (columns 30, 31).
+    Image frame(64, 48);
+
+    for (uint32_t y = 0; y < 48; ++y)
+    {
+        for (uint32_t x = 0; x < 64; ++x)
+        {
+            float* p = frame.at(x, y);
+            p[0] = p[1] = p[2] = x <= 30 ? 0.02f : 0.4f;
+            p[3] = 1.0f;
+        }
+    }
+
+    UploadHalf(rig.frame, frame);
+    Run(rig.Cmd(1, 2));
+    Run(rig.Cmd(2, 2));
+    Bytes model = ReadBytes(rig.proxy);
+
+    // The model brightens the bright surface by 40, and the texel that saw both by half of that.
+    for (uint32_t y = 0; y < 24; ++y)
+    {
+        for (uint32_t x = 15; x < 32; ++x)
+            model.at(x, y)[0] = (uint8_t) std::min(255, model.at(x, y)[0] + (x == 15 ? 20 : 40));
+    }
+
+    UploadBytes(rig.model, model);
+    const int dark = ToByte(L2S(0.02f)), bright = ToByte(L2S(0.4f));
+    int spill[2] = { 0, 0 }, short_[2] = { 0, 0 }, away[2] = { 0, 0 };
+
+    for (int follow = 0; follow < 2; ++follow)
+    {
+        options((uint32_t) follow, 0.08f, 0.0f, 0.0f, 0);
+        Run(rig.Cmd(3, 2));
+        const Bytes result = ReadBytes(rig.result);
+
+        for (uint32_t y = 8; y < 40; ++y)
+        {
+            for (uint32_t x = 0; x < 64; ++x)
+            {
+                const int red = result.at(x, y)[0];
+
+                if (x <= 30)
+                    spill[follow] = std::max(spill[follow], red - dark);
+                else
+                    short_[follow] = std::max(short_[follow], bright + 40 - red);
+
+                if (x <= 24)
+                    away[follow] = std::max(away[follow], abs(red - dark));
+                else if (x >= 38)
+                    away[follow] = std::max(away[follow], abs(red - (bright + 40)));
+            }
+        }
+    }
+
+    CHECK(spill[0] >= 8, "test setup: enlarged plainly the edit should spill onto the dark side (it spills %d)", spill[0]);
+    CHECK(spill[1] <= 2, "following the edge, the edit still spills onto the dark side by %d (plainly: %d)", spill[1], spill[0]);
+    CHECK(short_[1] <= 3, "following the edge, the bright side is short of its edit by %d (plainly: %d)", short_[1], short_[0]);
+    CHECK(away[0] <= 1 && away[1] <= 1, "away from the edge the two differ from what is expected by %d and %d", away[0], away[1]);
+
+    // Sharpening on top, with no room past its neighbours, holds within what the model's texels hold.
+    options(1, 0.08f, 2.0f, 0.0f, 0);
+    Run(rig.Cmd(3, 2));
+    {
+        const Bytes result = ReadBytes(rig.result);
+        int over = 0, under = 0;
+
+        for (uint32_t y = 8; y < 40; ++y)
+        {
+            for (uint32_t x = 0; x < 64; ++x)
+            {
+                const int red = result.at(x, y)[0];
+                over = std::max(over, red - (x <= 30 ? dark : bright) - 40);
+                under = std::max(under, (x <= 30 ? dark : bright) - red);
+            }
+        }
+
+        CHECK(over <= 1 && under <= 1, "sharpened, the edit leaves its own range: %d over, %d under", over, under);
+    }
+
+    // A fine pattern in the edit comes back stronger: the model adds +-16 to alternate texels of a
+    // flat frame; enlarged plainly the swing between them is what the filter leaves, sharpened it is more.
+    {
+        Image flat(64, 48);
+
+        for (float& v : flat.px)
+            v = 0.2f;
+
+        UploadHalf(rig.frame, flat);
+        Run(rig.Cmd(2, 2));
+        Bytes fine = ReadBytes(rig.proxy);
+
+        for (uint32_t y = 0; y < 24; ++y)
+            for (uint32_t x = 0; x < 32; ++x)
+                fine.at(x, y)[0] = (uint8_t) (fine.at(x, y)[0] + (((x + y) & 1) != 0 ? 16 : -16));
+
+        UploadBytes(rig.model, fine);
+        int swing[2] = { 0, 0 };
+
+        for (int sharp = 0; sharp < 2; ++sharp)
+        {
+            options(1, 0.08f, sharp != 0 ? 1.0f : 0.0f, 0.5f, 0);
+            Run(rig.Cmd(3, 2));
+            const Bytes result = ReadBytes(rig.result);
+            int lo = 255, hi = 0;
+
+            for (uint32_t y = 12; y < 36; ++y)
+            {
+                for (uint32_t x = 12; x < 52; ++x)
+                {
+                    lo = std::min(lo, (int) result.at(x, y)[0]);
+                    hi = std::max(hi, (int) result.at(x, y)[0]);
+                }
+            }
+
+            swing[sharp] = hi - lo;
+        }
+
+        CHECK(swing[1] >= swing[0] + 6, "sharpened, a fine pattern in the edit swings %d against %d plainly: no stronger", swing[1], swing[0]);
+
+        // The sharpening without following the edges (the cheaper way) strengthens it too.
+        options(0, 0.08f, 1.0f, 0.5f, 0);
+        Run(rig.Cmd(3, 2));
+        {
+            const Bytes result = ReadBytes(rig.result);
+            int lo = 255, hi = 0;
+
+            for (uint32_t y = 12; y < 36; ++y)
+            {
+                for (uint32_t x = 12; x < 52; ++x)
+                {
+                    lo = std::min(lo, (int) result.at(x, y)[0]);
+                    hi = std::max(hi, (int) result.at(x, y)[0]);
+                }
+            }
+
+            CHECK(hi - lo >= swing[0] + 6, "sharpened alone, a fine pattern swings %d against %d plainly: no stronger", hi - lo, swing[0]);
+        }
+        CHECK(swing[1] <= 2 * swing[0] + 2, "sharpened, a fine pattern swings %d against %d: more than its room allows", swing[1], swing[0]);
+
+        // And the other way, the amount below nothing: the fine pattern is taken out, not put in.
+        for (int follow = 0; follow < 2; ++follow)
+        {
+            options((uint32_t) follow, 0.08f, -1.0f, 0.5f, 0);
+            Run(rig.Cmd(3, 2));
+            const Bytes result = ReadBytes(rig.result);
+            int lo = 255, hi = 0;
+
+            for (uint32_t y = 12; y < 36; ++y)
+            {
+                for (uint32_t x = 12; x < 52; ++x)
+                {
+                    lo = std::min(lo, (int) result.at(x, y)[0]);
+                    hi = std::max(hi, (int) result.at(x, y)[0]);
+                }
+            }
+
+            CHECK(hi - lo <= swing[0] - 4, "smoothed%s, a fine pattern still swings %d against %d plainly", follow != 0 ? " along the edges" : "", hi - lo, swing[0]);
+        }
+    }
+
+    // A sharper shrink: beside an edge the model's input goes past the two flat values, away from
+    // it stays what it was -- and with the model changing nothing the frame still comes back as itself.
+    {
+        typedef void (*DownFn)(float, float, float);
+        DownFn down = (DownFn) GetProcAddress(dll, "vws_down_options");
+        CHECK(down != nullptr, "the shrink's options are exported");
+
+        if (down != nullptr)
+        {
+            // (an edge between two model texels: one that falls inside a texel is the same mean at either width)
+            Image edged(64, 48);
+
+            for (uint32_t y = 0; y < 48; ++y)
+            {
+                for (uint32_t x = 0; x < 64; ++x)
+                {
+                    float* p = edged.at(x, y);
+                    p[0] = p[1] = p[2] = x <= 31 ? 0.02f : 0.4f;
+                    p[3] = 1.0f;
+                }
+            }
+
+            UploadHalf(rig.frame, edged);
+            Run(rig.Cmd(2, 2));
+            const Bytes soft = ReadBytes(rig.proxy);
+            down(1.0f, 0.0f, 0.0f);
+            Run(rig.Cmd(2, 2));
+            const Bytes sharp = ReadBytes(rig.proxy);
+            int past = 0, flatMoved = 0;
+
+            for (uint32_t y = 4; y < 20; ++y)
+            {
+                for (uint32_t x = 0; x < 32; ++x)
+                {
+                    if (x >= 14 && x <= 17)
+                        past = std::max(past, abs((int) sharp.at(x, y)[0] - (int) soft.at(x, y)[0]));
+                    else if (x <= 10 || x >= 21)
+                        flatMoved = std::max(flatMoved, abs((int) sharp.at(x, y)[0] - (int) soft.at(x, y)[0]));
+                }
+            }
+
+            CHECK(past >= 4, "sharpened, the model's input beside an edge differs from the plain shrink by only %d", past);
+            CHECK(flatMoved <= 1, "sharpened, a flat area of the model's input moved by %d", flatMoved);
+
+            UploadBytes(rig.model, sharp);
+            options(0, 0.08f, 0.0f, 0.0f, 0);
+            Run(rig.Cmd(3, 2));
+            const Image seen = Seen(edged);
+            const Bytes result = ReadBytes(rig.result);
+            int moved = 0;
+
+            for (uint32_t y = 0; y < 48; ++y)
+                for (uint32_t x = 0; x < 64; ++x)
+                    moved = std::max(moved, abs((int) result.at(x, y)[0] - ToByte(L2S(seen.at(x, y)[0]))));
+
+            CHECK(moved <= 1, "with a sharpened input and nothing changed by the model the frame moved by %d", moved);
+            down(0.0f, 0.0f, 0.0f);
+        }
+    }
+
+    // And a model that changed nothing changes nothing, whatever the picture.
+    {
+        const Image noisy = TestPattern(64, 48, 5);
+        UploadHalf(rig.frame, noisy);
+        Run(rig.Cmd(2, 2));
+        UploadBytes(rig.model, ReadBytes(rig.proxy));
+        Run(rig.Cmd(3, 2));
+        const Image seen = Seen(noisy);
+        const Bytes result = ReadBytes(rig.result);
+        int moved = 0;
+
+        for (uint32_t y = 0; y < 48; ++y)
+            for (uint32_t x = 0; x < 64; ++x)
+                for (int c = 0; c < 3; ++c)
+                    moved = std::max(moved, abs((int) result.at(x, y)[c] - ToByte(L2S(seen.at(x, y)[c]))));
+
+        CHECK(moved <= 1, "with nothing changed by the model the frame moved by %d", moved);
+    }
+
+    options(0, 0.08f, 0.0f, 0.0f, 0);
+    Run(rig.Cmd(4, 2));
+    rig.Free();
+}
+
+// The model's edit kept over frames: an edit that differs from frame to frame, texel by texel,
+// comes out steadier; one that moves is carried along by the motion vectors, not left behind.
+static void TestSteady(HMODULE dll)
+{
+    printf("[half scale, the edit kept over frames]\n");
+
+    typedef int (*PushSteadyFn)(uint32_t, uint32_t, void*, float, uint32_t, const float*, uint32_t, uint32_t, uint32_t, float, float, float);
+    typedef void (*SteadyStatusFn)(uint32_t*, uint32_t*, uint32_t*);
+    PushSteadyFn steady = (PushSteadyFn) GetProcAddress(dll, "vws_push_steady");
+    SteadyStatusFn status = (SteadyStatusFn) GetProcAddress(dll, "vws_steady_status");
+    CHECK(steady != nullptr && status != nullptr, "keeping the edit over frames is exported");
+
+    if (steady == nullptr || status == nullptr)
+        return;
+
+    Rig rig;
+    rig.Make(64, 48, 32, 24);
+    Image flat(64, 48);
+
+    for (float& v : flat.px)
+        v = 0.2f;
+
+    UploadHalf(rig.frame, flat);
+    Run(rig.Cmd(1, 3));
+    Run(rig.Cmd(2, 3));
+    const Bytes proxy = ReadBytes(rig.proxy);
+    ID3D11Texture2D* motion = MakeTexture(32, 24, DXGI_FORMAT_R16G16B16A16_FLOAT, kRT);
+    Image still(32, 24);
+    UploadHalf(motion, still);
+
+    // The model adds something else to every texel on every frame: 16, give or take 16.
+    {
+        uint32_t seed = 99;
+        double moved[2] = { 0.0, 0.0 };
+
+        for (int with = 0; with < 2; ++with)
+        {
+            Bytes before(64, 48);
+
+            for (int n = 0; n < 12; ++n)
+            {
+                Bytes model = proxy;
+
+                for (uint32_t y = 0; y < 24; ++y)
+                {
+                    for (uint32_t x = 0; x < 32; ++x)
+                    {
+                        seed = seed * 1664525u + 1013904223u;
+                        model.at(x, y)[0] = (uint8_t) (model.at(x, y)[0] + ((seed >> 16) % 33));
+                    }
+                }
+
+                UploadBytes(rig.model, model);
+
+                if (with != 0)
+                    g_event(steady(3, 1, motion, 0.2f, 0, nullptr, 0, n == 0 ? 1u : 0u, 0, 0.0f, 0.0f, 0.0f));
+
+                Run(rig.Cmd(3, 3));
+                const Bytes result = ReadBytes(rig.result);
+
+                if (n >= 8)
+                {
+                    double sum = 0.0;
+
+                    for (uint32_t y = 8; y < 40; ++y)
+                        for (uint32_t x = 8; x < 56; ++x)
+                            sum += abs((int) result.at(x, y)[0] - (int) before.at(x, y)[0]);
+
+                    moved[with] += sum / (32.0 * 48.0) / 4.0;
+                }
+
+                before = result;
+            }
+        }
+
+        CHECK(moved[0] > 3.0, "test setup: from frame to frame the picture should move (it moves %.2f levels)", moved[0]);
+        CHECK(moved[1] < moved[0] * 0.6, "kept over frames, the picture moves %.2f levels a frame against %.2f plainly: no steadier", moved[1], moved[0]);
+    }
+
+    // An edit that slides four texels to the right every frame, with motion vectors that say so, and
+    // nearly all of it taken from what was kept: it has to arrive where the model now has it.
+    for (int axis = 0; axis < 2; ++axis)
+    {
+        Image vectors(32, 24);
+
+        for (uint32_t i = 0; i < 32 * 24; ++i)
+            vectors.px[i * 4 + axis] = axis == 0 ? 4.0f / 32.0f : 3.0f / 24.0f;
+
+        UploadHalf(motion, vectors);
+        Bytes plain(64, 48), kept(64, 48);
+
+        for (int with = 0; with < 2; ++with)
+        {
+            for (int n = 0; n < 4; ++n)
+            {
+                Bytes model = proxy;
+
+                for (uint32_t y = 0; y < 24; ++y)
+                {
+                    for (uint32_t x = 0; x < 32; ++x)
+                    {
+                        const int along = axis == 0 ? (int) x - 4 * n : (int) y - 3 * n;
+                        model.at(x, y)[0] = (uint8_t) (model.at(x, y)[0] + std::max(0, std::min(40, 2 * along)));
+                    }
+                }
+
+                UploadBytes(rig.model, model);
+
+                if (with != 0)
+                    g_event(steady(3, 1, motion, 0.02f, 0, nullptr, 1, n == 0 ? 1u : 0u, 0, 0.0f, 0.0f, 0.0f));
+
+                Run(rig.Cmd(3, 3));
+            }
+
+            (with != 0 ? kept : plain) = ReadBytes(rig.result);
+        }
+
+        int worst = 0;
+
+        for (uint32_t y = 12; y < 36; ++y)
+            for (uint32_t x = 16; x < 48; ++x)
+                worst = std::max(worst, abs((int) kept.at(x, y)[0] - (int) plain.at(x, y)[0]));
+
+        CHECK(worst <= 2, "an edit moving along %s is off by %d where it was carried to", axis == 0 ? "x" : "y", worst);
+    }
+
+    // A bright thing that moves with no motion vectors to say so (a person by their own animation),
+    // and an edit on it: what was kept for where it has left is let go, not trailed behind it.
+    {
+        Image vectors(32, 24);
+        UploadHalf(motion, vectors);
+        Bytes plain(64, 48), kept(64, 48);
+
+        for (int with = 0; with < 2; ++with)
+        {
+            for (int n = 0; n < 5; ++n)
+            {
+                Image scene(64, 48);
+
+                for (uint32_t y = 0; y < 48; ++y)
+                {
+                    for (uint32_t x = 0; x < 64; ++x)
+                    {
+                        float* p = scene.at(x, y);
+                        p[0] = p[1] = p[2] = (x >= 16u + 4u * n && x < 32u + 4u * n) ? 0.5f : 0.1f;
+                        p[3] = 1.0f;
+                    }
+                }
+
+                UploadHalf(rig.frame, scene);
+                Run(rig.Cmd(2, 3));
+                Bytes model = ReadBytes(rig.proxy);
+
+                for (uint32_t y = 0; y < 24; ++y)
+                    for (uint32_t x = 8u + 2u * n; x < 16u + 2u * n; ++x)
+                        model.at(x, y)[0] = (uint8_t) std::min(255, model.at(x, y)[0] + 30);
+
+                UploadBytes(rig.model, model);
+
+                // (a twentieth of each new frame: the least there is, and where what is kept stays longest)
+                if (with != 0)
+                    g_event(steady(3, 1, motion, 0.05f, 0, nullptr, 2, n == 0 ? 1u : 0u, 0, 0.0f, 0.0f, 0.0f));
+
+                Run(rig.Cmd(3, 3));
+            }
+
+            (with != 0 ? kept : plain) = ReadBytes(rig.result);
+        }
+
+        int trail = 0;
+
+        for (uint32_t y = 8; y < 40; ++y)
+            for (uint32_t x = 0; x < 64; ++x)
+                trail = std::max(trail, abs((int) kept.at(x, y)[0] - (int) plain.at(x, y)[0]));
+
+        CHECK(trail <= 3, "behind a thing that moves with no motion vectors the kept edit trails by %d levels", trail);
+        UploadHalf(rig.frame, flat);
+        Run(rig.Cmd(2, 3));
+    }
+
+    // Detail built up over frames. A model that cannot draw finer than its own pixels, shown a
+    // pattern as fine as the frame's (a chequer of single pixels, +-10): each of its pixels answers
+    // with what lies at its middle. With its raster shifted by half a pixel each way in turn and
+    // the edit kept at the frame's size, the frame's own pattern comes back; kept at the model's
+    // size, or not at all, it cannot.
+    {
+        Image vectors(32, 24);
+        UploadHalf(motion, vectors);
+        static const float kShift[4][2] = { { -0.5f, -0.5f }, { 0.5f, 0.5f }, { 0.5f, -0.5f }, { -0.5f, 0.5f } };
+        const Image seen = Seen(flat);
+        const int base = ToByte(L2S(seen.at(0, 0)[0]));
+        double off[2] = { 0.0, 0.0 };
+
+        for (int full = 0; full < 2; ++full)
+        {
+            for (int n = 0; n < 16; ++n)
+            {
+                const float* s = kShift[n % 4];
+                Bytes model = proxy;
+
+                for (uint32_t y = 0; y < 24; ++y)
+                {
+                    for (uint32_t x = 0; x < 32; ++x)
+                    {
+                        const uint32_t fx = 2 * x + (s[0] > 0.0f ? 1u : 0u), fy = 2 * y + (s[1] > 0.0f ? 1u : 0u);
+                        model.at(x, y)[0] = (uint8_t) (model.at(x, y)[0] + (((fx + fy) & 1u) != 0 ? 10 : -10));
+                    }
+                }
+
+                UploadBytes(rig.model, model);
+                g_event(steady(3, 1, motion, 0.2f, 0, nullptr, 3, n == 0 ? 1u : 0u, (uint32_t) full, s[0], s[1], 0.6f));
+                Run(rig.Cmd(3, 3));
+            }
+
+            const Bytes result = ReadBytes(rig.result);
+            double sum = 0.0;
+
+            for (uint32_t y = 8; y < 40; ++y)
+                for (uint32_t x = 8; x < 56; ++x)
+                    sum += abs((int) result.at(x, y)[0] - (base + ((((x + y) & 1u) != 0) ? 10 : -10)));
+
+            off[full] = sum / (32.0 * 48.0);
+        }
+
+        CHECK(off[0] > 7.0, "test setup: kept at the model's size the frame's own pattern should be lost (off by %.1f)", off[0]);
+        CHECK(off[1] < 4.0, "kept at the frame's size with the raster shifted, the frame's pattern is off by %.1f levels (at the model's size: %.1f)", off[1], off[0]);
+    }
+
+    // And kept at the frame's size, what a moving thing leaves behind is let go as well: the bright
+    // block again, with no motion vectors, each pixel keeping to its own look as much as it can.
+    {
+        Image vectors(32, 24);
+        UploadHalf(motion, vectors);
+        static const float kShift[4][2] = { { -0.5f, -0.5f }, { 0.5f, 0.5f }, { 0.5f, -0.5f }, { -0.5f, 0.5f } };
+        Bytes plain(64, 48), kept(64, 48);
+
+        for (int with = 0; with < 2; ++with)
+        {
+            for (int n = 0; n < 6; ++n)
+            {
+                Image scene(64, 48);
+
+                for (uint32_t y = 0; y < 48; ++y)
+                {
+                    for (uint32_t x = 0; x < 64; ++x)
+                    {
+                        float* p = scene.at(x, y);
+                        p[0] = p[1] = p[2] = (x >= 12u + 4u * n && x < 28u + 4u * n) ? 0.5f : 0.1f;
+                        p[3] = 1.0f;
+                    }
+                }
+
+                UploadHalf(rig.frame, scene);
+                Run(rig.Cmd(2, 3));
+                Bytes model = ReadBytes(rig.proxy);
+
+                for (uint32_t y = 0; y < 24; ++y)
+                    for (uint32_t x = 6u + 2u * n; x < 14u + 2u * n; ++x)
+                        model.at(x, y)[0] = (uint8_t) std::min(255, model.at(x, y)[0] + 30);
+
+                UploadBytes(rig.model, model);
+
+                if (with != 0)
+                    g_event(steady(3, 1, motion, 0.2f, 0, nullptr, 2, n == 0 ? 1u : 0u, 1, 0.0f, 0.0f, 1.0f));
+
+                Run(rig.Cmd(3, 3));
+            }
+
+            (with != 0 ? kept : plain) = ReadBytes(rig.result);
+        }
+
+        int trail = 0;
+
+        for (uint32_t y = 8; y < 40; ++y)
+            for (uint32_t x = 0; x < 64; ++x)
+                trail = std::max(trail, abs((int) kept.at(x, y)[0] - (int) plain.at(x, y)[0]));
+
+        CHECK(trail <= 4, "kept at the frame's size, the edit trails a moving thing by %d levels", trail);
+        UploadHalf(rig.frame, flat);
+        Run(rig.Cmd(2, 3));
+    }
+
+    uint32_t runs = 0, fresh = 0, failed = 0;
+    status(&runs, &fresh, &failed);
+    CHECK(runs == 12 + 8 + 5 + 32 + 6 && fresh == 7 && failed == 0, "counted: %u kept, %u begun anew, %u failed", runs, fresh, failed);
+
+    motion->Release();
+    Run(rig.Cmd(4, 3));
+    rig.Free();
+}
+
 static void TestCubeScale()
 {
     printf("[cube scaling]\n");
@@ -1935,6 +2487,191 @@ static Image SharpenReference(const Image& src, uint32_t eyes, float strength, b
     }
 
     return out;
+}
+
+// The scene's depth laid into a bound depth target: only inside the viewport in force, from the
+// named part of the texture, turned over when asked, pushed back by the slack, and with neither the
+// colour target nor what is bound disturbed.
+static std::vector<float> ReadDepth(ID3D11Texture2D* t)
+{
+    D3D11_TEXTURE2D_DESC d {};
+    t->GetDesc(&d);
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D* staging = nullptr;
+    g_dev->CreateTexture2D(&sd, nullptr, &staging);
+    g_ctx->CopyResource(staging, t);
+
+    std::vector<float> out((size_t) d.Width * d.Height);
+    D3D11_MAPPED_SUBRESOURCE m {};
+
+    if (SUCCEEDED(g_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m)))
+    {
+        for (uint32_t y = 0; y < d.Height; ++y)
+            memcpy(&out[(size_t) y * d.Width], (const uint8_t*) m.pData + (size_t) y * m.RowPitch, d.Width * 4);
+
+        g_ctx->Unmap(staging, 0);
+    }
+
+    staging->Release();
+    return out;
+}
+
+static void TestDepthFill(HMODULE dll)
+{
+    printf("[the scene's depth under what is drawn after the frame]\n");
+
+    typedef int (*PushFillFn)(void*, float, float, uint32_t, float, uint32_t);
+    typedef void (*FillStatusFn)(uint32_t*, uint32_t*, uint32_t*);
+    PushFillFn push = (PushFillFn) GetProcAddress(dll, "vws_push_depth_fill");
+    FillStatusFn status = (FillStatusFn) GetProcAddress(dll, "vws_depth_fill_status");
+    CHECK(push != nullptr && status != nullptr, "the depth fill is exported");
+
+    if (push == nullptr || status == nullptr)
+        return;
+
+    // The scene's depth, double-wide and at half the target's size: the left eye 0.2 over 0.6 (top
+    // rows, bottom rows), the right eye 0.8 everywhere.
+    const uint32_t sw = 16, sh = 8, tw = 32, th = 16;
+    std::vector<float> scene((size_t) sw * sh);
+
+    for (uint32_t y = 0; y < sh; ++y)
+    {
+        for (uint32_t x = 0; x < sw; ++x)
+            scene[(size_t) y * sw + x] = x >= sw / 2 ? 0.8f : (y < sh / 2 ? 0.2f : 0.6f);
+    }
+
+    ID3D11Texture2D* source = MakeTexture(sw, sh, DXGI_FORMAT_R32_FLOAT, kRT);
+    g_ctx->UpdateSubresource(source, 0, nullptr, scene.data(), sw * 4, 0);
+
+    ID3D11Texture2D* colour = MakeTexture(tw, th, DXGI_FORMAT_R8G8B8A8_UNORM, kRT);
+    ID3D11Texture2D* depth = MakeTexture(tw, th, DXGI_FORMAT_R32_TYPELESS, D3D11_BIND_DEPTH_STENCIL);
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11DepthStencilView* dsv = nullptr;
+    g_dev->CreateRenderTargetView(colour, nullptr, &rtv);
+    D3D11_DEPTH_STENCIL_VIEW_DESC dd {};
+    dd.Format = DXGI_FORMAT_D32_FLOAT;
+    dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    g_dev->CreateDepthStencilView(depth, &dd, &dsv);
+    CHECK(rtv != nullptr && dsv != nullptr, "test setup: the targets");
+
+    if (rtv == nullptr || dsv == nullptr)
+        return;
+
+    const float grey[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
+    g_ctx->ClearRenderTargetView(rtv, grey);
+    g_ctx->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 0.0f, 0);
+    g_ctx->OMSetRenderTargets(1, &rtv, dsv);
+
+    uint32_t done0 = 0, none0 = 0, failed0 = 0;
+    status(&done0, &none0, &failed0);
+
+    // The right eye, into the right half of the target only, pushed back by a tenth.
+    D3D11_VIEWPORT vp {};
+    vp.TopLeftX = (float) (tw / 2);
+    vp.Width = (float) (tw / 2);
+    vp.Height = (float) th;
+    vp.MaxDepth = 1.0f;
+    g_ctx->RSSetViewports(1, &vp);
+    g_event(push(source, 0.5f, 0.5f, 0, 0.1f, 1));
+
+    {
+        std::vector<float> got = ReadDepth(depth);
+        float worstIn = 0.0f, worstOut = 0.0f;
+
+        for (uint32_t y = 0; y < th; ++y)
+        {
+            for (uint32_t x = 0; x < tw; ++x)
+            {
+                const float v = got[(size_t) y * tw + x];
+
+                if (x >= tw / 2)
+                    worstIn = std::max(worstIn, fabsf(v - 0.72f));
+                else
+                    worstOut = std::max(worstOut, fabsf(v));
+            }
+        }
+
+        CHECK(worstIn < 1e-5f, "the right eye's depth, pushed back by a tenth, is off by %g", worstIn);
+        CHECK(worstOut == 0.0f, "depth outside the viewport changed by %g", worstOut);
+    }
+
+    // The left eye into the left half: as it lies, then turned over.
+    vp.TopLeftX = 0.0f;
+    g_ctx->RSSetViewports(1, &vp);
+    g_event(push(source, 0.0f, 0.5f, 0, 0.0f, 1));
+
+    {
+        std::vector<float> got = ReadDepth(depth);
+        CHECK(fabsf(got[(size_t) 1 * tw + 4] - 0.2f) < 1e-5f && fabsf(got[(size_t) (th - 2) * tw + 4] - 0.6f) < 1e-5f,
+              "as it lies: top %g (0.2), bottom %g (0.6)", got[(size_t) 1 * tw + 4], got[(size_t) (th - 2) * tw + 4]);
+        CHECK(fabsf(got[(size_t) 1 * tw + tw / 2 - 1] - 0.2f) < 1e-5f, "the right eye bled into the left at the seam: %g", got[(size_t) 1 * tw + tw / 2 - 1]);
+        CHECK(fabsf(got[(size_t) 1 * tw + tw - 4] - 0.72f) < 1e-5f, "the other half was written over: %g", got[(size_t) 1 * tw + tw - 4]);
+    }
+
+    g_event(push(source, 0.0f, 0.5f, 1, 0.0f, 1));
+
+    {
+        std::vector<float> got = ReadDepth(depth);
+        CHECK(fabsf(got[(size_t) 1 * tw + 4] - 0.6f) < 1e-5f && fabsf(got[(size_t) (th - 2) * tw + 4] - 0.2f) < 1e-5f,
+              "turned over: top %g (0.6), bottom %g (0.2)", got[(size_t) 1 * tw + 4], got[(size_t) (th - 2) * tw + 4]);
+    }
+
+    // Nothing else moved: the colour, and what was bound.
+    {
+        ID3D11Texture2D* staging = nullptr;
+        D3D11_TEXTURE2D_DESC sd {};
+        colour->GetDesc(&sd);
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.BindFlags = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        g_dev->CreateTexture2D(&sd, nullptr, &staging);
+        g_ctx->CopyResource(staging, colour);
+        D3D11_MAPPED_SUBRESOURCE m {};
+        int changed = 0;
+
+        if (SUCCEEDED(g_ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m)))
+        {
+            for (uint32_t y = 0; y < th; ++y)
+            {
+                const uint8_t* row = (const uint8_t*) m.pData + (size_t) y * m.RowPitch;
+
+                for (uint32_t x = 0; x < tw * 4; ++x)
+                    changed += abs((int) row[x] - 128) > 1 ? 1 : 0;
+            }
+
+            g_ctx->Unmap(staging, 0);
+        }
+
+        staging->Release();
+        CHECK(changed == 0, "the colour target changed in %d places", changed);
+
+        ID3D11RenderTargetView* gotRtv = nullptr;
+        ID3D11DepthStencilView* gotDsv = nullptr;
+        g_ctx->OMGetRenderTargets(1, &gotRtv, &gotDsv);
+        CHECK(gotRtv == rtv && gotDsv == dsv, "the targets are not as they were bound");
+        if (gotRtv) gotRtv->Release();
+        if (gotDsv) gotDsv->Release();
+    }
+
+    uint32_t done = 0, none = 0, failed = 0;
+    status(&done, &none, &failed);
+    CHECK(done - done0 == 3 && none == none0 && failed == failed0, "counted: %u done, %u without a target, %u failed", done - done0, none - none0, failed - failed0);
+
+    // With no depth target bound there is nothing to fill, and it says so.
+    g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+    g_event(push(source, 0.0f, 1.0f, 0, 0.0f, 1));
+    status(&done, &none, &failed);
+    CHECK(none - none0 == 1, "no depth target: counted %u", none - none0);
+
+    g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    rtv->Release();
+    dsv->Release();
+    colour->Release();
+    depth->Release();
+    source->Release();
 }
 
 static void TestSharpen()
@@ -3398,7 +4135,13 @@ int wmain(int argc, wchar_t** argv)
     Drain(true);
     TestEditTransfer();
     TestCubeScale();
+    TestFollow(dll);
+    Drain(true);
+    TestSteady(dll);
+    Drain(true);
     TestSharpen();
+    TestDepthFill(dll);
+    Drain(true);
     TestPassthrough(dll);
     TestOverlay(dll);
     TestHands(dll);

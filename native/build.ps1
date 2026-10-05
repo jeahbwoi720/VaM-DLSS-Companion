@@ -23,6 +23,9 @@ $shaders = @(
     @{ Entry = 'PSSharpen'; Profile = 'ps_5_0'; Name = 'g_vwsPsSharpen'; File = 'vws_ps_sharpen.h' },
     @{ Entry = 'PSPassthrough'; Profile = 'ps_5_0'; Name = 'g_vwsPsPass'; File = 'vws_ps_pass.h' },
     @{ Entry = 'PSMatte'; Profile = 'ps_5_0'; Name = 'g_vwsPsMatte'; File = 'vws_ps_matte.h' },
+    @{ Entry = 'PSDepthFill'; Profile = 'ps_5_0'; Name = 'g_vwsPsDepthFill'; File = 'vws_ps_depthfill.h' },
+    @{ Entry = 'PSSteady'; Profile = 'ps_5_0'; Name = 'g_vwsPsSteady'; File = 'vws_ps_steady.h' },
+    @{ Entry = 'PSGather'; Profile = 'ps_5_0'; Name = 'g_vwsPsGather'; File = 'vws_ps_gather.h' },
     @{ Entry = 'PSOverlay'; Profile = 'ps_5_0'; Name = 'g_vwsPsOverlay'; File = 'vws_ps_overlay.h' },
     @{ Entry = 'VSOverlay'; Profile = 'vs_5_0'; Name = 'g_vwsVsOverlay'; File = 'vws_vs_overlay.h' }
 )
@@ -54,5 +57,16 @@ if (Test-Path (Join-Path $here 'vws_test.cpp')) {
 Copy-Item (Join-Path $deps 'onnxruntime.dll') (Join-Path $out 'onnxruntime.dll') -Force
 Copy-Item (Join-Path $deps 'palm.onnx') (Join-Path $out 'hand-palm.onnx') -Force
 Copy-Item (Join-Path $deps 'handpose.onnx') (Join-Path $out 'hand-points.onnx') -Force
+
+# The full-size landmark model, when it has been put in deps (converted from MediaPipe's
+# hand_landmark_full.tflite; fetch-deps.ps1 does not bring it): [Hands] FullModel uses it.
+$fullModel = Join-Path $deps 'handpose-full.onnx'
+if (Test-Path $fullModel) { Copy-Item $fullModel (Join-Path $out 'hand-points-full.onnx') -Force }
+
+# Mercury's keypoint network (Monado's hand tracking), likewise when it has been put in deps
+# (grayscale_keypoint_jan18.onnx from Monado's hand-tracking-models, as hand-mercury.onnx):
+# [Hands] Mercury follows a hand with it.
+$mercuryModel = Join-Path $deps 'hand-mercury.onnx'
+if (Test-Path $mercuryModel) { Copy-Item $mercuryModel (Join-Path $out 'hand-mercury.onnx') -Force }
 
 Get-ChildItem $out -Include *.dll, *.exe -Recurse | Select-Object Name, Length, LastWriteTime

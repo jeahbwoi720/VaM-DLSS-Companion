@@ -41,6 +41,7 @@ $vamRefs = @(
     (Join-Path $managed 'UnityEngine.ImageConversionModule.dll'),
     (Join-Path $managed 'UnityEngine.VRModule.dll'),
     (Join-Path $managed 'UnityEngine.UI.dll'),
+    (Join-Path $managed 'UnityEngine.UIModule.dll'),
     (Join-Path $managed 'Assembly-CSharp.dll')
 )
 $refs = $vamRefs + @(
@@ -48,7 +49,7 @@ $refs = $vamRefs + @(
     (Join-Path $core '0Harmony.dll'),
     $ModDll
 )
-$sources = @((Join-Path $here 'WorkScale.cs'), (Join-Path $here 'ControlPanel.cs'), (Join-Path $here 'HeadsetUi.cs'), (Join-Path $here 'CameraProbe.cs'), (Join-Path $here 'Passthrough.cs'), (Join-Path $here 'Hands.cs'), (Join-Path $here 'HandDrive.cs'), (Join-Path $here 'HandUi.cs'), (Join-Path $here 'Foveation.cs'), (Join-Path $here 'Presentation.cs'))
+$sources = @((Join-Path $here 'WorkScale.cs'), (Join-Path $here 'ControlPanel.cs'), (Join-Path $here 'HeadsetUi.cs'), (Join-Path $here 'CameraProbe.cs'), (Join-Path $here 'Passthrough.cs'), (Join-Path $here 'Hands.cs'), (Join-Path $here 'HandDrive.cs'), (Join-Path $here 'HandUi.cs'), (Join-Path $here 'Foveation.cs'), (Join-Path $here 'Presentation.cs'), (Join-Path $here 'SceneUi.cs'), (Join-Path $here 'EyeSize.cs'))
 $defines = @()
 
 if ($SelfTest) {

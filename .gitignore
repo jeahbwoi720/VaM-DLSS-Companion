@@ -13,6 +13,9 @@ native/vws_ps_guide.h
 native/vws_ps_sharpen.h
 native/vws_ps_pass.h
 native/vws_ps_matte.h
+native/vws_ps_depthfill.h
+native/vws_ps_steady.h
+native/vws_ps_gather.h
 native/vws_ps_overlay.h
 native/vws_vs_overlay.h
 

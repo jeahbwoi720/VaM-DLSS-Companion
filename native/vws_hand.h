@@ -74,6 +74,16 @@ enum Setting : int
     kSetExposureNear = 16, // the narrow picture the points are found in: 0 brought up by the whole frame's
                         // mean, 1 by the mean of its own middle, where the hand is
     kSetBrightLow = 17, // the palm finder's second, gentler strength
+    kSetDepthRight = 18, // 1: a hand the network has read the wrong way round in depth is put right (see Fuse). Tried on a
+                        // recording and no better: the two lenses' depth is as coarse as a hand is deep. Off.
+    kSetDoubt = 19,     // looks in a row a hand has to be found turned right over before that is believed
+    kSetTurnMost = 20,  // ...and how far it may turn between two looks without being doubted, radians
+    kSetMercury = 21,   // 1: a hand once found is followed with Mercury's keypoint network, where that is loaded
+    kSetMercurySteady = 23, // ...and how far the hand may move in its picture, as a fraction of the picture's
+                        // half-width, before the picture is aimed anew (see MercuryView); 0 aims it every look
+    kSetMercuryLast = 22, // ...which is 1: told where the joints were expected, as its makers run it. Off: told so,
+                        // it went on "seeing" a hand in a cloth it had been pointed at, and in the place a
+                        // hand had left; left to look for itself it let both go (a recording, 2026-10-05)
     kSettings = 24,
 };
 
@@ -95,6 +105,11 @@ inline void Defaults(float* s)
     s[kSetExposure] = 1.0f;
     s[kSetExposureNear] = 1.0f;
     s[kSetBrightLow] = 0.3f;
+    s[kSetDoubt] = 12.0f;
+    s[kSetTurnMost] = 1.4f;
+    s[kSetMercury] = 1.0f;
+    s[kSetMercuryLast] = 0.0f;
+    s[kSetMercurySteady] = 0.12f;
 }
 
 // What is said of each hand: 4 + 63 floats.
@@ -258,6 +273,10 @@ struct Networks
     OrtEnv* env = nullptr;
     OrtSession* palm = nullptr;
     OrtSession* hand = nullptr;
+    bool wantFull = false; // the bigger landmark model, if its file is there (asked before Load)
+    bool full = false;     // and whether that is the one loaded
+    bool wantMercury = false;      // Mercury's keypoint network, if its file is there (asked before Load)
+    OrtSession* mercury = nullptr; // ...loaded
     OrtMemoryInfo* memory = nullptr;
     char error[256] = {};
 
@@ -273,7 +292,10 @@ struct Networks
         return false;
     }
 
-    // `folder` ends in a backslash and holds onnxruntime.dll and the two models.
+    // `folder` ends in a backslash and holds onnxruntime.dll and the two models; it may hold a
+    // third, hand-points-full.onnx: MediaPipe's full-size landmark model, which takes the same
+    // picture and gives the same answers as the small one that always ships, at about twice the
+    // time a look.
     bool Load(const wchar_t* folder)
     {
         if (hand != nullptr)
@@ -316,10 +338,40 @@ struct Networks
             ok = Ok(api->CreateSession(env, path, options, &palm), "hand-palm.onnx");
         }
 
-        if (ok)
+        full = false;
+
+        if (ok && wantFull)
+        {
+            swprintf(path, MAX_PATH * 2, L"%shand-points-full.onnx", folder);
+
+            if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
+            {
+                full = Ok(api->CreateSession(env, path, options, &hand), "hand-points-full.onnx");
+
+                if (!full)
+                    hand = nullptr;
+            }
+        }
+
+        if (ok && !full)
         {
             swprintf(path, MAX_PATH * 2, L"%shand-points.onnx", folder);
             ok = Ok(api->CreateSession(env, path, options, &hand), "hand-points.onnx");
+        }
+
+        // Mercury's keypoint network (Monado's hand tracking): made for a headset's own cameras --
+        // grey, wide, the hand often a dark shape -- where the one above was made for photographs.
+        // It follows a hand once that one has found it (see Tracker::PointsMercury). Not having
+        // it, or its not loading, is no failure.
+        if (ok && wantMercury)
+        {
+            swprintf(path, MAX_PATH * 2, L"%shand-mercury.onnx", folder);
+
+            if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES && !Ok(api->CreateSession(env, path, options, &mercury), "hand-mercury.onnx"))
+            {
+                mercury = nullptr;
+                error[0] = 0;
+            }
         }
 
         if (options != nullptr)
@@ -331,10 +383,73 @@ struct Networks
         return ok;
     }
 
+    // One run of Mercury's network: a 128x128 grey picture, where the 21 joints were expected in
+    // it (42 numbers, -1..1) and whether that is to be used; its four answers copied out (21
+    // planes of 22x22, 21 rows of 22, 8 numbers, 10 numbers). May be called from several threads.
+    bool RunMercury(float* picture, float* expected, bool useExpected, float* planes, float* depths, float* extras, float* curls)
+    {
+        static const char* const inNames[3] = { "inputImg", "lastKeypoints", "useLastKeypoints" };
+        static const char* const outNames[4] = { "heatmap_xy", "heatmap_depth", "scalar_extras", "curls" };
+        const int64_t shapePicture[4] = { 1, 1, 128, 128 }, shapeExpected[2] = { 1, 42 }, shapeUse[1] = { 1 };
+        const size_t counts[4] = { 21 * 22 * 22, 21 * 22, 8, 10 };
+        float* const out[4] = { planes, depths, extras, curls };
+        float use = useExpected ? 1.0f : 0.0f;
+        OrtValue* in[3] = {};
+        OrtValue* got[4] = {};
+
+        OrtStatus* status = api->CreateTensorWithDataAsOrtValue(memory, picture, sizeof(float) * 128 * 128, shapePicture, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in[0]);
+
+        if (status == nullptr)
+            status = api->CreateTensorWithDataAsOrtValue(memory, expected, sizeof(float) * 42, shapeExpected, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in[1]);
+
+        if (status == nullptr)
+            status = api->CreateTensorWithDataAsOrtValue(memory, &use, sizeof(float), shapeUse, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in[2]);
+
+        if (status == nullptr)
+            status = api->Run(mercury, nullptr, inNames, (const OrtValue* const*) in, 3, outNames, 4, got);
+
+        bool ok = status == nullptr;
+
+        if (status != nullptr)
+            api->ReleaseStatus(status);
+
+        for (int i = 0; i < 4; ++i)
+        {
+            void* data = nullptr;
+
+            if (ok && got[i] != nullptr)
+            {
+                status = api->GetTensorMutableData(got[i], &data);
+
+                if (status != nullptr)
+                {
+                    api->ReleaseStatus(status);
+                    ok = false;
+                }
+                else
+                {
+                    memcpy(out[i], data, sizeof(float) * counts[i]);
+                }
+            }
+
+            if (got[i] != nullptr)
+                api->ReleaseValue(got[i]);
+        }
+
+        for (OrtValue* value : in)
+            if (value != nullptr)
+                api->ReleaseValue(value);
+
+        return ok;
+    }
+
     void Free()
     {
         if (api != nullptr)
         {
+            if (mercury != nullptr)
+                api->ReleaseSession(mercury);
+
             if (hand != nullptr)
                 api->ReleaseSession(hand);
 
@@ -420,6 +535,8 @@ struct Seen
     float at[kPoints][3];   // the same in the narrow picture: pixels, and the network's nearer / further in the same measure
     float world[kPoints][3]; // the network's other answer: the hand in three dimensions, metres, as the picture is turned (x right, y down, z away)
     View view;              // that picture
+    bool curled;            // Mercury's: `curl` holds something
+    float curl[5], curlSure[5]; // ...how far each finger is bent in all (thumb first; radians, more bent = more negative), and how sure it is of each
 };
 
 struct Palm
@@ -458,6 +575,13 @@ struct Tracker
     {
         bool follow[kHands];
         View followView[kHands];
+        // ...and for Mercury: its own picture of the hand (reach = the picture's half-width as a
+        // stereographic radius), whether the hand is the right one (shown to it mirrored), how far
+        // away and how long the hand is taken to be, and where its joints are expected in the picture
+        View ballView[kHands];
+        bool ballKept[kHands];    // ballView is the picture the hand was last looked for in
+        bool ballMirror[kHands];
+        float ballFar[kHands], ballLength[kHands], ballExpected[kHands][42];
         Seen seen[kHands];
         bool look;
         bool lookAt;              // ...at `lookView`, where a hand was lost, not at the next of the usual pictures
@@ -485,6 +609,14 @@ struct Tracker
         bool left;                // which hand it is: settled when it is begun, and kept
         int unlike;               // frames in a row the network has plainly said the other
         float rightness, score, gap;
+        bool proven;              // Mercury has found it at least once (or Mercury is not in use): it is shown
+        bool curled;              // `curl` holds something
+        float curl[5];            // Mercury's word on how far each finger is bent, steadied (see Seen)
+        int unsure;               // looks in a row that Mercury has not found it
+        bool turned[2];           // each lens's reading of it is the wrong way round in depth (see Fuse)
+        bool depthKnown;          // the two lenses have said which way round it is, at least once
+        bool depthLeft;           // ...and for which hand the network's depth is then the right way round
+        float note[6];            // for looking into it: each lens's depth agreement and spread, and its rightness
         float palm;               // the lengths of kPalmBones added up, as the two lenses measure them on this hand
         bool framed;              // `frame` holds something
         int doubted;              // frames in a row the palm has been found turned too far to believe
@@ -721,6 +853,307 @@ struct Tracker
             view.Sight(points[i * 3], points[i * 3 + 1], kLmSize, seen.dir[i]);
     }
 
+    bool Mercury() const
+    {
+        return nets != nullptr && nets->mercury != nullptr && set[kSetMercury] > 0.5f;
+    }
+
+    // A view with the lens's own uprightness, turned the shortest way to look along `aim`: how
+    // Mercury's pictures are aimed (its makers' "twist" of nothing).
+    void LookAlong(int l, const float* aim, View& view) const
+    {
+        const float* m = turn[l];
+        const float axes[3][3] = { { m[0], m[3], m[6] }, { m[1], m[4], m[7] }, { m[2], m[5], m[8] } }; // the lens's right, up, back
+        const float forward[3] = { -axes[2][0], -axes[2][1], -axes[2][2] };
+        float v[3];
+        Cross(forward, aim, v);
+        const float c = Dot(forward, aim);
+        float* to[3] = { view.right, view.up, view.back };
+
+        for (int a = 0; a < 3; ++a)
+        {
+            float once[3], twice[3];
+            Cross(v, axes[a], once);
+            Cross(v, once, twice);
+
+            for (int j = 0; j < 3; ++j)
+                to[a][j] = c > -0.999f ? axes[a][j] + once[j] + twice[j] / (1.0f + c) : axes[a][j];
+
+            Unit(to[a]);
+        }
+    }
+
+    // Where a line of sight lies in a view's stereographic picture (forward at the middle).
+    static void Ball(const View& view, const float* d, float& x, float& y)
+    {
+        const float z = Dot(d, view.back);
+        const float under = 1.0f - z > 1e-4f ? 1.0f - z : 1e-4f;
+        x = Dot(d, view.right) / under;
+        y = Dot(d, view.up) / under;
+    }
+
+    static void FromBall(const View& view, float x, float y, float* d)
+    {
+        const float under = 1.0f + x * x + y * y;
+        const float in[3] = { 2.0f * x / under, 2.0f * y / under, (-1.0f + x * x + y * y) / under };
+
+        for (int j = 0; j < 3; ++j)
+            d[j] = view.right[j] * in[0] + view.up[j] * in[1] + view.back[j] * in[2];
+    }
+
+    // Mercury's picture of a hand, from where its points were (in the head's space): aimed at the
+    // middle of the joints as the lens sees them, 1.7 times as wide as they spread (and never
+    // narrower than a palm asks, for a fist) -- as Monado's make_projection_instructions has it.
+    //
+    // `kept`: `view` is the picture of the look before. It is kept as it is while the hand has
+    // not moved far in it: aimed anew every look, the picture follows the answer, the answer the
+    // picture, and a hand that is perfectly still wanders by millimetres (measured on still
+    // pictures: fingertips 3 mm at the median and 15 mm one time in ten, with nothing moving).
+    void MercuryView(const float points[kPoints][3], int l, bool mirror, View& view, bool kept, float* expected, float* distance, float* length) const
+    {
+        float d[kPoints][3], aim[3], at[kPoints][2];
+        const View before = view;
+
+        for (int i = 0; i < kPoints; ++i)
+        {
+            for (int j = 0; j < 3; ++j)
+                d[i][j] = points[i][j] - place[l][j];
+
+            if (i == 9)
+                *distance = sqrtf(Dot(d[i], d[i]));
+
+            Unit(d[i]);
+        }
+
+        const float span[3] = { points[9][0] - points[0][0], points[9][1] - points[0][1], points[9][2] - points[0][2] };
+        const float hand = sqrtf(Dot(span, span));
+        *length = hand < 0.07f ? 0.07f : (hand > 0.12f ? 0.12f : hand);
+        memcpy(aim, d[9], sizeof(aim));
+        float radius = 0.1f;
+
+        for (int pass = 0; pass < 5; ++pass)
+        {
+            LookAlong(l, aim, view);
+            float lo[2] = { 1e9f, 1e9f }, hi[2] = { -1e9f, -1e9f };
+
+            for (int i = 0; i < kPoints; ++i)
+            {
+                Ball(view, d[i], at[i][0], at[i][1]);
+
+                for (int k = 0; k < 2; ++k)
+                {
+                    lo[k] = at[i][k] < lo[k] ? at[i][k] : lo[k];
+                    hi[k] = at[i][k] > hi[k] ? at[i][k] : hi[k];
+                }
+            }
+
+            const float middle[2] = { (lo[0] + hi[0]) * 0.5f, (lo[1] + hi[1]) * 0.5f };
+            radius = middle[0] - lo[0] > middle[1] - lo[1] ? middle[0] - lo[0] : middle[1] - lo[1];
+
+            if (pass == 4 || middle[0] * middle[0] + middle[1] * middle[1] < 1e-8f)
+                break;
+
+            FromBall(view, middle[0], middle[1], aim);
+            Unit(aim);
+        }
+
+        const float a[2] = { at[0][0] - at[9][0], at[0][1] - at[9][1] }, b[2] = { at[5][0] - at[17][0], at[5][1] - at[17][1] };
+        const float along = sqrtf(a[0] * a[0] + a[1] * a[1]), across = sqrtf(b[0] * b[0] + b[1] * b[1]);
+        const float palm = (along > across ? along : across) * 0.5f * (2.2f / 1.65f) * 1.7f;
+        radius *= 1.7f;
+        radius = radius > palm ? radius : palm;
+        radius = radius < 0.02f ? 0.02f : radius;
+        view.reach = radius;
+
+        const float steady = set[kSetMercurySteady];
+
+        if (kept && steady > 0.0f && before.reach > 0.0f)
+        {
+            // where the new picture's middle lies in the old one, and how the two differ in width
+            const float forward[3] = { -view.back[0], -view.back[1], -view.back[2] };
+            float mx, my;
+            Ball(before, forward, mx, my);
+
+            if (mx * mx + my * my < steady * steady * before.reach * before.reach && fabsf(radius - before.reach) < steady * before.reach)
+            {
+                view = before;
+                radius = before.reach;
+
+                for (int i = 0; i < kPoints; ++i)
+                    Ball(view, d[i], at[i][0], at[i][1]);
+            }
+        }
+
+        for (int i = 0; i < kPoints; ++i)
+        {
+            expected[i * 2] = (mirror ? -1.0f : 1.0f) * at[i][0] / radius;
+            expected[i * 2 + 1] = -at[i][1] / radius;
+        }
+    }
+
+    // One lens's look at a hand that is being followed, by Mercury's network.
+    //
+    // The picture is the lens's, drawn out stereographically around the hand and brought to a
+    // set contrast; a right hand is shown mirrored (the network knows left hands). It answers
+    // with a 22x22 plane a joint -- where in the picture -- and a row of 22 -- how much nearer
+    // or further than the middle finger's knuckle, in hand lengths. From the two a whole hand
+    // is made in the picture's own space, as the other network's "world" points are, so that
+    // everything after this treats the two alike.
+    //
+    // How sure it is: the planes' peaks. On a recording they average 0.4 to 0.7 on a hand and
+    // under 0.25 on a cloth, a screen, or the empty place a hand has left -- which the network's
+    // own "this is a hand" number does not tell apart (it said 1.00 to the screen). So that
+    // average, doubled, is the score here.
+    void PointsMercury(int l, int which, Seen& seen)
+    {
+        Lens& my = lens[l];
+        const View& view = my.ballView[which];
+        const bool mirror = my.ballMirror[which];
+        const float radius = view.reach;
+        float* picture = my.picture;
+        seen.ok = false;
+        seen.score = 0.0f;
+        seen.curled = false;
+
+        // a picture coarser than the lens's own reads the half-size copy
+        const bool coarse = (8.0f * radius / 128.0f) * focal > 1.5f;
+        const uint8_t* src = coarse ? halved[l] : grey + l * lensW;
+        const int sw = coarse ? smallW : lensW, sh = coarse ? smallH : (int) h;
+        const size_t stride = coarse ? (size_t) smallW : (size_t) w;
+        const float scale = coarse ? 0.5f : 1.0f, shift = coarse ? -0.25f : 0.0f;
+        double sum = 0.0, squares = 0.0;
+
+        for (int y = 0; y < 128; ++y)
+        {
+            const float by = radius - 2.0f * radius * (float) y / 128.0f;
+
+            for (int x = 0; x < 128; ++x)
+            {
+                const float bx = (mirror ? 1.0f : -1.0f) * (radius - 2.0f * radius * (float) x / 128.0f);
+                float d[3], u, v, value = 0.0f;
+                FromBall(view, bx, by, d);
+
+                if (Pixel(l, d, u, v))
+                {
+                    const float fx = u * scale + shift, fy = v * scale + shift;
+
+                    if (fx >= 0.0f && fy >= 0.0f && fx <= (float) sw - 1.001f && fy <= (float) sh - 1.001f)
+                    {
+                        const int x0 = (int) fx, y0 = (int) fy;
+                        const float ax = fx - (float) x0, ay = fy - (float) y0;
+                        const uint8_t* p = src + (size_t) y0 * stride + x0;
+                        value = (((float) p[0] * (1.0f - ax) + (float) p[1] * ax) * (1.0f - ay) +
+                                 ((float) p[stride] * (1.0f - ax) + (float) p[stride + 1] * ax) * ay) / 255.0f;
+                    }
+                }
+
+                picture[y * 128 + x] = value;
+                sum += value;
+                squares += (double) value * value;
+            }
+        }
+
+        const double mean = sum / (128.0 * 128.0);
+        const double spread = sqrt(squares / (128.0 * 128.0) - mean * mean > 0.0 ? squares / (128.0 * 128.0) - mean * mean : 0.0);
+
+        if (spread < 1e-5)
+            return;
+
+        // (its makers': the spread to a quarter, then the mean to a half)
+        const float gain = (float) (0.25 / spread), lift = (float) (0.5 - mean * 0.25 / spread);
+
+        for (int i = 0; i < 128 * 128; ++i)
+            picture[i] = picture[i] * gain + lift;
+
+        float planes[21 * 22 * 22], depths[21 * 22], extras[8], curls[10];
+
+        if (!nets->RunMercury(picture, my.ballExpected[which], set[kSetMercuryLast] > 0.5f, planes, depths, extras, curls))
+            return;
+
+        float peaks = 0.0f, hand[kPoints][3];
+
+        for (int i = 0; i < kPoints; ++i)
+        {
+            const float* plane = planes + i * 22 * 22;
+            int best = 0;
+
+            for (int k = 1; k < 22 * 22; ++k)
+                best = plane[k] > plane[best] ? k : best;
+
+            const int row = best / 22, col = best % 22;
+            const int roomX = col < 22 - col - 1 ? col : 22 - col - 1, roomY = row < 22 - row - 1 ? row : 22 - row - 1;
+            const int kx = roomX < 0 ? 0 : (roomX > 10 ? 10 : roomX), ky = roomY < 0 ? 0 : (roomY > 10 ? 10 : roomY);
+            float total = 0.0f, tx = 0.0f, ty = 0.0f;
+
+            for (int y = row - ky; y <= row + ky; ++y)
+            {
+                for (int x = col - kx; x <= col + kx; ++x)
+                {
+                    const float value = plane[y * 22 + x];
+                    total += value;
+                    tx += value * ((float) x + 0.5f);
+                    ty += value * ((float) y + 0.5f);
+                }
+            }
+
+            const float px = (total != 0.0f ? tx / total : (float) col) / 22.0f * 128.0f, py = (total != 0.0f ? ty / total : (float) row) / 22.0f * 128.0f;
+            peaks += plane[best];
+
+            // nearer or further than the middle finger's knuckle, in hand lengths
+            const float* line = depths + i * 22;
+            float weight = 0.0f, where = 0.0f;
+
+            for (int k = 0; k < 22; ++k)
+            {
+                const float value = line[k] < 0.0f ? 0.0f : (line[k] > 1.0f ? 1.0f : line[k]);
+                weight += value;
+                where += value * (float) k;
+            }
+
+            const float deeper = weight > 1e-5f ? ((where / weight + 0.5f) / 22.0f - 0.5f) * 3.0f : 0.0f;
+
+            // back out of the picture: the line of sight, and the joint that far along it
+            const float bx = (mirror ? 1.0f : -1.0f) * (radius - 2.0f * radius * px / 128.0f), by = radius - 2.0f * radius * py / 128.0f;
+            FromBall(view, bx, by, seen.dir[i]);
+            Unit(seen.dir[i]);
+            const float away = my.ballFar[which] + deeper * my.ballLength[which];
+
+            for (int j = 0; j < 3; ++j)
+                hand[i][j] = seen.dir[i][j] * away;
+
+            seen.at[i][0] = px;
+            seen.at[i][1] = py;
+            seen.at[i][2] = deeper;
+        }
+
+        // the hand in the picture's own space: x right, y down, z away, as the other network gives it
+        for (int i = 0; i < kPoints; ++i)
+        {
+            const float q[3] = { hand[i][0] - hand[9][0], hand[i][1] - hand[9][1], hand[i][2] - hand[9][2] };
+            seen.world[i][0] = Dot(q, view.right);
+            seen.world[i][1] = -Dot(q, view.up);
+            seen.world[i][2] = -Dot(q, view.back);
+        }
+
+        // Its other answer about the fingers: how far each is bent, as one number, with how much
+        // that number may be off. Where a finger is folded into a fist its joints' places in the
+        // picture are guesses, and this is what tells a fist from a thumb held up.
+        for (int f = 0; f < 5; ++f)
+        {
+            seen.curl[f] = curls[f];
+            seen.curlSure[f] = 1.0f / (fabsf(curls[5 + f]) + 0.01f);
+        }
+
+        seen.curled = true;
+
+        const float sure = peaks / (float) kPoints * 2.0f;
+        seen.score = sure > 1.0f ? 1.0f : sure;
+        // (which hand it is was settled when it was begun; this network is told, it does not say)
+        seen.rightness = (mirror != (set[kSetSwap] > 0.5f)) ? 1.0f : 0.0f;
+        seen.ok = seen.score >= set[kSetHandMin];
+        seen.view = view;
+    }
+
     static float Overlap(const float* a, const float* b)
     {
         const float ow = (a[2] < b[2] ? a[2] : b[2]) - (a[0] > b[0] ? a[0] : b[0]);
@@ -851,13 +1284,20 @@ struct Tracker
     // large (the lengths of kPalmBones added up -- one lens cannot tell a near small hand from a
     // far large one), and moved to where its joints lie nearest the picture's lines of sight.
     // False when that is no place for a hand.
-    bool Alone(int l, const Seen& seen, float palm, float points[kPoints][3]) const
+    //
+    // `turned`: the network has this hand the wrong way round in depth, and it is put right. A
+    // hand that is a dark shape against a window looks the same from the palm's side as the other
+    // hand does from the back, and the network takes one for the other: every joint is then where
+    // it should be across the picture and on the wrong side of the hand in depth -- a palm seen
+    // edge-on comes out turned right over.
+    bool Alone(int l, const Seen& seen, float palm, float points[kPoints][3], bool turned = false) const
     {
         float shape[kPoints][3];
+        const float depth = turned ? -1.0f : 1.0f;
 
         for (int i = 0; i < kPoints; ++i)
             for (int j = 0; j < 3; ++j)
-                shape[i][j] = seen.view.right[j] * seen.world[i][0] - seen.view.up[j] * seen.world[i][1] - seen.view.back[j] * seen.world[i][2];
+                shape[i][j] = seen.view.right[j] * seen.world[i][0] - seen.view.up[j] * seen.world[i][1] - seen.view.back[j] * seen.world[i][2] * depth;
 
         const float own = PalmSize(shape);
 
@@ -975,7 +1415,9 @@ struct Tracker
             {
                 my.seen[i].ok = false;
 
-                if (my.follow[i])
+                if (my.follow[i] && Mercury())
+                    PointsMercury(l, i, my.seen[i]);
+                else if (my.follow[i])
                     Points(l, my.followView[i], my.seen[i]);
             }
 
@@ -1069,14 +1511,18 @@ struct Tracker
     // is plainly surer), or -1. `palm`: the hand's size as Alone takes it. Gives the average
     // distance the agreeing lines pass at, the ratio found, and the lens used. False when fewer
     // than half the points' lines agree or the result is no place for a hand.
-    bool Fuse(const Seen& a, const Seen& b, int prefer, float palm, float points[kPoints][3], float* gap, float* ratio, int* lensUsed) const
+    //
+    // The crossings say one thing more: which way round the hand is in depth. A lens's own hand
+    // can be the wrong way round (see Alone); where its joints lie nearer and further by the
+    // crossings the opposite of how the network has them, it is, and is put right. `turned`: what
+    // was last found of each lens's hand, kept while the hand is too flat-on for the crossings to
+    // tell (null: nothing is known). `note`: each lens's agreement (-1..1) and how far the
+    // crossings spread in depth, metres, or null.
+    bool Fuse(const Seen& a, const Seen& b, int prefer, float palm, float points[kPoints][3], float* gap, float* ratio, int* lensUsed,
+              bool* turned = nullptr, float* note = nullptr) const
     {
         const Seen* seen[2] = { &a, &b };
         float alone[2][kPoints][3];
-
-        if (!Alone(0, a, palm, alone[0]) || !Alone(1, b, palm, alone[1]))
-            return false;
-
         float crossed[kPoints][3], apart[kPoints];
         bool agree[kPoints];
         int good = 0;
@@ -1094,6 +1540,65 @@ struct Tracker
         }
 
         if (good < kPoints / 2)
+            return false;
+
+        bool round[2] = { false, false };
+
+        for (int l = 0; l < 2; ++l)
+        {
+            float theirs[kPoints], mine[kPoints], meanTheirs = 0.0f, meanMine = 0.0f;
+
+            for (int i = 0; i < kPoints; ++i)
+            {
+                if (!agree[i])
+                    continue;
+
+                const float c[3] = { crossed[i][0] - place[l][0], crossed[i][1] - place[l][1], crossed[i][2] - place[l][2] };
+                theirs[i] = -Dot(c, seen[l]->view.back);
+                mine[i] = seen[l]->world[i][2];
+                meanTheirs += theirs[i];
+                meanMine += mine[i];
+            }
+
+            meanTheirs /= (float) good;
+            meanMine /= (float) good;
+            float tt = 0.0f, mm = 0.0f, tm = 0.0f;
+
+            for (int i = 0; i < kPoints; ++i)
+            {
+                if (!agree[i])
+                    continue;
+
+                tt += (theirs[i] - meanTheirs) * (theirs[i] - meanTheirs);
+                mm += (mine[i] - meanMine) * (mine[i] - meanMine);
+                tm += (theirs[i] - meanTheirs) * (mine[i] - meanMine);
+            }
+
+            const float agreement = tt > 1e-10f && mm > 1e-10f ? tm / sqrtf(tt * mm) : 0.0f;
+            const float spread = sqrtf(tt / (float) good);
+            bool is = turned != nullptr ? turned[l] : false;
+
+            // (a hand flat-on to the lens is as deep one way round as the other: nothing to go by, and nothing to put right)
+            if (set[kSetDepthRight] <= 0.5f)
+                is = false;
+            else if (spread > 0.008f && agreement < -0.35f)
+                is = true;
+            else if (spread > 0.008f && agreement > 0.1f)
+                is = false;
+
+            round[l] = is;
+
+            if (turned != nullptr)
+                turned[l] = is;
+
+            if (note != nullptr)
+            {
+                note[l] = agreement;
+                note[2 + l] = spread;
+            }
+        }
+
+        if (!Alone(0, a, palm, alone[0], round[0]) || !Alone(1, b, palm, alone[1], round[1]))
             return false;
 
         float scales[2];
@@ -1280,8 +1785,8 @@ struct Tracker
     // A hand does not turn over between one frame and the next; the points sometimes do (a fist
     // from behind, or one lens alone, guessing which way the fingers go). A palm found turned
     // further than a hand turns in that time is not believed: the hand keeps the shape it had,
-    // carried to where the wrist is now, until the new turn has been found the same four frames
-    // running -- then it was real. `anew`: a hand begun or found again, believed as it is.
+    // carried to where the wrist is now, until the new turn has been found the same twelve
+    // frames running (kSetDoubt) -- then it was real. `anew`: a hand begun or found again, believed as it is.
     //
     // Fingers found folded back through the hand (further than a finger bends that way) are the
     // same mistake in one finger: they are put the same way round on the palm's side.
@@ -1298,10 +1803,12 @@ struct Tracker
 
         if (hd.framed && !anew && dt > 0.0f && set[kSetNoGate] < 0.5f)
         {
-            // a hundred and twenty degrees in a thirtieth of a second, more if the frames come
-            // slower: no hand turns so; a hand misread upside down does. (At fifty degrees it held
-            // back hands that were simply being opened and turned.)
-            const float most = 2.1f * (dt < 0.033f ? 1.0f : (dt > 0.046f ? 1.4f : dt / 0.033f));
+            // eighty degrees in a thirtieth of a second, more if the frames come slower: no hand
+            // turns so; a hand misread upside down does. (At fifty degrees it held back hands that
+            // were simply being opened and turned. It was a hundred and twenty, believed after four
+            // looks: on a recording of a hand dark against a window, read the wrong way round for
+            // half a dozen looks at a time, that let seven turns through where this lets four.)
+            const float most = (set[kSetTurnMost] > 0.1f ? set[kSetTurnMost] : 1.4f) * (dt < 0.033f ? 1.0f : (dt > 0.046f ? 1.4f : dt / 0.033f));
 
             if (Turned(hd.frame, frame) > most)
             {
@@ -1315,7 +1822,7 @@ struct Tracker
                     hd.doubted = 1;
                 }
 
-                sure = hd.doubted >= 4;
+                sure = hd.doubted >= (set[kSetDoubt] >= 1.0f ? (int) set[kSetDoubt] : 12);
             }
         }
 
@@ -1493,6 +2000,15 @@ struct Tracker
                 float dirs[kPalmPoints][3];
                 PalmDirs(was[i], l, dirs);
                 Aim(dirs, lens[l].followView[i]);
+
+                if (Mercury())
+                {
+                    // (a hand not found in the last look is looked for where its points say, not where the picture was)
+                    const bool kept = lens[l].ballKept[i] && hand[i].missed == 0 && lens[l].ballMirror[i] == !hand[i].left;
+                    lens[l].ballMirror[i] = !hand[i].left;
+                    MercuryView(was[i], l, !hand[i].left, lens[l].ballView[i], kept, lens[l].ballExpected[i], &lens[l].ballFar[i], &lens[l].ballLength[i]);
+                    lens[l].ballKept[i] = true;
+                }
             }
         }
 
@@ -1558,8 +2074,35 @@ struct Tracker
             float ratio = 1.0f;
             int used = 0;
 
-            if (a.ok && b.ok && Fuse(a, b, hd.lens, hd.palm, points, &gap, &ratio, &used))
+            hd.note[4] = a.ok ? a.rightness : -1.0f;
+            hd.note[5] = b.ok ? b.rightness : -1.0f;
+
+            // A lens's reading of the hand is one of two: this hand, or the other hand seen from
+            // its other side -- and it changes its mind. What the two lenses found is kept as "the
+            // depth is right when it is read as the left hand" (or the right), so that it holds
+            // for whichever reading comes next.
+            const bool swapped = set[kSetSwap] > 0.5f;
+
+            for (int l = 0; l < 2; ++l)
             {
+                const Seen& s = l == 0 ? a : b;
+
+                if (s.ok && hd.depthKnown && set[kSetDepthRight] > 0.5f)
+                    hd.turned[l] = ((s.rightness < 0.5f) != swapped) != hd.depthLeft;
+            }
+
+            if (a.ok && b.ok && Fuse(a, b, hd.lens, hd.palm, points, &gap, &ratio, &used, hd.turned, hd.note))
+            {
+                // (the surer lens's word on it)
+                const Seen& surer = a.score >= b.score ? a : b;
+                const int which = a.score >= b.score ? 0 : 1;
+
+                if (hd.note[2 + which] > 0.008f && fabsf(hd.note[which]) > 0.35f)
+                {
+                    hd.depthLeft = ((surer.rightness < 0.5f) != swapped) != hd.turned[which];
+                    hd.depthKnown = true;
+                }
+
                 found = true;
                 hd.oneLens = false;
                 hd.lens = used;
@@ -1585,7 +2128,7 @@ struct Tracker
 
                 const Seen& one = l == 0 ? a : b;
 
-                if (Alone(l, one, hd.palm, points))
+                if (Alone(l, one, hd.palm, points, hd.turned[l]))
                 {
                     found = true;
                     hd.oneLens = true;
@@ -1609,13 +2152,52 @@ struct Tracker
                 Place(hd, room, dt, passed && hd.settled > 6, false);
                 hd.settled = passed ? 0 : hd.settled + 1;
                 hd.missed = 0;
+                hd.proven = true;
+                hd.unsure = 0;
+
+                // the two lenses' word on the fingers' bend, each by how sure it is, and steadied
+                for (int f = 0; f < 5; ++f)
+                {
+                    float sum = 0.0f, weight = 0.0f;
+
+                    for (int l = 0; l < 2; ++l)
+                    {
+                        const Seen& s = l == 0 ? a : b;
+
+                        if (s.ok && s.curled)
+                        {
+                            sum += s.curl[f] * s.curlSure[f];
+                            weight += s.curlSure[f];
+                        }
+                    }
+
+                    if (weight > 0.0f)
+                    {
+                        const float value = sum / weight;
+                        hd.curl[f] = hd.curled ? hd.curl[f] + (value - hd.curl[f]) * 0.3f : value;
+                    }
+
+                    if (f == 4 && weight > 0.0f)
+                        hd.curled = true;
+                }
             }
-            else if (++hd.missed > (int) set[kSetHold])
+            else
             {
-                hd.live = false;
-                lostOne = true;
-                ++tally.lost;
-                --live;
+                // With Mercury following, the first network only finds hands, and it finds some
+                // that are none (a cloth on the desk was a "left hand" for a second and more, found
+                // again each time it was lost). Mercury not seeing a hand there is what counts: a
+                // hand it has never seen goes after three looks and is never shown, and one it has
+                // lost goes when the hold is up, however often the first network finds it again.
+                const bool merc = Mercury();
+                hd.unsure = merc ? hd.unsure + 1 : 0;
+
+                if (++hd.missed > (int) set[kSetHold] || (merc && hd.unsure > (hd.proven ? (int) set[kSetHold] : 2)))
+                {
+                    hd.live = false;
+                    lostOne = hd.proven;
+                    ++tally.lost;
+                    --live;
+                }
             }
         }
 
@@ -1820,6 +2402,8 @@ struct Tracker
                                 hd.rightness = f.rightness;
                                 hd.palm = kPalmSum;
                                 hd.lens = -1;
+                                hd.proven = !Mercury();
+                                lens[0].ballKept[i] = lens[1].ballKept[i] = false;
 
                                 // Which hand it is, settled now. Two hands are never the same one, and
                                 // the one already being followed has shown which it is for longer.
@@ -1900,11 +2484,23 @@ struct Tracker
         for (int i = 0; i < kHands; ++i)
         {
             const Hand& hd = hand[i];
-            out[i].live = hd.live ? 1.0f : 0.0f;
+            out[i].live = hd.live && hd.proven ? 1.0f : 0.0f;
             out[i].left = hd.left ? 1.0f : 0.0f;
             out[i].score = hd.score;
             out[i].gap = hd.gap;
             memcpy(out[i].point, hd.smooth, sizeof(hd.smooth));
+        }
+    }
+
+    // Mercury's word on the fingers of each hand as last given out: six numbers a hand -- 1 if
+    // there is one, then the bend of thumb, index, middle, ring and little finger (see Seen).
+    void Curls(float* out) const
+    {
+        for (int i = 0; i < kHands; ++i)
+        {
+            const Hand& hd = hand[i];
+            out[i * 6] = hd.live && hd.proven && hd.curled ? 1.0f : 0.0f;
+            memcpy(out + i * 6 + 1, hd.curl, sizeof(hd.curl));
         }
     }
 };
