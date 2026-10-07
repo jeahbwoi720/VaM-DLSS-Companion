@@ -18,6 +18,14 @@ models were made by Google for MediaPipe (https://github.com/google-ai-edge/medi
 The source build fetches all three with `native\fetch-deps.ps1`, which checks each against a fixed
 SHA-256.
 
+## DDColor (optional colour model)
+
+`[Passthrough] Look = 7` runs DDColor's smallest model (`ddcolor_paper_tiny`; Kang, Yang, Ouyang,
+Ren, Li, Xie: "DDColor: Towards Photo-Realistic Image Colorization via Dual Decoders", ICCV 2023;
+https://github.com/piddnad/DDColor, Apache-2.0) as `colour.onnx`, exported from the authors' code
+and weights by `native\export-colour-model.py`. The file is **not shipped** (270 MB): the README
+says how to make it. Nothing of it is in this repository or in the release.
+
 ## Mercury (optional hand model)
 
 `[Hands] Mercury` runs the keypoint network of Mercury, the hand tracking of

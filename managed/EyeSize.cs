@@ -25,13 +25,29 @@
 // VamDlssNr is upscaling and holds another scale for the user's than VaM's preference, it is given
 // the preference.
 //
+// The third thing is where a half-size picture after a scene load came from, with or without a DLSS
+// mode: VaM's SteamVR plugin. Whenever SteamVR takes the input focus away -- its dashboard, and by
+// what the logs show every scene load and every long freeze -- SteamVR_Render.OnInputFocus keeps
+// the eye scale in a field of its own and sets 0.5, and sets what it kept when the focus is back.
+// Told twice that the focus is gone before it is told once that it is back, it keeps its own 0.5
+// and gives that back: the headset stays at half size (1020x1040) with VaM's Render Scale at 1,
+// until the slider is moved. And under an upscaling mode VaM DLSS takes that 0.5 for the user's
+// scale, which is how its own came to be multiplied onto itself. Every one of these halvings also
+// has all of VaM DLSS's pictures and its DLSS feature made anew, twice: about half a second each.
+// Here the plugin's two writes of the scale are led through FocusScale below, which by default
+// leaves the scale alone; with [Headset] KeepSizeWithoutFocus off it halves as before, but gives
+// back what the scale was before the first halving, whatever came in between.
+//
 // And every change of any of these numbers is written to the log from the first frame on, so that
 // a session that goes wrong all the same says how.
 
 using System;
+using System.Collections.Generic;
 using System.Reflection;
+using System.Reflection.Emit;
 using System.Runtime.InteropServices;
 using BepInEx.Configuration;
+using HarmonyLib;
 using UnityEngine;
 using UnityEngine.XR;
 using VamDlssNr;
@@ -40,7 +56,7 @@ namespace VamDlssNrWorkScale
 {
     internal static class EyeSize
     {
-        internal static ConfigEntry<bool> CfgCorrect, CfgLog;
+        internal static ConfigEntry<bool> CfgCorrect, CfgLog, CfgKeep;
 
         // ---- the judgement: plain numbers, nothing of Unity's (the host test runs it) -----------
 
@@ -133,6 +149,137 @@ namespace VamDlssNrWorkScale
                 _at[_next] = now;
                 _next = (_next + 1) % _at.Length;
                 return true;
+            }
+        }
+
+        // ---- the eye scale while SteamVR has the input focus ------------------------------------
+
+        // What is written to the eye scale when VaM's SteamVR plugin is told that the input focus
+        // is back (`hasFocus`) or gone: nothing (0), half, or what it was before it was halved.
+        // `keep`: the scale is left alone while the focus is gone. `dimmed` and `before` are kept
+        // between calls: whether it stands halved by this, and what it was before.
+        internal static float FocusStep(bool hasFocus, bool keep, float now, ref bool dimmed, ref float before)
+        {
+            if (hasFocus)
+            {
+                if (!dimmed)
+                {
+                    return 0f;
+                }
+
+                dimmed = false;
+                return before;
+            }
+
+            if (keep)
+            {
+                return 0f;
+            }
+
+            if (!dimmed)
+            {
+                before = now;
+                dimmed = true;
+            }
+
+            return 0.5f;
+        }
+
+        internal static bool FocusHooked;
+        internal static string FocusProblem = "";
+        internal static int FocusSites;
+
+        private static bool _focus = true, _dimmed;
+        private static float _before = 1f;
+        private static int _focusLines;
+
+        internal static void Apply(Harmony harmony)
+        {
+            const BindingFlags any = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+            const BindingFlags pub = BindingFlags.Static | BindingFlags.Public;
+
+            try
+            {
+                Type render = Type.GetType("Valve.VR.SteamVR_Render, SteamVR") ?? AccessTools.TypeByName("Valve.VR.SteamVR_Render");
+                MethodInfo focus = render != null ? render.GetMethod("OnInputFocus", any, null, new[] { typeof(bool) }, null) : null;
+
+                if (focus == null)
+                {
+                    FocusProblem = "this build of VaM's SteamVR plugin has no OnInputFocus: its halving of the eye scale while SteamVR has the focus stays as it is";
+                    return;
+                }
+
+                Type me = typeof(EyeSize);
+                FocusSites = 0;
+                harmony.Patch(focus, new HarmonyMethod(me.GetMethod("FocusPrefix", pub)), null, new HarmonyMethod(me.GetMethod("FocusTranspiler", pub)));
+
+                if (FocusSites != 2)
+                {
+                    FocusProblem = "VaM's SteamVR plugin writes the eye scale in " + FocusSites + " places where two were expected: its halving while SteamVR has the focus stays as it is";
+                    harmony.UnpatchSelf();
+                    return;
+                }
+
+                FocusHooked = true;
+            }
+            catch (Exception ex)
+            {
+                FocusHooked = false;
+                FocusProblem = "the eye scale could not be kept while SteamVR has the focus (" + ex.GetType().Name + ": " + ex.Message + ")";
+
+                try
+                {
+                    harmony.UnpatchSelf();
+                }
+                catch (Exception)
+                {
+                }
+            }
+        }
+
+        // OnInputFocus's two writes of the eye scale (through SteamVR_Camera.sceneResolutionScale)
+        // come to FocusScale instead.
+        public static IEnumerable<CodeInstruction> FocusTranspiler(IEnumerable<CodeInstruction> instructions)
+        {
+            MethodInfo mine = typeof(EyeSize).GetMethod("FocusScale", BindingFlags.Static | BindingFlags.Public);
+
+            foreach (CodeInstruction instruction in instructions)
+            {
+                MethodInfo called = instruction.operand as MethodInfo;
+
+                if ((instruction.opcode == OpCodes.Call || instruction.opcode == OpCodes.Callvirt) && called != null && called.Name == "set_sceneResolutionScale")
+                {
+                    instruction.opcode = OpCodes.Call;
+                    instruction.operand = mine;
+                    FocusSites++;
+                }
+
+                yield return instruction;
+            }
+        }
+
+        public static void FocusPrefix(bool __0)
+        {
+            _focus = __0;
+        }
+
+        // `asked` is what the plugin would have written: half, or whatever it kept.
+        public static void FocusScale(float asked)
+        {
+            float now = XRSettings.eyeTextureResolutionScale;
+            bool keep = CfgKeep == null || CfgKeep.Value;
+            float write = FocusStep(_focus, keep, now, ref _dimmed, ref _before);
+
+            if (write > 0f && Math.Abs(write - now) > 0.00001f)
+            {
+                XRSettings.eyeTextureResolutionScale = write;
+            }
+
+            if (++_focusLines <= 40)
+            {
+                Say("SteamVR " + (_focus ? "gave the input focus back" : "took the input focus away") + ": the eye scale " +
+                    (write > 0f ? "goes from " + now.ToString("0.000") + " to " + write.ToString("0.000") : "stays " + now.ToString("0.000")) +
+                    " (VaM's SteamVR plugin asked for " + asked.ToString("0.000") + ")" + (_focusLines == 40 ? " -- no more of these lines this session" : ""));
             }
         }
 
@@ -278,6 +425,12 @@ namespace VamDlssNrWorkScale
             if (_off || !XRSettings.enabled)
             {
                 return;
+            }
+
+            if (FocusProblem.Length != 0)
+            {
+                Say(FocusProblem);
+                FocusProblem = "";
             }
 
             try

@@ -44,6 +44,8 @@ namespace VamDlssNrWorkScale
         private static uint _measuredWidth;
         private static readonly ulong[] _runs = new ulong[4];
         private static readonly uint[] _times = new uint[4];
+        private static readonly ulong[] _micros = new ulong[4];
+        private static readonly uint[] _microsTimes = new uint[4];
         private static uint _onsThen, _noTargetThen, _smallThen;
         private static bool _tracked;
 
@@ -141,6 +143,20 @@ namespace VamDlssNrWorkScale
                 saves = "\n" + (less >= 3f ? less.ToString("F0") + "% fewer pixels shaded (measured)" : "NO fewer pixels shaded (measured): no effect");
             }
 
+            // ...and what that is worth: the card's time over the two passes, with and without.
+            Native.FoveaTimed(_micros, _microsTimes);
+            string timed = "";
+
+            if (_microsTimes[0] != 0 && _microsTimes[1] != 0 && _microsTimes[2] != 0 && _microsTimes[3] != 0)
+            {
+                float opaqueWith = _micros[0] / (float)_microsTimes[0] / 1000f, opaqueWithout = _micros[1] / (float)_microsTimes[1] / 1000f;
+                float alphaWith = _micros[2] / (float)_microsTimes[2] / 1000f, alphaWithout = _micros[3] / (float)_microsTimes[3] / 1000f;
+                float saved = opaqueWithout + alphaWithout - opaqueWith - alphaWith;
+                saves += ", " + (saved >= 0.05f ? saved.ToString("F1") + " ms of the card's time a frame" : "no time of the card's saved");
+                timed = "; the card's time, with / without -- opaque pass " + opaqueWith.ToString("F2") + " / " + opaqueWithout.ToString("F2") + " ms, transparent pass " + alphaWith.ToString("F2") + " / " + alphaWithout.ToString("F2") +
+                    " ms (" + _microsTimes[0] + "/" + _microsTimes[1] + " passes): " + saved.ToString("F2") + " ms saved a frame";
+            }
+
             if (state == 1 && (_times[0] | _times[1] | _times[2] | _times[3]) != 0 && (now - _measuredSaidAt > 15f || width != _measuredWidth))
             {
                 _measuredSaidAt = now;
@@ -149,7 +165,7 @@ namespace VamDlssNrWorkScale
                 if (Hooks.Info != null)
                 {
                     Hooks.Info("foveation: " + width + "x" + height + ", applied " + applied.ToString("F0") + "/s; pixel shader runs with the rates / without -- opaque pass " + _runs[0] + " / " + _runs[1] +
-                        ", transparent pass " + _runs[2] + " / " + _runs[3] + "; counted " + _times[0] + "/" + _times[1] + " and " + _times[2] + "/" + _times[3] + " times" +
+                        ", transparent pass " + _runs[2] + " / " + _runs[3] + "; counted " + _times[0] + "/" + _times[1] + " and " + _times[2] + "/" + _times[3] + " times" + timed +
                         (CfgShow.Value ? "; zones shown, so nothing is being counted without" : ""));
                 }
             }

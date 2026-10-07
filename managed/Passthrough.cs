@@ -42,6 +42,8 @@ namespace VamDlssNrWorkScale
         internal static ConfigEntry<float> CfgPoseTiming;
         internal static ConfigEntry<bool> CfgDepth, CfgDepthFlip;
         internal static ConfigEntry<float> CfgDepthMargin, CfgDepthSoftness;
+        internal static ConfigEntry<int> CfgLook, CfgHandOver;
+        internal static ConfigEntry<float> CfgLookRed, CfgLookGreen, CfgLookBlue, CfgGrain, CfgRim, CfgColour;
 
         // The component of the camera the frame in hand was rendered by (HeadsetUi sets it before Run).
         internal static Component SceneCamera;
@@ -116,7 +118,9 @@ namespace VamDlssNrWorkScale
         // The native half's block of numbers (CamField in vws.cpp).
         private const int FKey = 0, FTolerance = 3, FSoftness = 4, FGain = 5, FDistance = 6, FFocal = 7, FK = 8, FCentre = 12, FTan = 16, FCamToHead = 24, FEyeToHead = 48, FFollow = 72, FView = 73, FMode = 74, FQuadTan = 75, FQuadDistance = 76, FStereoRule = 77, FSpace = 78, FPoseIsCamera = 79, FDepth = 80, FDepthMargin = 81, FDepthSoft = 82;
 
-        private static readonly float[] _config = new float[96];
+        private const int FLook = 83, FLookLow = 84, FLookMid = 87, FLookHigh = 90, FGrain = 93, FRim = 94, FColour = 95, FHandOver = 96;
+
+        private static readonly float[] _config = new float[112];
         private static readonly float[] _eyeToRoom = new float[12];
         private static readonly float[] _head = new float[12];
         private static IntPtr _compositor = IntPtr.Zero;
@@ -156,6 +160,87 @@ namespace VamDlssNrWorkScale
             new[] { 0f, 0f, 0f },          // 4 black
             new[] { 1f, 1f, 1f },          // 5 white
         };
+
+        // ---- the room's look: the cameras are monochrome, and this is what their grey is shown in ----
+
+        internal const int LookGrey = 0, LookOwn = 6, LookGuessed = 7;
+        internal static readonly string[] LookNames =
+        {
+            "Camera's grey", "Night vision (green)", "Amber", "Cold blue", "Sepia", "Heat", "Your colour", "Colours guessed by a network (experimental)"
+        };
+
+        // The ramps: what black, mid-grey and white become, as displayed.
+        private static readonly float[][] Ramps =
+        {
+            null,
+            new[] { 0f, 0.03f, 0f,        0.12f, 0.78f, 0.16f,    0.80f, 1f, 0.78f },    // night vision
+            new[] { 0.04f, 0.015f, 0f,    0.86f, 0.50f, 0.10f,    1f, 0.95f, 0.78f },    // amber
+            new[] { 0f, 0.012f, 0.045f,   0.24f, 0.52f, 0.82f,    0.90f, 0.97f, 1f },    // cold blue
+            new[] { 0.05f, 0.03f, 0.02f,  0.62f, 0.48f, 0.36f,    1f, 0.96f, 0.88f },    // sepia
+        };
+
+        // The look's numbers as the native half takes them (block[83..92]): which of its four
+        // ways of showing the grey, and the ramp's three colours.
+        internal static void LookNumbers(int look, float red, float green, float blue, float[] block)
+        {
+            float[] ramp = look > 0 && look < Ramps.Length ? Ramps[look] : null;
+
+            if (look == LookOwn)
+            {
+                // black, the colour, and most of the way from it to white
+                ramp = new[] { red * 0.04f, green * 0.04f, blue * 0.04f, red, green, blue, red + (1f - red) * 0.75f, green + (1f - green) * 0.75f, blue + (1f - blue) * 0.75f };
+            }
+
+            block[FLook] = ramp != null ? 1f : look == 5 ? 2f : look == LookGuessed ? 3f : 0f;
+
+            for (int i = 0; i < 9; i++)
+            {
+                block[FLookLow + i] = ramp != null ? ramp[i] : 0f;
+            }
+        }
+
+        private static void FillLook()
+        {
+            int look = CfgLook != null ? CfgLook.Value : 0;
+            LookNumbers(look, CfgLookRed != null ? CfgLookRed.Value : 1f, CfgLookGreen != null ? CfgLookGreen.Value : 1f, CfgLookBlue != null ? CfgLookBlue.Value : 1f, _config);
+            _config[FGrain] = look != LookGrey && CfgGrain != null ? CfgGrain.Value : 0f;
+            _config[FRim] = look != LookGrey && CfgRim != null ? CfgRim.Value : 0f;
+            _config[FColour] = CfgColour != null ? CfgColour.Value : 1f;
+        }
+
+        // How often the overlay's device has been lost since VaM started: nothing while it never was.
+        private static string LostStatus()
+        {
+            uint lost = Native.OverlayLost();
+            return lost == 0 ? "" : "; its device was lost " + lost + (lost == 1 ? " time" : " times");
+        }
+
+        // What the colour thread is doing, for the status line; empty unless that look is chosen.
+        private static string _colourSaid = "";
+
+        private static string ColourStatus()
+        {
+            if (CfgLook == null || CfgLook.Value != LookGuessed)
+            {
+                return "";
+            }
+
+            int state;
+            uint pictures, micros;
+            Native.ColourStatus(out state, out pictures, out micros);
+            string said = state < 0 ? "; no colours: " + Native.ColourError() :
+                state == 1 ? "; colours: loading the network" :
+                pictures == 0 ? "; colours: waiting for the first" :
+                "; colours: " + (micros / 1000f).ToString("0") + " ms a picture";
+
+            if (state < 0 && said != _colourSaid && Hooks.Info != null)
+            {
+                Hooks.Info("passthrough" + said);
+            }
+
+            _colourSaid = said;
+            return said;
+        }
 
         internal static void ApplyPreset()
         {
@@ -424,6 +509,7 @@ namespace VamDlssNrWorkScale
             _config[FFocal] = CfgFocal.Value * (_width * 0.5f / 1016f);
             _config[FMode] = 0f;
             _config[FDepth] = 0f;
+            _config[FLook] = 0f;
             _config[FSpace] = _space;
             _config[FPoseIsCamera] = _poseIsCamera ? 1f : 0f;
             Native.CamConfigure(_config);
@@ -1027,6 +1113,8 @@ namespace VamDlssNrWorkScale
             _config[FDepth] = overlay && CfgDepth != null && CfgDepth.Value ? 1f : 0f;
             _config[FDepthMargin] = CfgDepthMargin != null ? CfgDepthMargin.Value : 0.25f;
             _config[FDepthSoft] = CfgDepthSoftness != null ? CfgDepthSoftness.Value : 0.1f;
+            _config[FHandOver] = CfgHandOver != null ? CfgHandOver.Value : 0f;
+            FillLook();
 
             for (int eye = 0; eye < 2; eye++)
             {
@@ -1186,10 +1274,10 @@ namespace VamDlssNrWorkScale
                     Status = "passthrough: " + (
                         state == 5 ? "its own overlay, " + rate.ToString("0") + " pictures a second" :
                         state == 1 ? "overlay waiting for the game's first frame" :
-                        state == 2 ? "the overlay could not get a device of its own (0x" + overlayError.ToString("X") + ") -- try Mode 1" :
+                        state == 2 ? "the overlay's graphics device was lost (0x" + overlayError.ToString("X") + "), another is being made" :
                         state == 3 ? "this SteamVR has no overlay interface the plugin knows -- try Mode 1" :
                         state == 4 ? "SteamVR refused the overlay (error " + overlayError + ") -- try Mode 1" :
-                        "overlay starting") + (posed ? "" : ", no head pose");
+                        "overlay starting") + (posed ? "" : ", no head pose") + LostStatus() + ColourStatus();
 
                     // How far the room and the scene are taken to be, straight ahead: the one way
                     // to see from inside the headset whether either is being read.
@@ -1205,7 +1293,7 @@ namespace VamDlssNrWorkScale
                 }
                 else
                 {
-                    Status = "passthrough: in the game's frame, camera " + rate.ToString("0") + " pictures a second" + (posed ? "" : ", no head pose");
+                    Status = "passthrough: in the game's frame, camera " + rate.ToString("0") + " pictures a second" + (posed ? "" : ", no head pose") + ColourStatus();
                 }
             }
 

@@ -19,6 +19,7 @@
 #include <limits>
 #include <vector>
 
+#include "vws_colour.h"
 #include "vws_vs.h"
 #include "vws_ps_down.h"
 
@@ -4057,6 +4058,591 @@ static void TestOverlay(HMODULE dll)
     Drain(true);
 }
 
+// ---- the room's look: the cameras' grey as a ramp of colours, as heat, or as a network's guess ----
+
+static float RampAt(const float* cfg, int channel, float g)
+{
+    const float low = cfg[84 + channel], mid = cfg[87 + channel], high = cfg[90 + channel];
+    return g < 0.5f ? low + (mid - low) * g * 2.0f : mid + (high - mid) * (g * 2.0f - 1.0f);
+}
+
+static float HeatAt(int channel, float g)
+{
+    static const float stops[6][3] = { { 0.0f, 0.0f, 0.03f }, { 0.33f, 0.0f, 0.5f }, { 0.82f, 0.08f, 0.3f }, { 1.0f, 0.5f, 0.0f }, { 1.0f, 0.9f, 0.2f }, { 1.0f, 1.0f, 1.0f } };
+    const float s = Saturate(g) * 5.0f;
+    const int i = std::min((int) s, 4);
+    return stops[i][channel] + (stops[i + 1][channel] - stops[i][channel]) * (s - (float) i);
+}
+
+// How far inside the rim of the lens's circle one of an eye's lines of sight falls, in texels of
+// the camera's frame (the picture fades out over the last 40 of them, the colours over the last
+// 60), and how far off the eye's axis that line is, as a tangent.
+static float PassInside(const float* cfg, const Rig34& eyeToCam, uint32_t cw, uint32_t eye, float u, float v, float* tangent)
+{
+    const float* tn = cfg + 16 + eye * 4;
+    double ray[3] = { tn[0] + (tn[1] - tn[0]) * u, -(tn[2] + (tn[3] - tn[2]) * v), -1.0 };
+    *tangent = (float) sqrt(ray[0] * ray[0] + ray[1] * ray[1]);
+    const double len = sqrt(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
+    double at[3], q[3];
+
+    for (int i = 0; i < 3; ++i)
+        at[i] = ray[i] / len * cfg[6];
+
+    for (int i = 0; i < 3; ++i)
+        q[i] = eyeToCam.m[i * 4] * at[0] + eyeToCam.m[i * 4 + 1] * at[1] + eyeToCam.m[i * 4 + 2] * at[2] + eyeToCam.m[i * 4 + 3];
+
+    const double across = std::max(sqrt(q[0] * q[0] + q[1] * q[1]), 1e-9);
+    const double angle = atan2(across, -q[2]);
+    const double a2 = angle * angle;
+    const double radius = cfg[7] * angle * (1.0 + a2 * (cfg[8] + a2 * (cfg[9] + a2 * (cfg[10] + a2 * cfg[11]))));
+    return (float) (cw / 2 * 0.5 - 6.0 - radius);
+}
+
+// Ten bytes written to a file of this name in `folder`, through this program's own import of
+// WriteFile: how long the file is afterwards, and what WriteFile said it wrote.
+static uint32_t LogWrite(const wchar_t* folder, const wchar_t* name, DWORD* said)
+{
+    wchar_t path[MAX_PATH];
+    swprintf(path, MAX_PATH, L"%s%s", folder, name);
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    *said = 0;
+
+    if (file == INVALID_HANDLE_VALUE)
+        return 0xFFFFFFFFu;
+
+    const BOOL ok = WriteFile(file, "0123456789", 10, said, nullptr);
+    LARGE_INTEGER size = {};
+    GetFileSizeEx(file, &size);
+    CloseHandle(file);
+    DeleteFileW(path);
+    return ok ? (uint32_t) size.QuadPart : 0xFFFFFFFEu;
+}
+
+// The log files of VaM DLSS's native half and of NVIDIA's DLSS, kept off the disk (vws_logs.h):
+// tried on this program's own imports.
+static void TestLogs(HMODULE dll)
+{
+    typedef uint32_t (*LogsFn)(uint32_t, uint32_t*, uint32_t*);
+    typedef uint32_t (*LogsHookFn)(void*);
+    const LogsFn logs = (LogsFn) GetProcAddress(dll, "vws_logs");
+    const LogsHookFn hook = (LogsHookFn) GetProcAddress(dll, "vws_logs_hook");
+    CHECK(logs != nullptr && hook != nullptr, "the DLL keeps log files off the disk");
+
+    if (logs == nullptr || hook == nullptr)
+        return;
+
+    wchar_t folder[MAX_PATH];
+    GetTempPathW(MAX_PATH - 40, folder);
+    wcscat_s(folder, MAX_PATH, L"vws-logs-check\\");
+    CreateDirectoryW(folder, nullptr);
+    DWORD said = 0;
+    uint32_t writes = 0, kilobytes = 0;
+
+    CHECK(logs(0, &writes, &kilobytes) == 0 && writes == 0, "with every log on, no import is touched");
+    CHECK(LogWrite(folder, L"vdn.log", &said) == 10 && said == 10, "and a log is written as it comes");
+
+    const uint32_t changed = hook(GetModuleHandleW(nullptr));
+    CHECK(changed >= 1, "this program's own WriteFile is led through the DLL (%u imports)", changed);
+    CHECK(hook(GetModuleHandleW(nullptr)) == 0, "and not a second time");
+    CHECK(LogWrite(folder, L"vdn.log", &said) == 10 && said == 10, "led through with every log on, a log is still written");
+
+    logs(1, nullptr, nullptr);
+    CHECK(LogWrite(folder, L"vdn.log", &said) == 0 && said == 10, "VaM DLSS's files off: vdn.log stays empty, and the writer is told all was written (%lu)", said);
+    CHECK(LogWrite(folder, L"VDN_FG.LOG", &said) == 0 && said == 10, "and so does vdn_fg.log, in whatever case");
+    CHECK(LogWrite(folder, L"nvngx.log", &said) == 10, "NVIDIA's are not its files");
+    CHECK(LogWrite(folder, L"vdn.log.txt", &said) == 10 && LogWrite(folder, L"myvdn.log", &said) == 10 && LogWrite(folder, L"other.txt", &said) == 10,
+          "and no other file is kept from being written");
+
+    logs(2, nullptr, nullptr);
+    CHECK(LogWrite(folder, L"nvngx.log", &said) == 0 && said == 10 && LogWrite(folder, L"nvngx_dlss_310_7_128.log", &said) == 0, "NVIDIA's files off: nvngx.log and nvngx_dlss_*.log stay empty");
+    CHECK(LogWrite(folder, L"vdn.log", &said) == 10 && LogWrite(folder, L"nvngx_dlss.dll", &said) == 10, "VaM DLSS's are written then, and so is a file of NVIDIA's that is no log");
+
+    logs(3, &writes, &kilobytes);
+    CHECK(LogWrite(folder, L"vdn.log", &said) == 0 && LogWrite(folder, L"nvngx.log", &said) == 0, "both off: neither is written");
+    logs(3, &writes, &kilobytes);
+    CHECK(writes == 6, "the writes not made are counted (%u)", writes);
+
+    logs(0, nullptr, nullptr);
+    CHECK(LogWrite(folder, L"vdn.log", &said) == 10 && LogWrite(folder, L"nvngx.log", &said) == 10, "switched on again, both are written");
+    RemoveDirectoryW(folder);
+}
+
+static void TestLooks(HMODULE dll)
+{
+    printf("[the room's look: the cameras' grey in a ramp of colours, as heat, in a network's colours]\n");
+
+    // The arithmetic the colour thread does around its network.
+    {
+        using namespace vwscolour;
+        float cb = 9.0f, cr = 9.0f;
+        Differences(0.5f, 0.0f, 0.0f, &cb, &cr);
+        CHECK(fabsf(cb) < 1e-3f && fabsf(cr) < 1e-3f, "a grey without colour stays grey (%.4f, %.4f)", cb, cr);
+        Differences(0.5f, 45.0f, 30.0f, &cb, &cr);
+        CHECK(cr > 0.08f && cb < -0.02f, "a and b towards red and yellow come out redder and less blue (Cb %.3f, Cr %.3f)", cb, cr);
+        Differences(0.5f, -5.0f, -40.0f, &cb, &cr);
+        CHECK(cb > 0.08f, "b towards blue comes out bluer (Cb %.3f)", cb);
+        CHECK(Take(0.0f, true) == 0.3f && Take(5.0f, true) == 1.0f && Take(0.0f, false) == 0.5f,
+              "a still head keeps most of the last answer, a turned one takes the new one whole");
+
+        float still[12], turned[12];
+        RigYaw(still, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+        RigYaw(turned, 0.1745329f, 0.0f, 0.3f, 0.0f, 0.0f);
+        CHECK(fabsf(Turned(still, turned) - 10.0f) < 0.05f, "the turn between two poses is measured (%.2f degrees for ten)", Turned(still, turned));
+
+        const uint32_t w = 64, h = 32;
+        std::vector<uint8_t> frame((size_t) w * h);
+
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x)
+                frame[(size_t) y * w + x] = x < w / 2 ? 100 : 250;
+
+        std::vector<float> light((size_t) kIn * kIn);
+        Shrink(frame.data(), w, h, 0, w / 2, 2.0f, light.data());
+        float lo = 9.0f, hi = -9.0f;
+
+        for (float v : light)
+        {
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+
+        CHECK(fabsf(lo - 200.0f / 255.0f) < 1e-4f && fabsf(hi - 200.0f / 255.0f) < 1e-4f, "the network is shown the first lens alone, as bright as the room is shown (%.3f..%.3f)", lo, hi);
+
+        std::vector<float> kept((size_t) kOut * kOut * 2, 0.0f), fresh((size_t) kOut * kOut * 2, 0.1f);
+        std::vector<uint8_t> bytes((size_t) kOut * kOut * 4);
+        vwscolour::Bytes(kept.data(), bytes.data());
+        CHECK(bytes[0] == 128 && bytes[1] == 128 && bytes[3] == 255, "no colour is 128, 128 in the texture");
+        Blend(kept.data(), fresh.data(), 0.5f);
+        vwscolour::Bytes(kept.data(), bytes.data());
+        CHECK(bytes[0] == 141 && bytes[1] == 141, "half of a new answer is taken where a half is asked for (%d)", bytes[0]);
+    }
+
+    typedef void (*ConfigureFn)(const float*, uint32_t);
+    typedef void (*InjectFn)(const uint8_t*, uint32_t, uint32_t, const float*);
+    typedef int (*PushPassFn2)(void*, uint32_t, uint32_t, uint32_t, uint32_t, const float*);
+    typedef int (*StartFn)(void*, uint64_t, uint32_t, uint32_t);
+    typedef void (*StopFn)();
+    typedef int (*ReadFn)(uint8_t*, uint32_t, uint32_t*, uint32_t*);
+    typedef void (*ColourStatusFn)(int32_t*, uint32_t*, uint32_t*);
+    typedef uint32_t (*ColourErrorFn)(char*, uint32_t);
+    typedef int (*ColourSolveFn)(const uint8_t*, uint32_t, uint32_t, float, const wchar_t*, uint8_t*, uint32_t, uint32_t*);
+    typedef void (*OverlayStatusFn)(int32_t*, uint32_t*, int32_t*);
+    typedef void (*ColourInjectFn)(const uint8_t*, const float*);
+    const ColourInjectFn colourInject = (ColourInjectFn) GetProcAddress(dll, "vws_colour_inject");
+    const OverlayStatusFn overlayStatus = (OverlayStatusFn) GetProcAddress(dll, "vws_overlay_status");
+    const ConfigureFn configure = (ConfigureFn) GetProcAddress(dll, "vws_cam_configure");
+    const InjectFn inject = (InjectFn) GetProcAddress(dll, "vws_cam_inject");
+    const PushPassFn2 push = (PushPassFn2) GetProcAddress(dll, "vws_push_passthrough");
+    const StartFn start = (StartFn) GetProcAddress(dll, "vws_cam_start");
+    const StopFn stop = (StopFn) GetProcAddress(dll, "vws_cam_stop");
+    const ReadFn read = (ReadFn) GetProcAddress(dll, "vws_overlay_read");
+    const ColourStatusFn colourStatus = (ColourStatusFn) GetProcAddress(dll, "vws_colour_status");
+    const ColourErrorFn colourError = (ColourErrorFn) GetProcAddress(dll, "vws_colour_error");
+    const ColourSolveFn colourSolve = (ColourSolveFn) GetProcAddress(dll, "vws_colour_solve");
+
+    CHECK(configure && inject && push && start && stop && read && colourStatus && colourError && colourSolve && overlayStatus && colourInject, "the look's exports are there");
+
+    if (!configure || !inject || !push || !start || !stop || !read || !colourStatus || !colourError || !colourSolve || !overlayStatus || !colourInject)
+        return;
+
+    const uint32_t cw = 2032, ch = 1016;
+    g_fakeW = cw;
+    g_fakeH = ch;
+    g_fakeCam.resize((size_t) cw * ch);
+
+    for (uint32_t y = 0; y < ch; ++y)
+        for (uint32_t x = 0; x < cw; ++x)
+            g_fakeCam[(size_t) y * cw + x] = (uint8_t) lroundf(128.0f + 90.0f * sinf(x * 0.013f) * cosf(y * 0.017f));
+
+    float cfg[96] = {};
+    cfg[0] = 0.0f; cfg[1] = 1.0f; cfg[2] = 0.0f;
+    cfg[3] = 0.30f;
+    cfg[4] = 0.20f;
+    cfg[5] = 1.2f;
+    cfg[6] = 1.5f;
+    cfg[7] = 382.6f;
+    cfg[8] = 0.01983145f; cfg[9] = -0.0011872f; cfg[10] = -0.00294614f; cfg[11] = 0.00045608f;
+    cfg[12] = 507.887f; cfg[13] = 510.078f; cfg[14] = 506.532f; cfg[15] = 504.605f;
+    const float tangents[8] = { -1.8418f, 0.9472f, -1.329f, 1.329f, -0.9472f, 1.8418f, -1.329f, 1.329f };
+    memcpy(cfg + 16, tangents, sizeof(tangents));
+    const float camToHead[24] = { 0.9647f, 0.0022f, 0.2635f, -0.04f, -0.1331f, 0.8671f, 0.48f, -0.0392f, -0.2274f, -0.4981f, 0.8368f, -0.0809f,
+                                  0.9653f, 0.0041f, -0.261f, 0.0388f, 0.1275f, 0.8651f, 0.4852f, -0.0393f, 0.2278f, -0.5016f, 0.8345f, -0.0806f };
+    memcpy(cfg + 24, camToHead, sizeof(camToHead));
+    const float eyeToHead[24] = { 1, 0, 0, -0.0325f, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0.0325f, 0, 1, 0, 0, 0, 0, 1, 0 };
+    memcpy(cfg + 48, eyeToHead, sizeof(eyeToHead));
+    cfg[78] = 1.0f;
+    cfg[79] = 1.0f;
+    const float ramp[9] = { 0.0f, 0.1f, 0.0f, 0.1f, 0.8f, 0.2f, 1.0f, 1.0f, 0.9f };
+
+    // ---- in the game's own frame: one eye's 8-bit picture, all of it the key colour ----
+    {
+        const uint32_t w = 64, h = 64, eye = 0;
+        Bytes key(w, h);
+
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                uint8_t* p = key.at(x, y);
+                p[0] = 0;
+                p[1] = 255;
+                p[2] = 0;
+                p[3] = 255;
+            }
+        }
+
+        ID3D11Texture2D* t = MakeTexture(w, h, DXGI_FORMAT_R8G8B8A8_TYPELESS, kRT);
+
+        const auto shown = [&](float look, float grain, float rim) -> Bytes
+        {
+            cfg[83] = look;
+            memcpy(cfg + 84, ramp, sizeof(ramp));
+            cfg[93] = grain;
+            cfg[94] = rim;
+            cfg[95] = 1.0f;
+            configure(cfg, 96);
+            inject(g_fakeCam.data(), cw, ch, nullptr);
+            UploadBytes(t, key);
+            g_event(push(t, 1, eye, 1, 0, nullptr));
+            return ReadBytes(t);
+        };
+
+        const Bytes grey = shown(0.0f, 0.0f, 0.0f);
+        const Bytes ramped = shown(1.0f, 0.0f, 0.0f);
+        const Bytes heat = shown(2.0f, 0.0f, 0.0f);
+        const Bytes guessed = shown(3.0f, 0.0f, 0.0f);
+        const Bytes grainy = shown(1.0f, 0.6f, 0.0f);
+        const Bytes rimmed = shown(1.0f, 0.0f, 1.0f);
+
+        // Colours as the colour thread would deliver them: the same two differences everywhere.
+        std::vector<uint8_t> handed((size_t) vwscolour::kOut * vwscolour::kOut * 4);
+
+        for (size_t i = 0; i < handed.size(); i += 4)
+        {
+            handed[i] = 160;
+            handed[i + 1] = 100;
+            handed[i + 2] = 0;
+            handed[i + 3] = 255;
+        }
+
+        colourInject(handed.data(), nullptr);
+        const Bytes coloured = shown(3.0f, 0.0f, 0.0f);
+        int worstColour = 0, bluer = 0;
+        int isGrey = 0, worstRamp = 0, worstHeat = 0, worstGuess = 0, spread = 0, grainMoved = 0, darker = 0, centreMoved = 0, whole = 0;
+        double grainSum = 0.0;
+        const Rig34 eyeToCam = RigMul(RigInverse(RigFrom(camToHead + eye * 12)), RigFrom(eyeToHead + eye * 12));
+
+        for (uint32_t y = 0; y < h; ++y)
+        {
+            for (uint32_t x = 0; x < w; ++x)
+            {
+                const uint8_t* g = grey.at(x, y);
+                isGrey = std::max(isGrey, std::max(abs(g[0] - g[1]), abs(g[0] - g[2])));
+                spread = std::max(spread, (int) g[0]);
+
+                // (where the picture fades out towards the lens's rim the ramp is of the unfaded
+                // grey, which the faded picture does not say: those are left out; so are texels
+                // beside them, which the target's filtering mixes with them)
+                float tangent = 0.0f, tangentBeside = 0.0f;
+                const float v = 1.0f - (y + 0.5f) / h;
+                const bool unfaded = PassInside(cfg, eyeToCam, cw, eye, (x + 0.5f) / w, v, &tangent) >= 60.0f &&
+                                     PassInside(cfg, eyeToCam, cw, eye, (x + 2.5f) / w, v, &tangentBeside) >= 60.0f &&
+                                     PassInside(cfg, eyeToCam, cw, eye, (x - 1.5f) / w, v, &tangentBeside) >= 60.0f &&
+                                     PassInside(cfg, eyeToCam, cw, eye, (x + 0.5f) / w, v + 2.0f / h, &tangentBeside) >= 60.0f &&
+                                     PassInside(cfg, eyeToCam, cw, eye, (x + 0.5f) / w, v - 2.0f / h, &tangentBeside) >= 60.0f;
+                whole += unfaded ? 1 : 0;
+
+                if (unfaded)
+                {
+                    // Cb and Cr as handed in below, laid on the camera's grey
+                    const float cb = (160 - 128) / 255.0f, cr = (100 - 128) / 255.0f, grey01 = g[0] / 255.0f;
+                    const float want[3] = { grey01 + 1.402f * cr, grey01 - 0.344136f * cb - 0.714136f * cr, grey01 + 1.772f * cb };
+
+                    for (int i = 0; i < 3; ++i)
+                        worstColour = std::max(worstColour, abs(coloured.at(x, y)[i] - (int) lroundf(Saturate(want[i]) * 255.0f)));
+
+                    if (coloured.at(x, y)[2] > coloured.at(x, y)[0] + 20)
+                        bluer++;
+                }
+
+                for (int i = 0; i < 3; ++i)
+                {
+                    if (unfaded)
+                    {
+                        // the grey is known to a 255th, and a ramp may be several times as steep
+                        worstRamp = std::max(worstRamp, abs(ramped.at(x, y)[i] - (int) lroundf(RampAt(cfg, i, g[0] / 255.0f) * 255.0f)));
+                        worstHeat = std::max(worstHeat, abs(heat.at(x, y)[i] - (int) lroundf(HeatAt(i, g[0] / 255.0f) * 255.0f)));
+                    }
+
+                    if (tangent < 0.4f)
+                        centreMoved = std::max(centreMoved, abs(rimmed.at(x, y)[i] - ramped.at(x, y)[i]));
+
+                    worstGuess = std::max(worstGuess, abs(guessed.at(x, y)[i] - g[i]));
+                    grainMoved = std::max(grainMoved, abs(grainy.at(x, y)[i] - ramped.at(x, y)[i]));
+                    grainSum += grainy.at(x, y)[i] - ramped.at(x, y)[i];
+                }
+
+                if (tangent > 0.9f && ramped.at(x, y)[1] > 20 && rimmed.at(x, y)[1] + 8 < ramped.at(x, y)[1])
+                    darker++;
+            }
+        }
+
+        CHECK(isGrey == 0 && spread > 120, "look 0 is the camera's grey (channels apart by %d, brightest %d)", isGrey, spread);
+        CHECK(whole > 600 && worstRamp <= 6, "a ramp shows each grey as its place between the three colours (worst %d/255 over %d texels)", worstRamp, whole);
+        CHECK(worstHeat <= 9, "heat shows each grey as its place on the ramp of heat (worst %d/255)", worstHeat);
+        colourInject(nullptr, nullptr);
+        CHECK(worstGuess == 0, "the network's look, while it has given no colours, is the camera's grey (off by %d)", worstGuess);
+        CHECK(worstColour <= 3 && bluer > 300, "colours handed in are laid on the camera's grey as its two differences (worst %d/255, %d texels bluer)", worstColour, bluer);
+        CHECK(grainMoved > 20 && fabs(grainSum / (w * h * 3.0)) < 6.0, "grain moves the picture's texels both ways (by up to %d, %.1f on average)", grainMoved, grainSum / (w * h * 3.0));
+        CHECK(darker > 100 && centreMoved == 0, "a dark rim darkens the sides of the view and leaves its middle as it was (%d texels darker, the middle moved by %d)", darker, centreMoved);
+        t->Release();
+    }
+
+    // ---- as the overlay: the camera everywhere, on the overlay's own device ----
+    cfg[73] = 2.0f; // the camera everywhere
+    cfg[74] = 1.0f; // as an overlay
+    cfg[75] = 2.2f;
+    cfg[76] = 2.0f;
+    cfg[83] = 0.0f;
+    cfg[93] = cfg[94] = 0.0f;
+    RigYaw(g_fakePose, 0.20f, 0.05f, 0.10f, 1.20f, -0.30f);
+    configure(cfg, 96);
+
+    // The game's frame, for its matte: by that the overlay knows which card the game is on.
+    typedef int (*PushMatteFn)(void*, uint32_t, uint32_t, uint32_t, uint32_t, const float*, uint32_t, void*, const float*);
+    const PushMatteFn pushMatte = (PushMatteFn) GetProcAddress(dll, "vws_push_matte");
+    Image keyed(192, 64);
+
+    for (size_t i = 0; i < keyed.px.size(); i += 4)
+    {
+        keyed.px[i] = 0.0f;
+        keyed.px[i + 1] = 1.0f;
+        keyed.px[i + 2] = 0.0f;
+        keyed.px[i + 3] = 1.0f;
+    }
+
+    ID3D11Texture2D* frame = MakeTexture(192, 64, DXGI_FORMAT_R16G16B16A16_TYPELESS, kRT);
+    UploadHalf(frame, keyed);
+
+    if (pushMatte != nullptr)
+    {
+        g_event(pushMatte(frame, 2, 0, 0, 1, g_fakePose, 0, nullptr, nullptr));
+        g_event(pushMatte(frame, 2, 1, 0, 1, g_fakePose, 0, nullptr, nullptr));
+        g_ctx->Flush();
+        Drain(true);
+    }
+
+    CHECK(start((void*) &FakeFrame, 1, cw, ch) == 1, "the camera thread starts");
+
+    std::vector<uint8_t> first((size_t) 3072 * 1536 * 4), second(first.size());
+    uint32_t pw = 0, ph = 0;
+
+    // A picture drawn from here on: what can be read at once may be one drawn before the last
+    // change, or by an earlier check's camera.
+    const auto after = [&](std::vector<uint8_t>& into) -> bool
+    {
+        // (a read hands over the copy made at the last one's asking, and asks for another: so
+        // one is asked for once the change is in the pictures, and taken a few pictures later.
+        // There is no SteamVR here to show them on: they are drawn all the same.)
+        for (int round = 0; round < 2; ++round)
+        {
+            int32_t state = 0, error = 0;
+            uint32_t drawn = 0, before = 0;
+            overlayStatus(&state, &before, &error);
+
+            for (int i = 0; i < 300 && drawn < before + 4; ++i)
+            {
+                Sleep(40);
+                overlayStatus(&state, &drawn, &error);
+            }
+
+            if (drawn < before + 4)
+                return false;
+
+            if (read(into.data(), (uint32_t) into.size(), &pw, &ph) != 1 && round == 1)
+                return false;
+        }
+
+        return pw == 3072 && ph == 1536;
+    };
+
+    if (after(first))
+    {
+        cfg[83] = 1.0f;
+        configure(cfg, 96);
+        const bool changed = after(second);
+        int worst = 0, checked = 0;
+
+        for (uint32_t y = 0; y < ph; y += 16)
+        {
+            for (uint32_t x = 0; x < pw; x += 16)
+            {
+                const uint8_t* g = &first[((size_t) y * pw + x) * 4];
+                const uint8_t* c = &second[((size_t) y * pw + x) * 4];
+
+                if (g[3] != 255)
+                    continue;
+
+                checked++;
+
+                for (int i = 0; i < 3; ++i)
+                    worst = std::max(worst, abs(c[i] - (int) lroundf(RampAt(cfg, i, g[0] / 255.0f) * 255.0f)));
+            }
+        }
+
+        CHECK(changed && checked > 1000 && worst <= 6, "the overlay's picture takes the ramp too (worst %d/255 over %d texels)", worst, checked);
+
+        // Colours handed in, on the overlay's device: both eyes take them from the first lens's
+        // picture, where they fade out towards its rim a little before the picture itself does.
+        {
+            std::vector<uint8_t> handed((size_t) vwscolour::kOut * vwscolour::kOut * 4);
+
+            for (size_t i = 0; i < handed.size(); i += 4)
+            {
+                handed[i] = 160;
+                handed[i + 1] = 100;
+                handed[i + 2] = 0;
+                handed[i + 3] = 255;
+            }
+
+            colourInject(handed.data(), nullptr);
+            cfg[83] = 3.0f;
+            cfg[95] = 1.0f;
+            configure(cfg, 96);
+            const bool drawn = after(second);
+            const float cb = (160 - 128) / 255.0f, cr = (100 - 128) / 255.0f;
+            int left = 0, leftRight = 0, right = 0, worstLuma = 0;
+
+            for (uint32_t y = 0; y < ph; y += 16)
+            {
+                for (uint32_t x = 0; x < pw; x += 16)
+                {
+                    const uint8_t* g = &first[((size_t) y * pw + x) * 4];
+                    const uint8_t* c = &second[((size_t) y * pw + x) * 4];
+
+                    if (g[3] != 255 || g[0] < 60 || g[0] > 190)
+                        continue;
+
+                    // how much of the full difference came through, by the blue and by the red
+                    const float byBlue = (c[2] - g[0]) / (1.772f * cb * 255.0f), byRed = (c[0] - g[0]) / (1.402f * cr * 255.0f);
+                    worstLuma = std::max(worstLuma, abs((int) lroundf(0.299f * c[0] + 0.587f * c[1] + 0.114f * c[2]) - g[0]));
+
+                    if (x < pw / 2)
+                    {
+                        left++;
+                        leftRight += byBlue >= 0.6f && byBlue <= 1.06f && byRed >= 0.6f && byRed <= 1.06f ? 1 : 0;
+                    }
+                    else if (byBlue > 0.5f)
+                    {
+                        right++;
+                    }
+                }
+            }
+
+            CHECK(drawn && left > 300 && leftRight == left && worstLuma <= 3,
+                  "colours handed in show in the overlay's picture, as bright as the grey was (%d of %d of the left eye's texels, brightness off by %d/255)", leftRight, left, worstLuma);
+            CHECK(right > 300, "and the right eye takes them from the first lens too (%d texels)", right);
+            colourInject(nullptr, nullptr);
+        }
+
+        // The network, end to end: the camera thread feeds it, and its colours come into the picture.
+        cfg[83] = 3.0f;
+        configure(cfg, 96);
+        int32_t state = 0;
+        uint32_t pictures = 0, picturesBefore = 0, micros = 0;
+        colourStatus(&state, &picturesBefore, &micros);
+        pictures = picturesBefore;
+
+        for (int i = 0; i < 300 && state >= 0 && pictures < picturesBefore + 2; ++i)
+        {
+            Sleep(100);
+            colourStatus(&state, &pictures, &micros);
+        }
+
+        if (state < 0)
+        {
+            char why[256] = {};
+            colourError(why, sizeof(why));
+            CHECK(strstr(why, "colour.onnx") != nullptr, "without its network the colours say what is missing (%s)", why);
+            printf("  (colour.onnx is not beside the DLL: the network itself was not run)\n");
+            after(second);
+            int off = 0;
+
+            for (size_t i = 0; i < first.size(); i += 4 * 97)
+                off = std::max(off, abs(second[i] - first[i]));
+
+            CHECK(off <= 1, "and the room is shown in the camera's grey (off by %d)", off);
+        }
+        else
+        {
+            CHECK(state == 2 && pictures >= picturesBefore + 2 && micros > 0, "the colour thread colours the camera's pictures (%u of them, %.0f ms the last)",
+                  pictures - picturesBefore, micros / 1000.0);
+            after(second);
+            int worstLuma = 0, coloured = 0, texels = 0;
+
+            for (uint32_t y = 0; y < ph; y += 8)
+            {
+                for (uint32_t x = 0; x < pw; x += 8)
+                {
+                    const uint8_t* g = &first[((size_t) y * pw + x) * 4];
+                    const uint8_t* c = &second[((size_t) y * pw + x) * 4];
+
+                    // (a colour too strong for its grey is cut off at black or white, and its
+                    // brightness with it: those are left out)
+                    if (g[3] != 255 || c[0] == 0 || c[1] == 0 || c[2] == 0 || c[0] == 255 || c[1] == 255 || c[2] == 255)
+                        continue;
+
+                    texels++;
+                    worstLuma = std::max(worstLuma, abs((int) lroundf(0.299f * c[0] + 0.587f * c[1] + 0.114f * c[2]) - g[0]));
+
+                    if (abs(c[0] - c[1]) > 2 || abs(c[2] - c[1]) > 2)
+                        coloured++;
+                }
+            }
+
+            CHECK(texels > 4000 && worstLuma <= 3, "with colours in it the room is as bright as the camera saw it (worst %d/255 over %d texels)", worstLuma, texels);
+            printf("  (the network gave %d of those texels a colour; a picture takes %.0f ms here)\n", coloured, micros / 1000.0);
+
+            std::vector<uint8_t> solved((size_t) vwscolour::kOut * vwscolour::kOut * 4);
+            uint32_t took = 0;
+            const int ok = colourSolve(g_fakeCam.data(), cw, ch, 1.2f, nullptr, solved.data(), (uint32_t) solved.size(), &took);
+            CHECK(ok == 1 && solved[3] == 255 && took > 0, "one frame can be coloured in one call (%.0f ms)", took / 1000.0);
+        }
+    }
+    else
+    {
+        CHECK(false, "the overlay drew a picture");
+    }
+
+    // A lost device: another is made after a pause that grows, and never none at all.
+    {
+        typedef uint32_t (*OverlayLostFn)(uint32_t, float*);
+        const OverlayLostFn lost = (OverlayLostFn) GetProcAddress(dll, "vws_overlay_lost");
+        CHECK(lost != nullptr, "the overlay says how often its device was lost");
+
+        if (lost != nullptr)
+        {
+            float pause[8] = {};
+
+            for (uint32_t i = 0; i < 8; ++i)
+                lost(i, &pause[i]);
+
+            CHECK(pause[1] == 0.25f && pause[2] == 0.5f && pause[3] == 1.0f && pause[5] == 4.0f && pause[6] == 5.0f && pause[7] == 5.0f,
+                  "after a lost device another is made in a quarter of a second, then a half, and at most five apart (%.2f %.2f %.2f .. %.2f %.2f)",
+                  pause[1], pause[2], pause[3], pause[6], pause[7]);
+            CHECK(lost(0, nullptr) == 0, "the overlay's device was not lost once in these checks (%u times)", lost(0, nullptr));
+        }
+    }
+
+    stop();
+    frame->Release();
+    cfg[73] = 0.0f;
+    cfg[74] = 0.0f;
+    cfg[83] = 0.0f;
+    configure(cfg, 96);
+    Drain(true);
+}
+
 int wmain(int argc, wchar_t** argv)
 {
     const wchar_t* dllPath = argc > 1 ? argv[1] : L"VamDlssNrWorkScaleNative.dll";
@@ -4144,6 +4730,8 @@ int wmain(int argc, wchar_t** argv)
     Drain(true);
     TestPassthrough(dll);
     TestOverlay(dll);
+    TestLooks(dll);
+    TestLogs(dll);
     TestHands(dll);
     TestFovea(dll);
     TestFoveaReal(dll);

@@ -69,4 +69,10 @@ if (Test-Path $fullModel) { Copy-Item $fullModel (Join-Path $out 'hand-points-fu
 $mercuryModel = Join-Path $deps 'hand-mercury.onnx'
 if (Test-Path $mercuryModel) { Copy-Item $mercuryModel (Join-Path $out 'hand-mercury.onnx') -Force }
 
+# The network that guesses the room's colours (DDColor-tiny, Apache-2.0), likewise when it has
+# been put in deps as colour.onnx: native\export-colour-model.py makes it. The passthrough's look
+# 'colours guessed by a network' needs it; without it that look shows the camera's grey.
+$colourModel = Join-Path $deps 'colour.onnx'
+if (Test-Path $colourModel) { Copy-Item $colourModel (Join-Path $out 'colour.onnx') -Force }
+
 Get-ChildItem $out -Include *.dll, *.exe -Recurse | Select-Object Name, Length, LastWriteTime

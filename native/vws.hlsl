@@ -61,6 +61,7 @@ Texture2D<float4> tModel : register(t2);
 Texture2D<float4> tKept  : register(t3);   // the edit kept over frames (rgb), and how bright the model's input was there (a):
                                             // PSSteady reads last frame's and writes this frame's; the resolve reads this frame's
 Texture2D<float4> tMotion : register(t4);  // PSGather: the model-size motion vectors
+Texture2D<float4> tColour : register(t5);  // the room's colours as a network guessed them (see Look)
 SamplerState      sLinear : register(s0);
 
 // Both saturate first. That bounds the value to what an 8-bit model input can carry, and under
@@ -853,6 +854,69 @@ float4 PSDepthFill(float4 pos : SV_Position, out float depth : SV_Depth) : SV_Ta
 // camera's fisheye to a place in its frame. tFrame is a copy of the target, tProxy the camera's
 // frame (grey; the two lenses side by side). One eye per draw.
 
+// ---- the camera picture's look ------------------------------------------------------------------
+//
+// The cameras are monochrome. What the room is shown in: the grey as it comes (0); a ramp of
+// three colours laid over it -- night-vision green, amber, sepia... (1); a ramp of heat (2); or
+// the colours a network guessed for the picture (3: see vws_colour.h), which come a few times a
+// second and at a fraction of the picture's size, as two differences from the brightness. The
+// brightness stays the camera's own. All of it in displayed (sRGB-encoded) values.
+
+// (Dave Hoskins' hash without sine)
+float Speck(float2 p, float seed)
+{
+    float3 p3 = frac(float3(p.xyx) * 0.1031 + seed * 0.0137);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return frac((p3.x + p3.y) * p3.z);
+}
+
+float3 Heat(float t)
+{
+    static const float3 stops[6] =
+    {
+        float3(0.0, 0.0, 0.03), float3(0.33, 0.0, 0.5), float3(0.82, 0.08, 0.3), float3(1.0, 0.5, 0.0), float3(1.0, 0.9, 0.2), float3(1.0, 1.0, 1.0)
+    };
+    const float s = saturate(t) * 5.0;
+    const int i = min((int) s, 4);
+    return lerp(stops[i], stops[i + 1], s - (float) i);
+}
+
+// A point in the space of the camera the colours belong to: where in tColour, and how far that is
+// to be believed (the lens's picture is a circle, and fades out towards its rim).
+float3 ColourAt(float3 q, float focal, float4 k, float2 centre, float lensW, float lensH)
+{
+    const float across = max(length(q.xy), 1e-9);
+    const float angle = atan2(across, -q.z);
+    const float a2 = angle * angle;
+    const float radius = focal * angle * (1.0 + a2 * (k.x + a2 * (k.y + a2 * (k.z + a2 * k.w))));
+    const float2 texel = centre + radius * float2(q.x, -q.y) / across;
+    return float3(texel.x / lensW, texel.y / lensH, saturate((lensW * 0.5 - 6.0 - radius) / 60.0));
+}
+
+// low, mid, high: the ramp's colours from dark to bright; low.a = which look, mid.a = how much
+// grain, high.a = how much darker towards the rim of the view. more: x changes with every
+// picture, y = how strong the network's colours are. pixel: where on the target. tangent: how far
+// off the eye's axis this line of sight is. colour: tColour there (xy), and how far to believe it.
+float3 Look(float grey, float4 low, float4 mid, float4 high, float4 more, float2 pixel, float tangent, float3 colour)
+{
+    const int look = (int) (low.a + 0.5);
+
+    if (look == 0)
+        return grey.xxx;
+
+    float g = saturate(grey + (Speck(pixel, more.x) - 0.5) * mid.a * 0.5);
+    g *= 1.0 - high.a * smoothstep(0.45, 1.3, tangent);
+
+    if (look == 1)
+        return g < 0.5 ? lerp(low.rgb, mid.rgb, g * 2.0) : lerp(mid.rgb, high.rgb, g * 2.0 - 1.0);
+
+    if (look == 2)
+        return Heat(g);
+
+    const float2 d = (tColour.SampleLevel(sLinear, colour.xy, 0).rg * 255.0 - 128.0) / 255.0 * (more.y * colour.z);
+    return saturate(float3(g + 1.402 * d.y, g - 0.344136 * d.x - 0.714136 * d.y, g + 1.772 * d.x));
+}
+
 cbuffer PassthroughParams : register(b1)
 {
     float4 pDst;     // target width, height, 1/width, 1/height
@@ -866,6 +930,13 @@ cbuffer PassthroughParams : register(b1)
     float4 pRow1;
     float4 pRow2;
     float4 pMisc;    // eye, eyes in the target, target holds encoded values, first row at the top
+    float4 pLow;     // the look (see Look): the ramp's dark end; a = which look
+    float4 pMid;     // its middle; a = grain
+    float4 pHigh;    // its bright end; a = darker towards the rim
+    float4 pMore;    // x = changes with every picture, y = the network's colours' strength (0 where there are none yet)
+    float4 pCol0;    // a point in the eye's space -> the camera the colours belong to, as it stood then
+    float4 pCol1;
+    float4 pCol2;
 };
 
 // The alpha the game's own picture is marked with while the room's depth is in use. The interface is
@@ -930,8 +1001,11 @@ float4 PSPassthrough(float4 pos : SV_Position) : SV_Target
     texel = clamp(texel, 0.0, float2(lensW, pCam.y) - 1.0);
 
     const float2 uv = float2((texel.x + 0.5 + pMisc.x * lensW) / pCam.x, (texel.y + 0.5) / pCam.y);
-    const float grey = saturate(tProxy.SampleLevel(sLinear, uv, 0).r * pTune.y) * inside;
-    const float3 room = encoded ? grey.xxx : SrgbToLinear(grey.xxx);
+    const float grey = saturate(tProxy.SampleLevel(sLinear, uv, 0).r * pTune.y);
+    const float3 there = float3(dot(pCol0.xyz, at) + pCol0.w, dot(pCol1.xyz, at) + pCol1.w, dot(pCol2.xyz, at) + pCol2.w);
+    const float3 shown = Look(grey, pLow, pMid, pHigh, pMore, pos.xy, length(float2(lerp(pTan.x, pTan.y, u), lerp(pTan.z, pTan.w, v))),
+                              ColourAt(there, pTune.w, pK, pCentre.xy, lensW, pCam.y)) * inside;
+    const float3 room = encoded ? shown : SrgbToLinear(shown);
 
     return float4(lerp(c.rgb, room, matte), mark ? own * (1.0 - matte) : c.a);
 }
@@ -1043,6 +1117,11 @@ cbuffer OverlayParams : register(b1)
     float4 oMatte;      // x = how much of the matte texture's height is matte, y = the row its pose is in, z = how far the depth grid reaches to each side, as a tangent
     float4 oDepth;      // x = the room's depth is used, y = how much nearer (per metre) the room must be than the scene to show in front of it, z = over how much more it fades in
     float4 oGrid;       // the depth grid: cells per side, -, -, the most 1/distance
+    float4 oLow;        // the look (see Look): the ramp's dark end; a = which look
+    float4 oMid;        // its middle; a = grain
+    float4 oHigh;       // its bright end; a = darker towards the rim
+    float4 oMore;       // x = changes with every picture, y = the network's colours' strength (0 where there are none yet)
+    float4 oCol[3];     // a point in the head's space, as it stood at the camera frame's moment -> the camera the colours belong to, as it stood then
 };
 
 // A point of the head's space in a lens's picture: its texel, and how far from the lens's centre
@@ -1188,5 +1267,7 @@ float4 PSOverlay(OverlayVertex vertex) : SV_Target
     if (view == 4)
         return float4(sqrt(saturate(scene * 0.25)).xxx, inPicture ? 1.0 : 0.0);
 
-    return float4(grey, grey, grey, alpha * inside);
+    const float3 there = float3(dot(oCol[0].xyz, shown) + oCol[0].w, dot(oCol[1].xyz, shown) + oCol[1].w, dot(oCol[2].xyz, shown) + oCol[2].w);
+    return float4(Look(grey, oLow, oMid, oHigh, oMore, pos.xy, g.z < -1e-3 ? length(g.xy) / -g.z : 4.0,
+                       ColourAt(there, oLens.x, oK, oCentre.xy, lensW, oCam.y)), alpha * inside);
 }

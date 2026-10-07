@@ -728,20 +728,27 @@ namespace VamDlssNrWorkScale
         // The tabs: half of them above the left column, the rest above the right. Each row is one of
         // VaM's own buttons with its face switched off, so that the column lays it out as it does any
         // other control, holding one small button a tab side by side.
+        // How the tabs are laid out across the two columns: up to four pages in one row, more in
+        // two rows. `each` is how many places a column has in a row; the pages fill them in
+        // reading order (left column, right column, next row), and a place left over stays empty,
+        // so that every tab is as wide as the others.
+        internal static void TabGrid(int count, out int rows, out int each)
+        {
+            rows = count > 4 ? 2 : 1;
+            each = Math.Max(1, (count + rows * 2 - 1) / (rows * 2));
+        }
+
         private static void Tabs(Panel p)
         {
             Transform prefab = p.Script.manager != null ? p.Script.manager.configurableButtonPrefab : null;
             int count = p.Pages.Count;
-            int leftCount = (count + 1) / 2;
+            int rows, each;
+            TabGrid(count, out rows, out each);
 
-            for (int column = 0; column < 2 && prefab != null && count > 1; column++)
+            // (each holder goes to the top of its column, so the lower row is made first)
+            for (int place = rows * 2 - 1; place >= 0 && prefab != null && count > 1; place--)
             {
-                int from = column == 0 ? 0 : leftCount, to = column == 0 ? leftCount : count;
-
-                if (from >= to)
-                {
-                    continue;
-                }
+                int column = place % 2, from = place * each, to = from + each;
 
                 UIDynamicButton holder = p.Script.CreateButton("", column == 1);
 
@@ -776,6 +783,14 @@ namespace VamDlssNrWorkScale
 
                 for (int i = from; i < to; i++)
                 {
+                    if (i >= count)
+                    {
+                        GameObject gap = new GameObject("gap", typeof(RectTransform));
+                        gap.transform.SetParent(holder.transform, false);
+                        gap.AddComponent<UnityEngine.UI.LayoutElement>().flexibleWidth = 1f;
+                        continue;
+                    }
+
                     Transform t = UnityEngine.Object.Instantiate(prefab);
                     t.SetParent(holder.transform, false);
                     t.gameObject.SetActive(true);
@@ -973,6 +988,7 @@ namespace VamDlssNrWorkScale
             if (HeadsetUi.Hooked && SceneUi.CfgOn != null)
             {
                 Toggle(p, Left, "Scene UI atoms: after DLSS / NR", SceneUi.CfgOn);
+                Toggle(p, Left, "Scene UI atoms: hidden behind people", SceneUi.CfgOcclude);
             }
 
             Toggle(p, Left, "Frame generation (monitor only)", Mod<bool>("CfgFrameGen"));
@@ -1021,10 +1037,28 @@ namespace VamDlssNrWorkScale
                 ToDefault(motionY);
             });
 
-            // ---- foveated shading of the scene ----
-            if (Foveation.CfgOn != null)
+            // The controllers' and the mouse's menu passes, left out while they are off the menus (see MenuPointers).
+            if (MenuPointers.CfgOn != null && MenuPointers.Hooked)
+            {
+                Toggle(p, Right, "Menu pointers: rest while not on a menu (headset)", MenuPointers.CfgOn);
+            }
+
+            // Where the main thread's time goes, for half a minute, to the log (see Profile).
+            Button(p, Right, "Profile the main thread (to the log)", delegate
+            {
+                Profile.Start();
+            });
+
+            // ---- foveation: of the scene's shading on the left and above, of DLSS itself below it on the right ----
+            bool window = DlssWindow.CfgOn != null && DlssWindow.Hooked;
+
+            if (Foveation.CfgOn != null || window)
             {
                 Page(p, "Foveation");
+            }
+
+            if (Foveation.CfgOn != null)
+            {
                 Toggle(p, Left, "Foveated shading (NVIDIA)", Foveation.CfgOn);
                 Toggle(p, Left, "Foveation follows gaze", Foveation.CfgGaze);
                 Slider(p, Left, "Foveation: full detail within", Foveation.CfgInner, "F2");
@@ -1034,6 +1068,14 @@ namespace VamDlssNrWorkScale
                 Toggle(p, Right, "Foveation: show the zones", Foveation.CfgShow);
                 Toggle(p, Right, "Foveation: zone is upside down", Foveation.CfgTopDown);
                 Toggle(p, Right, "Foveation on the monitor too", Foveation.CfgMonitor);
+            }
+
+            // DLSS on a window of each eye (see DlssWindow).
+            if (window)
+            {
+                Toggle(p, Right, "DLSS window: DLSS only around the middle (headset, DLAA)", DlssWindow.CfgOn);
+                Slider(p, Right, "DLSS window: size", DlssWindow.CfgSize, "F2");
+                Toggle(p, Right, "DLSS window: follows gaze (in steps)", DlssWindow.CfgGaze);
             }
 
             // ---- passthrough: what is cut out on the left, how the room is shown on the right ----
@@ -1049,12 +1091,27 @@ namespace VamDlssNrWorkScale
 
                 Choice(p, Right, "Passthrough mode", Passthrough.CfgMode, new[] { "Own overlay (camera's pace)", "In the game's frame" }, new[] { 0, 1 });
                 Slider(p, Right, "Passthrough overlay distance (m)", Passthrough.CfgOverlayDistance, "F0");
+
+                if (Passthrough.CfgHandOver != null)
+                {
+                    Choice(p, Right, "Passthrough overlay: pictures to SteamVR", Passthrough.CfgHandOver, new[] { "By shared handle", "As textures it copies (old)" }, new[] { 0, 1 });
+                }
                 Toggle(p, Right, "Passthrough overlay: room behind", Passthrough.CfgRoomBehind);
                 Slider(p, Right, "Passthrough distance (m)", Passthrough.CfgDistance, "F2");
                 Slider(p, Right, "Passthrough brightness", Passthrough.CfgBrightness, "F2");
                 Slider(p, Right, "Passthrough room size", Passthrough.CfgFocal, "F0");
                 Toggle(p, Right, "Passthrough follows head", Passthrough.CfgFollowHead);
                 Choice(p, Right, "Passthrough view", Passthrough.CfgView, new[] { "Picture", "Matte", "Camera everywhere", "Room depth", "Scene depth" }, new[] { 0, 1, 2, 3, 4 });
+
+                // What the cameras' grey is shown in (see Passthrough.LookNumbers).
+                if (Passthrough.CfgLook != null)
+                {
+                    Choice(p, Left, "Room look", Passthrough.CfgLook, Passthrough.LookNames, new[] { 0, 1, 2, 3, 4, 5, 6, 7 });
+                    Colour(p, Left, "Room look: your colour", Passthrough.CfgLookRed, Passthrough.CfgLookGreen, Passthrough.CfgLookBlue, null);
+                    Slider(p, Left, "Room look: grain", Passthrough.CfgGrain, "F2");
+                    Slider(p, Left, "Room look: dark rim", Passthrough.CfgRim, "F2");
+                    Slider(p, Left, "Room look: strength of the guessed colours", Passthrough.CfgColour, "F2");
+                }
 
                 if (Passthrough.CfgDepth != null)
                 {
@@ -1102,6 +1159,17 @@ namespace VamDlssNrWorkScale
                 {
                     CameraProbe.Begin(Time.unscaledTime);
                 });
+            }
+
+            // ---- which logs are written to disk (see Logs) ----
+            if (Logs.CfgOwn != null)
+            {
+                Page(p, "Logs");
+                Toggle(p, Left, "Log file: this plugin's lines", Logs.CfgOwn);
+                Toggle(p, Left, "Log file: VaM DLSS's lines", Logs.CfgMod);
+                Toggle(p, Right, "VaM DLSS: vr_motion.log", Logs.CfgMotionFile);
+                Toggle(p, Right, "VaM DLSS: ngx\\vdn.log, vdn_fg.log", Logs.CfgNativeFiles);
+                Toggle(p, Right, "NVIDIA DLSS: ngx\\nvngx*.log", Logs.CfgNgxFiles);
             }
 
             Tabs(p);
@@ -1261,6 +1329,11 @@ namespace VamDlssNrWorkScale
             StringBuilder sb = new StringBuilder(320);
             string line = null;
 
+            if (Profile.Line.Length != 0)
+            {
+                sb.Append("<b>").Append(Profile.Line).Append("</b>\n");
+            }
+
             try
             {
                 line = M_statusLine != null ? M_statusLine.Invoke(null, null) as string : null;
@@ -1293,6 +1366,16 @@ namespace VamDlssNrWorkScale
             if (SceneUi.Status.Length != 0)
             {
                 sb.Append(SceneUi.Status).Append('\n');
+            }
+
+            if (DlssWindow.Status.Length != 0)
+            {
+                sb.Append(DlssWindow.Status).Append('\n');
+            }
+
+            if (Logs.Status.Length != 0)
+            {
+                sb.Append(Logs.Status).Append('\n');
             }
 
             if (Presentation.Status.Length != 0)

@@ -36,6 +36,8 @@ $fullModel = Join-Path $here 'native\out\hand-points-full.onnx'
 if (Test-Path $fullModel) { Copy-Item $fullModel $plugin }
 $mercuryModel = Join-Path $here 'native\out\hand-mercury.onnx'
 if (Test-Path $mercuryModel) { Copy-Item $mercuryModel $plugin }
+$colourModel = Join-Path $here 'native\out\colour.onnx'
+if (Test-Path $colourModel) { Copy-Item $colourModel $plugin }
 Copy-Item (Join-Path $here 'THIRD-PARTY.md') (Join-Path $dist 'VamDlssNrWorkScale-THIRD-PARTY.md')
 Copy-Item (Join-Path $here 'README.md') (Join-Path $dist 'VamDlssNrWorkScale-README.md')
 Copy-Item (Join-Path $here 'LICENSE') (Join-Path $dist 'VamDlssNrWorkScale-LICENSE.txt')
@@ -44,14 +46,14 @@ Copy-Item (Join-Path $here 'LICENSE') (Join-Path $dist 'VamDlssNrWorkScale-LICEN
 if ($LASTEXITCODE -ne 0) { throw 'the .var package could not be built' }
 
 if ($Zip) {
-    # The release does not carry the two models the build only takes along when they have been put
+    # The release does not carry the models the build only takes along when they have been put
     # in native\deps by hand (see the README, Building): the zip is made from a copy without them.
     $zipPath = Join-Path $here "VamDlssNrWorkScale-v$version.zip"
     if (Test-Path $zipPath) { Remove-Item $zipPath -Force -Confirm:$false }
     $stage = Join-Path ([IO.Path]::GetTempPath()) "VamDlssNrWorkScale-zip-$PID"
     if (Test-Path $stage) { Remove-Item $stage -Recurse -Force -Confirm:$false }
     Copy-Item $dist $stage -Recurse
-    foreach ($optional in 'hand-points-full.onnx', 'hand-mercury.onnx') {
+    foreach ($optional in 'hand-points-full.onnx', 'hand-mercury.onnx', 'colour.onnx') {
         $path = Join-Path $stage "BepInEx\plugins\VamDlssNrWorkScale\$optional"
         if (Test-Path $path) { Remove-Item $path -Force -Confirm:$false }
     }

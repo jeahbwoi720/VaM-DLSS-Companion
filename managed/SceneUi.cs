@@ -57,6 +57,16 @@ namespace VamDlssNrWorkScale
         }
 
         // The layer's bit, where this camera is to have it taken off; 0 where there is nothing to.
+        // In a headset, where the menu is drawn by a camera of somebody else's: noted for the status.
+        private static int _elsewhereFrame = -100;
+        private static string _elsewhereName = "";
+
+        internal static void Elsewhere(Camera other)
+        {
+            _elsewhereFrame = Time.frameCount;
+            _elsewhereName = other != null ? other.name : "?";
+        }
+
         internal static int Mask(Camera camera)
         {
             if (!Wanted || camera == null)
@@ -77,8 +87,76 @@ namespace VamDlssNrWorkScale
             return bit;
         }
 
+        // For looking at what the game's window shows without looking at the screen: the window's
+        // own picture, as the game drew it, saved once beside the plugin so many seconds after VaM
+        // started (0: never) -- and once more three seconds later with this option switched the
+        // other way for those seconds, so that the two can be compared. Nothing of the desktop is
+        // in either.
+        internal static ConfigEntry<int> CfgPicture;
+        private static float _pictureAt = -1f;
+
+        private static System.Collections.IEnumerator Picture()
+        {
+            yield return new WaitForEndOfFrame();
+            Save("window-picture.png");
+
+            if (CfgOn != null)
+            {
+                bool was = CfgOn.Value;
+                CfgOn.Value = !was;
+                float until = Time.unscaledTime + 3f;
+
+                while (Time.unscaledTime < until)
+                {
+                    yield return null;
+                }
+
+                yield return new WaitForEndOfFrame();
+                Save("window-picture-other.png");
+                CfgOn.Value = was;
+            }
+        }
+
+        private static void Save(string name)
+        {
+            try
+            {
+                Texture2D picture = new Texture2D(Screen.width, Screen.height, TextureFormat.RGB24, false);
+                picture.ReadPixels(new Rect(0, 0, Screen.width, Screen.height), 0, 0, false);
+                picture.Apply(false);
+                string path = System.IO.Path.Combine(System.IO.Path.GetDirectoryName(typeof(SceneUi).Assembly.Location), name);
+                System.IO.File.WriteAllBytes(path, ImageConversion.EncodeToPNG(picture));
+                UnityEngine.Object.Destroy(picture);
+
+                if (Hooks.Info != null)
+                {
+                    Hooks.Info("the window's picture is saved (" + Screen.width + "x" + Screen.height + "): " + name + " beside the plugin, with scene UI atoms after DLSS " + (CfgOn != null && CfgOn.Value ? "on" : "off") + "; " + Status);
+                }
+            }
+            catch (Exception ex)
+            {
+                if (Hooks.Warn != null)
+                {
+                    Hooks.Warn("the window's picture could not be saved: " + ex.GetType().Name + ": " + ex.Message);
+                }
+            }
+        }
+
         internal static void Tick(float now)
         {
+            if (CfgPicture != null && CfgPicture.Value > 0 && _pictureAt != float.MaxValue)
+            {
+                if (_pictureAt < 0f)
+                {
+                    _pictureAt = now + CfgPicture.Value;
+                }
+                else if (now >= _pictureAt && WorkScalePlugin.Instance != null)
+                {
+                    _pictureAt = float.MaxValue;
+                    WorkScalePlugin.Instance.StartCoroutine(Picture());
+                }
+            }
+
             if (CfgOn == null)
             {
                 return;
@@ -101,7 +179,22 @@ namespace VamDlssNrWorkScale
             // The monitor's camera, when VaM DLSS no longer comes by to have it set up.
             if (_own != null && _own.enabled && Time.frameCount - _monitorSeen > 2)
             {
+                Why("VaM DLSS's camera has not come by for " + (Time.frameCount - _monitorSeen) + " frames");
                 MonitorOff();
+            }
+
+            // Why the atoms' drawing was switched off, when it was: said once a second at most.
+            if (_offs != 0 && now - _offSaidAt >= 1f)
+            {
+                if (Hooks.Info != null && _offSaid < 40)
+                {
+                    _offSaid++;
+                    Hooks.Info("scene UI atoms: drawing after VaM DLSS was switched off " + _offs + " time(s) in " + (now - _offSaidAt).ToString("0.0") + " s, on for " + _ons + " frame(s) between; the last time because " + _offWhy);
+                }
+
+                _offs = 0;
+                _ons = 0;
+                _offSaidAt = now;
             }
 
             if (now < _scanAt)
@@ -122,7 +215,26 @@ namespace VamDlssNrWorkScale
             }
 
             Say(now);
+
+            // Said in the log as well whenever it becomes another: what the atoms were doing in a
+            // session is then there to be read afterwards.
+            if (Status != _statusSaid && now - _statusSaidAt > 2f)
+            {
+                _statusSaid = Status;
+                _statusSaidAt = now;
+
+                if (Hooks.Info != null && Status.Length != 0)
+                {
+                    uint done, noTarget, failed;
+                    Native.DepthFillStatus(out done, out noTarget, out failed);
+                    Hooks.Info(Status + " [" + (_own != null && _own.enabled && _draw != null ? "drawn by hand at camera depth " + _own.depth.ToString("0.00") + ", layers " + _draw.cullingMask : "not drawn by us") +
+                        "; depth laid " + done + " times, no target " + noTarget + ", failed " + failed + "; hidden behind people " + (CfgOcclude != null && CfgOcclude.Value ? "on" : "off") + "]");
+                }
+            }
         }
+
+        private static string _statusSaid = "";
+        private static float _statusSaidAt = -100f;
 
         private static void Scan()
         {
@@ -254,12 +366,10 @@ namespace VamDlssNrWorkScale
                 return;
             }
 
-            bool kept = CfgOcclude != null && CfgOcclude.Value && Keep(camera, stereo);
-
-            // On the monitor the atoms' own camera renders after this one: its fill, for this frame.
-            if (!stereo && kept && _own != null && _ownFill != null)
+            // (on the monitor the depth is laid when the atoms are drawn: see Marked)
+            if (CfgOcclude != null && CfgOcclude.Value)
             {
-                Fill(_ownFill, -1, true);
+                Keep(camera, stereo);
             }
         }
 
@@ -350,6 +460,12 @@ namespace VamDlssNrWorkScale
 
             if (mask == 0 || Time.frameCount - _monitorComposed > 2)
             {
+                if (_own != null && _own.enabled)
+                {
+                    Why(mask == 0 ? "there was nothing to take off the scene's camera (" + (!Able() ? "the option is off or the hooks are not there" : (_refused.Length != 0 ? _refused : (_moved.Count == 0 ? "no canvases moved" : "its mask 0x" + main.cullingMask.ToString("X")))) + ")"
+                        : "VaM DLSS has not composed a frame for " + (Time.frameCount - _monitorComposed) + " frames");
+                }
+
                 MonitorOff();
                 return 0;
             }
@@ -367,22 +483,38 @@ namespace VamDlssNrWorkScale
             int off = main.cullingMask & mask;
 
             // After VaM DLSS's picture has been put on the screen (its camera for that is a
-            // quarter above the scene's) and before its interface (a half above).
+            // quarter above the scene's) and before its interface (a half above). That camera
+            // only marks the moment and draws nothing itself: a camera of the frame's own round
+            // does not draw these canvases when their layer is all it has (seen in the game: a
+            // cube on the layer it draws, the canvases not, whatever is done to it or them), while
+            // one rendered by hand does -- which is how the headset's are drawn, and now these.
             own.depth = main.depth + 0.4f;
-            own.cullingMask = off;
-            own.fieldOfView = main.fieldOfView;
-            own.nearClipPlane = main.nearClipPlane;
-            own.farClipPlane = main.farClipPlane;
-            own.allowMSAA = main.allowMSAA;
-            own.ResetAspect();
-            own.ResetProjectionMatrix();
+            own.cullingMask = 0;
+            _draw.cullingMask = off;
+            _draw.fieldOfView = main.fieldOfView;
+            _draw.nearClipPlane = main.nearClipPlane;
+            _draw.farClipPlane = main.farClipPlane;
+            _draw.allowMSAA = main.allowMSAA;
+            _draw.ResetAspect();
+            _draw.ResetProjectionMatrix();
 
             if (off != 0)
             {
                 _drawnAt = Time.unscaledTime;
+                _ons++;
             }
 
             return off;
+        }
+
+        private static int _offs, _ons, _offSaid;
+        private static float _offSaidAt;
+        private static string _offWhy = "";
+
+        private static void Why(string why)
+        {
+            _offs++;
+            _offWhy = why;
         }
 
         private static void MonitorOff()
@@ -393,9 +525,58 @@ namespace VamDlssNrWorkScale
                 _own.cullingMask = 0;
             }
 
+            if (_draw != null)
+            {
+                _draw.cullingMask = 0;
+            }
+
             if (_ownFill != null)
             {
                 _ownFill.Clear();
+            }
+        }
+
+        private static Camera _draw;
+        private static bool _marked;
+        private static int _activeKind = -1;
+
+        // The moment in the frame: the marking camera has had its turn.
+        private static void Marked(Camera camera)
+        {
+            if ((object)camera != _own || _draw == null || _draw.cullingMask == 0)
+            {
+                return;
+            }
+
+            // Into whatever the frame's cameras are drawing into at this moment. That is the screen
+            // -- until VaM DLSS has been through an upscaling mode once: from then on, back at DLAA
+            // or with DLSS off, Unity has the cameras after the scene's draw into a buffer of its
+            // own that it puts on the screen at the end, and what is drawn onto the screen itself
+            // is covered by it (seen in the game: the atoms gone after DLAA -> Performance -> DLAA).
+            RenderTexture active = RenderTexture.active;
+            int kind = active != null ? 1 : 0;
+
+            if (kind != _activeKind && Hooks.Info != null)
+            {
+                _activeKind = kind;
+                Hooks.Info("scene UI atoms: drawn into " + (active != null ? "the frame's own buffer (" + active.width + "x" + active.height + " '" + active.name + "')" : "the screen"));
+            }
+
+            try
+            {
+                // The scene's depth under them: a render texture has its first row at the bottom,
+                // as the kept depth has; the screen has it at the top.
+                Fill(_ownFill, -1, active == null);
+                _draw.targetTexture = active;
+                _draw.Render();
+                _draw.targetTexture = null;
+                RenderTexture.active = active;
+            }
+            catch (Exception ex)
+            {
+                _draw.cullingMask = 0;
+                _refused = "they could not be drawn after VaM DLSS (" + ex.GetType().Name + ": " + ex.Message + ")";
+                GiveBack();
             }
         }
 
@@ -406,9 +587,16 @@ namespace VamDlssNrWorkScale
                 if (_own.transform.parent != main.transform)
                 {
                     _own.transform.SetParent(main.transform, false);
+                    _draw.transform.SetParent(main.transform, false);
                 }
 
                 return _own;
+            }
+
+            if (!_marked)
+            {
+                _marked = true;
+                Camera.onPostRender += Marked;
             }
 
             GameObject holder = new GameObject("VamDlssNrWorkScale.SceneUi");
@@ -419,7 +607,7 @@ namespace VamDlssNrWorkScale
             camera.enabled = false;
             camera.stereoTargetEye = StereoTargetEyeMask.None;
             camera.targetTexture = null;
-            camera.clearFlags = CameraClearFlags.Depth;
+            camera.clearFlags = CameraClearFlags.Nothing;
             camera.cullingMask = 0;
             camera.renderingPath = RenderingPath.Forward;
             camera.depthTextureMode = DepthTextureMode.None;
@@ -438,8 +626,22 @@ namespace VamDlssNrWorkScale
                 _ownClear.ClearRenderTarget(true, false, Color.clear);
             }
 
-            camera.AddCommandBuffer(CameraEvent.BeforeForwardOpaque, _ownFill);
-            camera.AddCommandBuffer(CameraEvent.AfterForwardAlpha, _ownClear);
+            // The one that draws them: never part of the frame's round, rendered by hand at the mark.
+            GameObject hand = new GameObject("VamDlssNrWorkScale.SceneUi.Draw");
+            hand.hideFlags = HideFlags.HideAndDontSave;
+            hand.transform.SetParent(main.transform, false);
+            _draw = hand.AddComponent<Camera>();
+            _draw.enabled = false;
+            _draw.stereoTargetEye = StereoTargetEyeMask.None;
+            _draw.targetTexture = null;
+            _draw.clearFlags = CameraClearFlags.Depth;
+            _draw.cullingMask = 0;
+            _draw.renderingPath = RenderingPath.Forward;
+            _draw.depthTextureMode = DepthTextureMode.None;
+            _draw.allowHDR = false;
+            _draw.useOcclusionCulling = false;
+            _draw.AddCommandBuffer(CameraEvent.BeforeForwardOpaque, _ownFill);
+            _draw.AddCommandBuffer(CameraEvent.AfterForwardAlpha, _ownClear);
             _own = camera;
             return camera;
         }
@@ -467,6 +669,12 @@ namespace VamDlssNrWorkScale
             if (_atomCount == 0)
             {
                 Status = "scene UI atoms: none in this scene";
+                return;
+            }
+
+            if (Time.frameCount - _elsewhereFrame <= 2)
+            {
+                Status = "scene UI atoms: " + _atomCount + ", in the scene: here a scene plugin draws the menu with a camera of its own ('" + _elsewhereName + "', PostMagic does), and they cannot be drawn after VaM DLSS";
                 return;
             }
 

@@ -130,6 +130,8 @@ public static class HostTest
             Extents();
             GazeFollowing();
             EyeSizes();
+            Profiles();
+            DlssWindows();
         }
         catch (Exception ex)
         {
@@ -206,6 +208,72 @@ public static class HostTest
         HeadsetUi.Resolve();
         HeadsetUi.Apply(new Harmony("vws.hosttest.headsetui"));
         Check(HeadsetUi.Hooked && HeadsetUi.Problem.Length == 0, "the headset's interface pass is hooked: " + HeadsetUi.Problem);
+        DlssWindow.Apply(new Harmony("vws.hosttest.dlsswindow"));
+        Check(DlssWindow.Hooked && DlssWindow.Problem.Length == 0, "the DLSS window's five hooks on VaM DLSS are in place: " + DlssWindow.Problem);
+        MenuPointers.Apply(new Harmony("vws.hosttest.menupointers"));
+        Check(MenuPointers.Hooked && MenuPointers.Problem.Length == 0, "the menu pointers' four hooks on VaM are in place: " + MenuPointers.Problem);
+        {
+            int rows, each;
+            bool fits = true;
+
+            for (int pages = 1; pages <= 12; pages++)
+            {
+                ControlPanel.TabGrid(pages, out rows, out each);
+                fits &= rows * 2 * each >= pages && (rows - 1) * 2 * each < pages && (pages <= 4) == (rows == 1);
+            }
+
+            ControlPanel.TabGrid(7, out rows, out each);
+            Check(fits && rows == 2 && each == 2, "the panel's tabs: up to four pages in one row, seven in two rows of four places (" + rows + " x " + each * 2 + ")");
+        }
+
+        Logs.Apply(new Harmony("vws.hosttest.logs"));
+        Check(Logs.Hooked && Logs.Listeners == 2 && Logs.Problem.Length == 0, "BepInEx's two file writers are led through the log switches (" + Logs.Listeners + "): " + Logs.Problem);
+        Check(Logs.MotionHooked, "VaM DLSS's write of vr_motion.log is led through its switch");
+        Check(Logs.ModName == "VaM DLSS", "VaM DLSS's lines are known by its name in the log (" + Logs.ModName + ")");
+        Check(Logs.SourceOf("VaM DLSS", "VaM DLSS - Model Resolution", "VaM DLSS") == Logs.Mod && Logs.SourceOf("VaM DLSS - Model Resolution", "VaM DLSS - Model Resolution", "VaM DLSS") == Logs.Own &&
+            Logs.SourceOf("BepInEx", "VaM DLSS - Model Resolution", "VaM DLSS") == Logs.Other && Logs.SourceOf(null, "a", "b") == Logs.Other, "a line is told by whose it is");
+        Check(Logs.Written(Logs.Own, false, "[vws] x", true, false) && Logs.Written(Logs.Mod, false, "[vdn] x", false, true) && Logs.Written(Logs.Other, false, "x", false, false), "with its switch on a line is written, and anybody else's always");
+        Check(!Logs.Written(Logs.Own, false, "[vws] x", false, true) && !Logs.Written(Logs.Mod, false, "[vdn] x", true, false), "with its switch off it is not");
+        Check(Logs.Written(Logs.Own, true, "[vws] x", false, false) && Logs.Written(Logs.Mod, true, "[vdn] x", false, false), "an error is written whatever the switches say");
+        Check(Logs.Written(Logs.Own, false, "[vws] profile: 12 ms", false, false) && !Logs.Written(Logs.Mod, false, "[vws] profile: 12 ms", false, false), "and so is what the profiler was asked for");
+        Check(Logs.NativeMask(true, true) == 0u && Logs.NativeMask(false, true) == 1u && Logs.NativeMask(true, false) == 2u && Logs.NativeMask(false, false) == 3u, "the native half is told which files are off");
+        EyeSize.Apply(new Harmony("vws.hosttest.eyesize"));
+        Check(EyeSize.FocusHooked && EyeSize.FocusSites == 2 && EyeSize.FocusProblem.Length == 0, "both writes of the eye scale in VaM's SteamVR plugin are led through here (" + EyeSize.FocusSites + "): " + EyeSize.FocusProblem);
+
+        {
+            // Kept: whatever the plugin is told, and however often, nothing is written.
+            bool dimmed = false;
+            float before = 1f;
+            bool nothing = EyeSize.FocusStep(false, true, 1f, ref dimmed, ref before) == 0f && EyeSize.FocusStep(false, true, 1f, ref dimmed, ref before) == 0f &&
+                EyeSize.FocusStep(true, true, 1f, ref dimmed, ref before) == 0f && EyeSize.FocusStep(true, true, 0.3333f, ref dimmed, ref before) == 0f;
+            Check(nothing && !dimmed, "kept: the eye scale is not written while SteamVR has the focus, nor when it gives it back");
+
+            // As before: halved, and told twice that the focus is gone (the second time the scale
+            // in force is the half) what comes back is what it was -- not the half.
+            dimmed = false;
+            before = 1f;
+            float first = EyeSize.FocusStep(false, false, 1.5f, ref dimmed, ref before);
+            float second = EyeSize.FocusStep(false, false, 0.5f, ref dimmed, ref before);
+            float back = EyeSize.FocusStep(true, false, 0.5f, ref dimmed, ref before);
+            Check(first == 0.5f && second == 0.5f && back == 1.5f && !dimmed, "halved as before: told twice that the focus is gone, the scale given back is the one from before (" + back + ")");
+            Check(EyeSize.FocusStep(true, false, 1.5f, ref dimmed, ref before) == 0f, "the focus given back without having been taken writes nothing");
+
+            // Switched to kept while it stands halved: it is still given back.
+            EyeSize.FocusStep(false, false, 1f, ref dimmed, ref before);
+            Check(EyeSize.FocusStep(false, true, 0.5f, ref dimmed, ref before) == 0f && EyeSize.FocusStep(true, true, 0.5f, ref dimmed, ref before) == 1f && !dimmed,
+                "switched to kept while halved: the scale from before still comes back");
+        }
+        Check(MenuPointers.Asked(7, 0, true) && MenuPointers.Asked(8, 0, false) && !MenuPointers.Asked(9, 0, false) && !MenuPointers.Asked(11, 0, false), "a pointer on a menu is asked every frame, one at rest every fourth");
+        int askedTogether = 0;
+
+        for (int frame = 0; frame < 8; frame++)
+        {
+            int asked = (MenuPointers.Asked(frame, 0, false) ? 1 : 0) + (MenuPointers.Asked(frame, 1, false) ? 1 : 0) + (MenuPointers.Asked(frame, 2, false) ? 1 : 0);
+            askedTogether = Math.Max(askedTogether, asked);
+        }
+
+        Check(askedTogether == 1, "no two resting pointers are asked on the same frame: " + askedTogether);
+        Looks();
         Check(HeadsetUi.Line().Length == 0, "the headset's interface pass says nothing until it is asked for");
 
         const BindingFlags any = BindingFlags.Instance | BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
@@ -332,6 +400,121 @@ public static class HostTest
 
     // The window following the eye: the arithmetic that decides where it is aimed, with the eye
     // tracker's part played by hand. (The tracker itself is SteamVR's and is not here.)
+    // DLSS on a window of each eye: the window's size and place.
+    // The room's look: what the cameras' grey is shown in, as the numbers the native half takes.
+    private static void Looks()
+    {
+        float[] block = new float[96];
+
+        for (int i = 0; i < block.Length; i++)
+        {
+            block[i] = 7f;
+        }
+
+        Passthrough.LookNumbers(Passthrough.LookGrey, 1f, 0f, 0f, block);
+        Check(block[83] == 0f && block[84] == 0f && block[92] == 0f && block[82] == 7f && block[93] == 7f, "the camera's grey is look 0, and nothing beside the look's ten numbers is written");
+
+        bool ramps = true, rising = true;
+
+        for (int look = 1; look <= 4; look++)
+        {
+            Passthrough.LookNumbers(look, 0f, 0f, 0f, block);
+            ramps &= block[83] == 1f;
+            float before = -1f;
+
+            for (int stop = 0; stop < 3; stop++)
+            {
+                float luma = 0.299f * block[84 + stop * 3] + 0.587f * block[85 + stop * 3] + 0.114f * block[86 + stop * 3];
+                rising &= luma > before + 0.2f || stop == 0;
+                before = luma;
+            }
+        }
+
+        Check(ramps, "night vision, amber, cold blue and sepia are ramps");
+        Check(rising, "every ramp gets brighter from its dark end to its bright one, so the picture stays readable");
+        Passthrough.LookNumbers(1, 0f, 0f, 0f, block);
+        Check(block[88] > block[87] * 3f && block[88] > block[89] * 3f, "night vision's middle is green: " + block[87] + " " + block[88] + " " + block[89]);
+        Passthrough.LookNumbers(5, 0f, 0f, 0f, block);
+        Check(block[83] == 2f, "heat is look 2");
+        Passthrough.LookNumbers(Passthrough.LookOwn, 1f, 0.5f, 0f, block);
+        Check(block[83] == 1f && block[87] == 1f && block[88] == 0.5f && block[89] == 0f && block[84] < 0.05f && block[92] == 0.75f, "your colour is a ramp from black through the colour towards white");
+        Passthrough.LookNumbers(Passthrough.LookGuessed, 0f, 0f, 0f, block);
+        Check(block[83] == 3f, "the network's colours are look 3");
+        Check(Passthrough.LookNames.Length == 8, "every look has a name in the panel");
+    }
+
+    private static void DlssWindows()
+    {
+        Console.WriteLine("DLSS window:");
+        Check(DlssWindow.Extent(2040, 0.5f) == 1020 && DlssWindow.Extent(2080, 0.5f) == 1040, "half an eye of 2040x2080 is 1020x1040");
+        Check(DlssWindow.Extent(2040, 0.333f) % 2 == 0 && DlssWindow.Extent(2040, 0.333f) == 680, "the window's size is even: " + DlssWindow.Extent(2040, 0.333f));
+        Check(DlssWindow.Extent(2040, 1f) == 2040 && DlssWindow.Extent(2040, 0.99f) == 2040, "a window of the whole eye is no window");
+        Check(DlssWindow.Extent(600, 0.25f) == 256, "it is never smaller than 256: " + DlssWindow.Extent(600, 0.25f));
+        Check(DlssWindow.Extent(400, 0.5f) == 400, "a picture too small to bother with is left whole");
+        Check(DlssWindow.Origin(2040, 1020, 0.5f) == 510, "centred in the eye it begins a quarter in");
+        Check(DlssWindow.Origin(2040, 1020, 0.1f) == 0 && DlssWindow.Origin(2040, 1020, 0.95f) == 1020, "it stays inside the eye however far out the eye looks");
+        Check(DlssWindow.Origin(2040, 1020, 0.56f) == 632, "it follows its centre: " + DlssWindow.Origin(2040, 1020, 0.56f));
+        Check(!DlssWindow.Moves(510, 600, 1020) && DlssWindow.Moves(510, 800, 1020) && DlssWindow.Moves(510, 200, 1020), "it moves only when the eye has left its middle fifth");
+    }
+
+    // The main-thread profile: what is said of ten seconds of frames.
+    private static void Profiles()
+    {
+        Console.WriteLine("profile:");
+
+        // 100 frames of 30 ms at 1000 ticks a millisecond: 3 physics steps a frame of 6 ms each
+        // (2 of scripts), Update 3 (2.5 scripts), 1 between, LateUpdate 2, 0.5 before rendering,
+        // rendering 4, 1 between frames, and half a millisecond nobody saw.
+        Profile.Window w = new Profile.Window();
+        w.Frames = 100;
+        w.Steps = 300;
+        w.All = 100 * 30000;
+        w.Worst = 61000;
+        w.FixedSpan = 300 * 6000;
+        w.Scripts[Profile.Fixed] = 300 * 2000;
+        w.UpdateSpan = 100 * 3000;
+        w.Scripts[Profile.Update] = 100 * 2500;
+        w.Between = 100 * 1000;
+        w.LateSpan = 100 * 2000;
+        w.BeforeRender = 100 * 500;
+        w.RenderSpan = 100 * 4000;
+        w.Wait = 100 * 1000;
+
+        List<Profile.Slot> slots = new List<Profile.Slot>();
+
+        foreach (string[] one in new[] { new[] { "Small", "0", "10000" }, new[] { "Big", "0", "500000" }, new[] { "Middle", "1", "250000" }, new[] { "Idle", "2", "0" } })
+        {
+            Profile.Slot slot = new Profile.Slot();
+            slot.Name = one[0];
+            slot.Phase = int.Parse(one[1]);
+            slot.Ticks = long.Parse(one[2]);
+            slot.Calls = 300;
+            slots.Add(slot);
+        }
+
+        // (this thread's cycles, 2000 to the millisecond: at work through its physics steps, and
+        // for one of the ten milliseconds the engine takes before rendering -- the rest is waiting)
+        w.Busy[1] = 100 * 36000;
+        w.Busy[5] = 100 * 2000;
+
+        List<string> lines = w.Describe(1000.0, slots, 2, 2000.0);
+        Check(lines[0].Contains("at work 19.00 ms") && lines[1].Contains("[at work 18.00]") && string.Join("|", lines.ToArray()).Contains("take the last frame)  [at work 1.00]"),
+            "a phase's length and how much of it the thread worked are both said: " + lines[0]);
+        Check(!string.Join("|", w.Describe(1000.0, slots, 2, 0.0).ToArray()).Contains("at work"), "without the thread's cycles nothing is said of them");
+        string all = string.Join("\n", lines.ToArray());
+        Check(lines[0].Contains("33.3 fps") && lines[0].Contains("30.00 ms a frame") && lines[0].Contains("61.0"), "the frame rate and the frame's length are the window's: " + lines[0]);
+        Check(lines[1].Contains("18.00 ms") && lines[1].Contains("3.00 a frame") && lines[1].Contains("6.00 ms each") && lines[1].Contains("FixedUpdate 2.00") && lines[1].Contains("the rest 4.00"),
+            "a physics step is split into its scripts and the engine: " + lines[1]);
+        Check(all.Contains("   0.50 ms  not accounted for"), "what no mark covers is said, not hidden");
+        Check(lines[lines.Count - 2].Contains("Big") && lines[lines.Count - 2].Contains("5.00 ms") && lines[lines.Count - 1].Contains("Middle") && !all.Contains("Small") && !all.Contains("Idle"),
+            "the scripts are named by what they take, the most first, and no more of them than asked for");
+        Check(new Profile.Window().Describe(1000.0, slots, 5, 0.0).Count == 1, "a window without frames says so and nothing else");
+
+        string brief = w.Short(1000.0, 2000.0);
+        Check(brief.Contains("33.3 fps") && brief.Contains("3.00 physics steps a frame") && brief.Contains("6.00 ms each (scripts 2.00, engine 4.00)") && brief.Contains("at work 19.00") && brief.Contains("the longest 61.0"),
+            "a trial's one line has the frame rate, the steps and what a step is made of: " + brief);
+    }
+
     // The headset's picture size as VaM DLSS measured it, against SteamVR's and the eye texture.
     private static void EyeSizes()
     {

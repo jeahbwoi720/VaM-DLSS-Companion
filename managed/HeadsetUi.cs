@@ -276,6 +276,7 @@ namespace VamDlssNrWorkScale
             Tally(Time.unscaledTime);
 
             Camera camera = Hooks.CameraOf(__instance);
+            SceneCamera = camera;
 
             if (camera == null)
             {
@@ -309,12 +310,12 @@ namespace VamDlssNrWorkScale
                 _presented = false;
                 _nElsewhere++;
 
-                // (the atoms too, unless that camera draws their layer as well)
-                if (_live && (other.cullingMask & atoms) == 0)
-                {
-                    TakeAtoms(camera, atoms);
-                }
-
+                // The atoms stay in the scene here. Taken off and drawn at the frame's end into
+                // what VaM DLSS wrote to, they were gone (seen in a headset with PostMagic, whose
+                // own camera draws the menu after the scene's): with a second camera in the frame
+                // that picture is not the one the headset is given. Left where they are they go
+                // through DLSS and Neural Rendering as before this option, and are there.
+                SceneUi.Elsewhere(other);
                 return;
             }
 
@@ -455,11 +456,19 @@ namespace VamDlssNrWorkScale
             return found;
         }
 
+        // The camera VaM DLSS works on, as last seen (for the profile's marks).
+        internal static Camera SceneCamera;
+
         public static void ComposePrefix(NrCapture __instance, RenderTexture __0, RenderTexture __1)
         {
             if (!Hooked)
             {
                 return;
+            }
+
+            if (Profile.Gpu && IsPrimary(__instance))
+            {
+                Profile.SpanTo(3);
             }
 
             Camera camera = Hooks.CameraOf(__instance);
@@ -679,6 +688,11 @@ namespace VamDlssNrWorkScale
             if (!IsPrimary(__instance))
             {
                 return;
+            }
+
+            if (Profile.Gpu)
+            {
+                Profile.SpanTo(4);
             }
 
             Restore();

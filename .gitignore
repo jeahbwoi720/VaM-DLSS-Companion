@@ -19,7 +19,7 @@ native/vws_ps_gather.h
 native/vws_ps_overlay.h
 native/vws_vs_overlay.h
 
-# never part of this repository: the mod this plugs into is UncleBurrito's, and paid
+# never part of this repository: the mod this plugs into is UncleBurrito's
 orig/
 decomp/
 VamDlssNrPlugin.dll

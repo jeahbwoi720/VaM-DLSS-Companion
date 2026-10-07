@@ -51,7 +51,7 @@ namespace VamDlssNrWorkScale
     internal static class Native
     {
         private const string Dll = "VamDlssNrWorkScaleNative";
-        private const uint ExpectedAbi = 32;
+        private const uint ExpectedAbi = 37;
 
         internal const uint Frame = 1, Proxy = 2, Model = 4, Result = 8;
         internal const int ReadyDown = 1, ReadyResolve = 2, ReadyGuide = 4; // ReadyGuide << n for guide n
@@ -128,7 +128,11 @@ namespace VamDlssNrWorkScale
         private delegate int FoveaEventForFn(uint camera, uint opaque);
         private delegate void FoveaMeasuredFn([Out] ulong[] runs, [Out] uint[] times);
         private static FoveaEventForFn _foveaEventFor;
-        private static FoveaMeasuredFn _foveaMeasured;
+        private static FoveaMeasuredFn _foveaMeasured, _foveaTimed;
+        private delegate int SpanEventFn(uint index, uint begin);
+        private delegate void SpansFn([Out] ulong[] micros, [Out] uint[] times, uint reset);
+        private static SpanEventFn _spanEvent;
+        private static SpansFn _spans;
         private delegate void FlipStatusFn(out int state, out uint width, out uint height, out uint presents, out uint tearing);
         private static FlipStatusFn _flipStatus;
         private delegate void FlipPaceFn(int on, uint multiplier);
@@ -159,6 +163,18 @@ namespace VamDlssNrWorkScale
         private static DepthReadFn _depthRead;
         private static CamReadFn _camRead;
         private delegate void OverlayStatusFn(out int state, out uint frames, out int error);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void ColourStatusFn(out int state, out uint pictures, out uint micros);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate uint ColourErrorFn([Out] byte[] text, uint capacity);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate uint OverlayLostFn(uint inARow, IntPtr pause);
+        private static OverlayLostFn _overlayLost;
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate uint LogsFn(uint off, out uint writes, out uint kilobytes);
+        private static LogsFn _logs;
+        private static ColourStatusFn _colourStatus;
+        private static ColourErrorFn _colourError;
         private static PushMatteFn _pushMatte;
         private static OverlayStatusFn _overlayStatus;
         private delegate int OverlayReadFn([Out] byte[] rgba, uint capacity, out uint width, out uint height);
@@ -238,6 +254,10 @@ namespace VamDlssNrWorkScale
                 _pushPassthrough = (PushPassthroughFn)Bind(module, "vws_push_passthrough", typeof(PushPassthroughFn));
                 _pushMatte = (PushMatteFn)Bind(module, "vws_push_matte", typeof(PushMatteFn));
                 _overlayStatus = (OverlayStatusFn)Bind(module, "vws_overlay_status", typeof(OverlayStatusFn));
+                _colourStatus = (ColourStatusFn)Bind(module, "vws_colour_status", typeof(ColourStatusFn));
+                _overlayLost = (OverlayLostFn)Bind(module, "vws_overlay_lost", typeof(OverlayLostFn));
+                _logs = (LogsFn)Bind(module, "vws_logs", typeof(LogsFn));
+                _colourError = (ColourErrorFn)Bind(module, "vws_colour_error", typeof(ColourErrorFn));
                 _overlayRead = (OverlayReadFn)Bind(module, "vws_overlay_read", typeof(OverlayReadFn));
                 _overlayDepth = (OverlayDepthFn)Bind(module, "vws_overlay_depth", typeof(OverlayDepthFn));
                 _depthRead = (DepthReadFn)Bind(module, "vws_depth_read", typeof(DepthReadFn));
@@ -249,6 +269,9 @@ namespace VamDlssNrWorkScale
                 _foveaAsked = (FoveaAskedFn)Bind(module, "vws_fovea_asked", typeof(FoveaAskedFn));
                 _foveaEventFor = (FoveaEventForFn)Bind(module, "vws_fovea_event_for", typeof(FoveaEventForFn));
                 _foveaMeasured = (FoveaMeasuredFn)Bind(module, "vws_fovea_measured", typeof(FoveaMeasuredFn));
+                _foveaTimed = (FoveaMeasuredFn)Bind(module, "vws_fovea_timed", typeof(FoveaMeasuredFn));
+                _spanEvent = (SpanEventFn)Bind(module, "vws_span_event", typeof(SpanEventFn));
+                _spans = (SpansFn)Bind(module, "vws_spans", typeof(SpansFn));
                 _flipStatus = (FlipStatusFn)Bind(module, "vws_flip_status", typeof(FlipStatusFn));
                 _flipPace = (FlipPaceFn)Bind(module, "vws_flip_pace", typeof(FlipPaceFn));
                 _flipPaceStatus = (FlipPaceStatusFn)Bind(module, "vws_flip_pace_status", typeof(FlipPaceStatusFn));
@@ -421,6 +444,26 @@ namespace VamDlssNrWorkScale
         }
 
         // Four numbers each: the opaque pass with the rates and without, then the transparent pass.
+        // A mark for the card's clock between two parts of the frame (see Profile): where span `index` begins or ends.
+        internal static void Span(int index, bool begin)
+        {
+            if (Loaded && EventFunc != IntPtr.Zero)
+            {
+                GL.IssuePluginEvent(EventFunc, _spanEvent((uint)index, begin ? 1u : 0u));
+            }
+        }
+
+        internal static void Spans(ulong[] micros, uint[] times, bool reset)
+        {
+            _spans(micros, times, reset ? 1u : 0u);
+        }
+
+        // The card's time over the same four: microseconds summed, and how many passes in each sum.
+        internal static void FoveaTimed(ulong[] micros, uint[] times)
+        {
+            _foveaTimed(micros, times);
+        }
+
         internal static void FoveaMeasured(ulong[] runs, uint[] times)
         {
             _foveaMeasured(runs, times);
@@ -510,6 +553,29 @@ namespace VamDlssNrWorkScale
         internal static void OverlayStatus(out int state, out uint frames, out int error)
         {
             _overlayStatus(out state, out frames, out error);
+        }
+
+        internal static uint Logs(uint off, out uint writes, out uint kilobytes)
+        {
+            return _logs(off, out writes, out kilobytes);
+        }
+
+        internal static uint OverlayLost()
+        {
+            return _overlayLost(0u, IntPtr.Zero);
+        }
+
+        internal static void ColourStatus(out int state, out uint pictures, out uint micros)
+        {
+            _colourStatus(out state, out pictures, out micros);
+        }
+
+        internal static string ColourError()
+        {
+            byte[] text = new byte[256];
+            _colourError(text, (uint)text.Length);
+            int length = Array.IndexOf(text, (byte)0);
+            return System.Text.Encoding.ASCII.GetString(text, 0, length < 0 ? text.Length : length);
         }
 
         internal static int PushRelease(uint set)
@@ -3380,7 +3446,7 @@ namespace VamDlssNrWorkScale
     public class WorkScalePlugin : BaseUnityPlugin
     {
         public const string Guid = "jeahbwoi720.vamdlssnr.workscale";
-        public const string Version = "1.8.0";
+        public const string Version = "1.9.0";
 
         // What every build's settings file is called after its owner prefix.
         private const string SettingsSuffix = ".vamdlssnr.workscale.cfg";
@@ -3593,6 +3659,26 @@ namespace VamDlssNrWorkScale
                 "How far away the room is taken to be, in metres. The cameras are not where the eyes are, so things at this distance line up with where they really are; nearer and farther things are slightly off.",
                 new AcceptableValueRange<float>(0.3f, 10f)));
             Passthrough.CfgBrightness = Config.Bind("Passthrough", "Brightness", 1f, new ConfigDescription("Camera brightness.", new AcceptableValueRange<float>(0.2f, 4f)));
+            Passthrough.CfgHandOver = Config.Bind("Passthrough", "OverlayHandOver", 0, new ConfigDescription(
+                "Mode 0: how the room's pictures reach SteamVR. 0: by their shared handles, so that SteamVR reads them where they are. 1: as textures that SteamVR's own library copies, as it was up to 1.8 -- " +
+                "that copying shares its machinery with the game's own pictures, and the overlay's graphics device was lost by it whenever VaM DLSS ran in a mode below DLAA (the room stuttered or froze) and now and then otherwise. " +
+                "Set 1 only if the room does not show at all with 0.",
+                new AcceptableValueRange<int>(0, 1)));
+            Passthrough.CfgLook = Config.Bind("Passthrough", "Look", 0, new ConfigDescription(
+                "What the room is shown in. The cameras are monochrome: 0 their grey as it comes; 1 night vision (green); 2 amber; 3 cold blue; 4 sepia; 5 heat (black through violet and orange to white, by brightness); " +
+                "6 your colour (LookRed, LookGreen, LookBlue); 7 colours guessed by a network -- experimental: a network trained to colour black-and-white photographs looks at a small copy of the left camera's picture about three times a second, " +
+                "on two of the processor's threads, and its colours are laid under the camera's own brightness. They are a guess (often a wrong one: the cameras see infrared too), they lag the head by a moment, " +
+                "and things nearer than the passthrough's distance get their colour a little to the side in the right eye. Needs colour.onnx beside the plugin (270 MB, not part of the download: see the README).",
+                new AcceptableValueRange<int>(0, 7)));
+            Passthrough.CfgLookRed = Config.Bind("Passthrough", "LookRed", 1f, new ConfigDescription("Look 6, your colour: its red, as displayed (0 to 1). Mid-grey becomes this colour, black stays black, white nearly white.", new AcceptableValueRange<float>(0f, 1f)));
+            Passthrough.CfgLookGreen = Config.Bind("Passthrough", "LookGreen", 0.3f, new ConfigDescription("Look 6, your colour: its green.", new AcceptableValueRange<float>(0f, 1f)));
+            Passthrough.CfgLookBlue = Config.Bind("Passthrough", "LookBlue", 0.6f, new ConfigDescription("Look 6, your colour: its blue.", new AcceptableValueRange<float>(0f, 1f)));
+            Passthrough.CfgGrain = Config.Bind("Passthrough", "LookGrain", 0f, new ConfigDescription(
+                "Grain over the room's picture, new with every picture, as an image intensifier has. For every look but the camera's grey.", new AcceptableValueRange<float>(0f, 1f)));
+            Passthrough.CfgRim = Config.Bind("Passthrough", "LookDarkRim", 0f, new ConfigDescription(
+                "How much darker the room gets towards the rim of the view, as through a tube. For every look but the camera's grey.", new AcceptableValueRange<float>(0f, 1f)));
+            Passthrough.CfgColour = Config.Bind("Passthrough", "LookColourStrength", 1f, new ConfigDescription(
+                "Look 7: how strongly the network's colours are shown. 1 as it gives them; lower for a paler, calmer picture (its mistakes show less); higher for more colour.", new AcceptableValueRange<float>(0f, 2f)));
             Passthrough.CfgFocal = Config.Bind("Passthrough", "LensFocal", 382.6f, new ConfigDescription(
                 "The cameras' fisheye scale, in pixels per radian for a 1016-pixel-wide lens picture. Measured on a PlayStation VR2; it sets the room's apparent size -- raise it if the room looks too small, lower it if too large.",
                 new AcceptableValueRange<float>(200f, 600f)));
@@ -3717,10 +3803,69 @@ namespace VamDlssNrWorkScale
                 "The filter is contrast-adaptive: soft detail gains the most, flat areas and edges that are already hard are left nearly alone, and nothing is pushed beyond the darkest and brightest of its neighbours, so it does not ring.",
                 new AcceptableValueRange<float>(0f, 1f)));
 
+            SceneUi.CfgPicture = Config.Bind("Advanced", "SaveWindowPictureAfterSeconds", 0, new ConfigDescription(
+                "For support: save the game window's own picture once, this many seconds after VaM has started, as window-picture.png beside the plugin (0: never). Monitor mode.",
+                new AcceptableValueRange<int>(0, 3600)));
+
+            DlssWindow.CfgOn = Config.Bind("DLSS window", "Enabled", false,
+                "Experimental, headset at DLAA only. Run DLSS on a window around the middle of each eye instead of on the whole eye: DLSS's cost goes by the pixels it reconstructs, and a window half the eye's width has a quarter of them. " +
+                "Outside the window the scene is shown as it was rendered -- not anti-aliased, and trembling by the fraction of a pixel DLSS has the camera shaken by; the window's edge is a hard one. A first version, to see what it buys in frame rate.");
+            DlssWindow.CfgSize = Config.Bind("DLSS window", "Size", 0.5f, new ConfigDescription(
+                "The window's width and height as a share of the eye's. 0.5 is a quarter of the pixels. Changing it has DLSS set up anew.",
+                new AcceptableValueRange<float>(0.25f, 1f)));
+            DlssWindow.CfgGaze = Config.Bind("DLSS window", "FollowGaze", false,
+                "Put the window where the eye looks, when SteamVR has eye tracking for the headset, instead of at the lens centre. It moves in steps, when the eye has left its middle, and DLSS starts its history anew at every step: a moment of rougher picture each time.");
+
+            Profile.CfgSeconds = Config.Bind("Profile", "Seconds", 30, new ConfigDescription(
+                "How long a run of the main-thread profile lasts (the panel's button 'Profile the main thread', DLSS page). For that long every script's FixedUpdate, Update, LateUpdate and render callbacks are timed and the frame's phases marked off; " +
+                "what it finds is written to BepInEx\\LogOutput.log every ten seconds (lines beginning 'profile:'). Nothing is measured, and nothing costs anything, outside a run.",
+                new AcceptableValueRange<int>(5, 600)));
+            Profile.CfgScripts = Config.Bind("Profile", "Scripts", true,
+                "Time every script by name during a run. Off: only the frame's phases are marked off, which costs next to nothing but does not say which script it is.");
+            Profile.CfgPlugins = Config.Bind("Profile", "ScenePlugins", true,
+                "During a run, also time the scripts of scene and session plugins (the ones VaM compiles as it loads them). Off: they are left alone and their time is counted as the engine's; the log names them.");
+            Profile.CfgTry = Config.Bind("Profile", "Trials", true,
+                "After a run's own time, try the scene with one thing changed for five seconds each, an unchanged five seconds before and after each, and say what each comes to: at most one physics step a frame (the scene runs a little slow where a frame is longer than a step), and the physics solver's iterations at half of what every body has. " +
+                "Everything is put back at the end. While the second runs the physics is looser than the scene was made for: soft parts may wobble or sag for those seconds.");
+            const string inside = "SuperController, SuperController.AssignUICamera, LookInputModule, LookInputModule.GetLookPointerEventData, UnityEngine.EventSystems.EventSystem.RaycastAll, UnityEngine.UI.GraphicRaycaster.Raycast";
+            Profile.CfgInside = Config.Bind("Profile", "LookInside", inside,
+                "During a run, also time the steps inside these, with commas between. A class of VaM's: its methods named Process..., Check..., Sync..., Prep..., Verify..., Handle... and Apply.... 'Class.Method': that one method, of VaM's or (with its full name) of Unity's. " +
+                "For finding what a script that takes long is spending it on. Empty: nothing. As it comes: SuperController, and what its ProcessUI calls for the menu pointers.");
+
+            if (Profile.CfgInside.Value.Trim() == "SuperController")
+            {
+                Profile.CfgInside.Value = inside; // what it came as before the menu pointers were looked into
+            }
+
+            MenuPointers.CfgOn = Config.Bind("Menu pointers", "RestOffMenus", false,
+                "Experimental, headset only. Every frame VaM asks for each controller and for the mouse what it points at, and goes through every menu of the scene for each: 2.4-4 ms of a frame in a heavy scene. On: a pointer that is not on a menu is asked on one frame in four only, " +
+                "and every frame again from the moment it is on one (so the pointer's dot may appear up to three frames late as it comes onto a menu). Never while it holds something, while a text field has the keyboard, or while the mouse moves.");
+            Profile.CfgStartAfter = Config.Bind("Profile", "StartAfterSeconds", 0, new ConfigDescription(
+                "Start one run by itself this many seconds after VaM has started (0: only the panel's button starts one). For a run without the panel: set it, start VaM, load the scene within that time, read the log, set it back to 0.",
+                new AcceptableValueRange<int>(0, 3600)));
+
             EyeSize.CfgCorrect = Config.Bind("Headset", "CorrectEyeSize", true,
                 "VaM DLSS measures the size of the headset's picture once and reconstructs to it for the rest of the session. Started with a DLSS upscaling mode already on, VaM can still have eye textures of half the size at that moment, and the headset then gets a coarse, pixelated picture whatever is chosen afterwards (until VaM's own Render Scale is moved, or VaM is restarted). " +
                 "On: the measurement is checked against the size SteamVR gives for an eye, and written anew where SteamVR and the eye texture Unity has both say otherwise. " +
                 "Likewise the eye scale VaM DLSS multiplies its DLSS ratio onto: where it has come to hold another than VaM's Render Scale (seen after changing the quality: Ultra Performance at a ninth of the size instead of a third), it is given VaM's. Said in the log when either happens, and as often as it happens (four times within twenty seconds at most, so as not to fight over it with something else). SteamVR headsets only.");
+            Logs.OwnName = Logger.SourceName;
+            Logs.CfgOwn = Config.Bind("Logs", "ThisPlugin", true,
+                "Write this plugin's lines to BepInEx\\LogOutput.log and to Unity's output_log.txt. Off: only its errors are written, and what the profiler was asked for by its button. " +
+                "(The BepInEx console, where it is open, shows everything either way.) Leave it on when something is to be looked into: the log is what says how a session went wrong.");
+            Logs.CfgMod = Config.Bind("Logs", "VamDlss", true,
+                "Write VaM DLSS's lines to BepInEx\\LogOutput.log and to Unity's output_log.txt. Off: only its errors are written. VaM DLSS itself has no setting for this; its lines are let fall where BepInEx hands them to its file writers.");
+            Logs.CfgMotionFile = Config.Bind("Logs", "VamDlssMotionFile", true,
+                "Let VaM DLSS write its motion statistics to BepInEx\\plugins\\VamDlssNr\\vr_motion.log (up to 8 MB, and as much again in vr_motion.log.1). Off: the file is not written; the lines still go to the BepInEx log, where VamDlss above decides.");
+            Logs.CfgNativeFiles = Config.Bind("Logs", "VamDlssNativeFiles", true,
+                "Let VaM DLSS's native half write ngx\\vdn.log and ngx\\vdn_fg.log in its folder. Off: its writes to those two files are answered as done and not made (in memory, in this process; nothing of VaM DLSS's on disk is changed). The files stay, empty.");
+            Logs.CfgNgxFiles = Config.Bind("Logs", "NvidiaFiles", true,
+                "Let NVIDIA's DLSS libraries write ngx\\nvngx.log and ngx\\nvngx_dlss_*.log in VaM DLSS's folder. Off: their writes to those files are answered as done and not made, the same way. " +
+                "Switched off while VaM runs it holds from the next line on; set before VaM starts, from the first.");
+            EyeSize.CfgKeep = Config.Bind("Headset", "KeepSizeWithoutFocus", true,
+                "VaM's SteamVR plugin halves the headset's eye scale whenever SteamVR takes the input focus away -- for its dashboard, and during every scene load and long freeze -- and gives back what it kept when the focus returns. " +
+                "It has been seen to give back its own half instead: the headset stays at half size (a coarse, pixelated picture, with or without a DLSS mode) until VaM's Render Scale slider is moved; and under a DLSS upscaling mode VaM DLSS takes the half for your scale. " +
+                "Each halving also has every picture of VaM DLSS made anew, twice. On: the eye scale is left alone while SteamVR has the focus (the scene goes on at full size behind the dashboard). " +
+                "Off: it is halved as before, and given back as it was before the first halving. Lines beginning 'eye size: SteamVR' in the log say each time.");
             EyeSize.CfgLog = Config.Bind("Headset", "EyeSizeLog", true,
                 "Write a line to the log whenever the headset's eye texture, its eye scale, SteamVR's size for an eye, VaM's Render Scale or VaM DLSS's own measurement changes (lines beginning 'eye size:'; 160 a session at most). For finding out how a session came to a wrong picture size.");
 
@@ -3780,6 +3925,19 @@ namespace VamDlssNrWorkScale
             // go in, it alone is taken back out.
             HeadsetUi.Resolve();
             HeadsetUi.Apply(new Harmony(Guid + ".headsetui"));
+
+            // DLSS on a window of each eye: likewise apart, and likewise taken back out if it cannot go in.
+            DlssWindow.Apply(new Harmony(Guid + ".dlsswindow"));
+            MenuPointers.Apply(new Harmony(Guid + ".menupointers"));
+            EyeSize.Apply(new Harmony(Guid + ".eyesize"));
+            Logs.Apply(new Harmony(Guid + ".logs"));
+
+            if (Logs.Problem.Length != 0)
+            {
+                Logger.LogWarning("[vws] " + Logs.Problem);
+            }
+
+            Logs.Tick(0f);
 
             Foveation.Begin();
 
@@ -3858,6 +4016,9 @@ namespace VamDlssNrWorkScale
             Presentation.Tick(Time.unscaledTime);
             SceneUi.Tick(Time.unscaledTime);
             EyeSize.Tick(Time.unscaledTime);
+            Logs.Tick(Time.unscaledTime);
+            DlssWindow.Tick(Time.unscaledTime);
+            Profile.Tick(Time.unscaledTime);
 
             // The wearer's hands, when they are being tracked: it holds the camera, so before the tick
             // that would give it back.

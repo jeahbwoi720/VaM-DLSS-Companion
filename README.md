@@ -1,8 +1,8 @@
 # VaM DLSS Companion
 
-A free companion plugin for [UncleBurrito's VaM DLSS](https://www.patreon.com/UncleBurrito) in
-Virt-A-Mate. VaM DLSS itself is a paid mod and nothing of it is included here; this plugin adds to
-it and does nothing without it.
+A free companion plugin for UncleBurrito's VaM DLSS in
+Virt-A-Mate. VaM DLSS itself is a separate mod and nothing of it is included here; this plugin adds
+to it and does nothing without it.
 
 It began as one slider and has grown since:
 
@@ -133,8 +133,8 @@ freckles — thins out as the slider comes down, and two passes at 50% cost less
 
 ## Requirements
 
-- **VaM DLSS 1.0.3** by UncleBurrito, installed and working. It is a paid mod and nothing of it is
-  included here. This plugin does nothing without it.
+- **VaM DLSS 1.0.3** by UncleBurrito, installed and working. It is a separate mod and nothing of it
+  is included here. This plugin does nothing without it.
 - BepInEx 5 (which VaM DLSS already needs), an RTX card.
 
 ## Installing
@@ -277,6 +277,41 @@ every change of these numbers (lines beginning `eye size:`), which is what to se
 session comes out pixelated all the same. `[Headset] CorrectEyeSize` and `EyeSizeLog` in the
 plugin's settings turn the two off.
 
+A third way to the same coarse picture needed no DLSS mode at all, and showed after loading a
+scene: VaM's SteamVR plugin halves the eye scale whenever SteamVR takes the input focus away (for
+its dashboard, and during every scene load and long freeze) and gives back what it kept when the
+focus returns -- which, told twice that the focus was gone, is its own half. The headset then
+stayed at half size until the Render Scale slider was moved. The plugin now leaves the eye scale
+alone while SteamVR has the focus, which also spares the half second it took to make every picture
+anew at each of these halvings. `[Headset] KeepSizeWithoutFocus = false` has it halved as before,
+but given back as it was. Lines beginning `eye size: SteamVR` in the log say each time.
+
+## Logs: what is written to disk
+
+VaM DLSS and this plugin write a few thousand lines a session between them, and VaM DLSS has no
+setting that stops its own. Each place they go has a switch -- the *Logs* page of the in-headset
+panel, or `[Logs]` in the plugin's settings. All are on as they come: the logs are what says how a
+session went wrong, so switch them off for playing and back on for a report.
+
+| Setting | What it stops |
+|---|---|
+| `ThisPlugin` | this plugin's lines in `BepInEx\LogOutput.log` and Unity's `output_log.txt` |
+| `VamDlss` | VaM DLSS's lines in the same two files |
+| `VamDlssMotionFile` | `BepInEx\plugins\VamDlssNr\vr_motion.log` |
+| `VamDlssNativeFiles` | `ngx\vdn.log` and `ngx\vdn_fg.log` in VaM DLSS's folder |
+| `NvidiaFiles` | `ngx\nvngx.log` and `ngx\nvngx_dlss_*.log`, written by NVIDIA's DLSS libraries |
+
+Errors are written whatever the first two say, and so is what the profiler was asked for by its
+button. The BepInEx console, where it is open, shows everything either way; other plugins' lines
+are not touched (BepInEx's own `[Logging.Disk] Enabled` in `BepInEx\config\BepInEx.cfg` stops the
+whole file).
+
+None of this changes a file of VaM DLSS's. Its lines are let fall where BepInEx hands them to its
+file writers; its write of `vr_motion.log` is skipped; and the native files are stopped in memory,
+where the five libraries that write them (VaM DLSS's and NVIDIA's) call Windows to write: a write
+to one of those files is answered as done and not made, every other write goes through as it came.
+The files themselves stay, empty. Nothing is hooked until one of the last two is switched off.
+
 ## Scene UI atoms after DLSS
 
 The atoms a scene's own interface is built with — UIButton, UIButtonImage, UISlider, UIToggle,
@@ -315,7 +350,22 @@ background of that colour and the person stands in your room.
   PlayStation VR2 — whatever the game's frame rate is. The cut-out around the person comes from the
   game's frame and is fitted to where your head has moved since.
 - It works with Neural Rendering and DLSS off, too.
-- The PlayStation VR2's cameras are black-and-white, and so is the room.
+- It works in every DLSS mode. (Up to 1.8 the room stuttered or froze in any mode below DLAA, and
+  now and then otherwise until passthrough was switched off and on: its pictures went to SteamVR in
+  a way that collided with the game's own. They go another way now, and if its graphics device is
+  lost all the same, another is made by itself; the status box counts how often.)
+- The PlayStation VR2's cameras are black-and-white, and so is the room -- unless you give it a
+  *Room look*: night-vision green, amber, cold blue, sepia, a ramp of heat, or a colour of your
+  own, with grain and a dark rim if you like. These cost nothing.
+- *Room look: colours guessed by a network* (experimental) is a guess at the room's real colours.
+  A network made for colouring black-and-white photographs
+  ([DDColor](https://github.com/piddnad/DDColor), its smallest variant) looks at a small copy of
+  the left camera's picture about three times a second, on two of the processor's threads, and
+  its colours are laid under the camera's own brightness. Expect skin, wood and daylight to come
+  out about right and much else not: the cameras see infrared as well as light, and the network
+  changes its mind. The colours lag a turning head by a moment, and things nearer than the
+  passthrough's distance get theirs a little to the side in the right eye. It needs `colour.onnx`
+  beside the plugin, which the download does not carry (270 MB): see Building.
 - *Tolerance* and *edge softness* decide how much counts as the key colour. *Passthrough view* can
   show the cut-out on its own, which is the quickest way to set them. With black as the key, keep
   the tolerance low (0.02), or dark hair and shadows go with it.
@@ -340,10 +390,14 @@ may work, but the lens model was measured on a PlayStation VR2 and nothing else 
 | `OverlayRoomBehind` | true | also draw the room into the game's frame, under the overlay, so that a gap beside the person shows room and not the key colour |
 | `Distance` | 1.5 | the distance at which the room lines up with where things really are |
 | `Brightness` | 1 | camera brightness |
+| `Look` | 0 | what the room is shown in: 0 the cameras' grey, 1 night vision, 2 amber, 3 cold blue, 4 sepia, 5 heat, 6 your colour (`LookRed`, `LookGreen`, `LookBlue`), 7 colours guessed by a network |
+| `LookGrain`, `LookDarkRim` | 0, 0 | grain over the room, and how much darker it gets towards the rim of the view (every look but 0) |
+| `LookColourStrength` | 1 | look 7: how strongly the guessed colours are shown; lower hides its mistakes |
 | `LensFocal` | 382.6 | the room's apparent size; raise it if the room looks too small |
 | `FollowHead` | false | mode 1: carry the camera's picture to where the head is now. Not tried since its last fix |
 | `View` | 0 | 1 = the cut-out alone, 2 = the camera everywhere |
 | `OverlayOtherShape`, `CutOutPose`, `CutOutTimingMs` | false, 0, 0 | for troubleshooting an overlay that sits wrong |
+| `OverlayHandOver` | 0 | mode 0: how the room's pictures reach SteamVR. 0 by their shared handles; 1 as textures SteamVR's library copies, as it was up to 1.8 -- only if the room does not show with 0 |
 | `Depth` | false | experimental: things in the room that are nearer than the figure show in front of it |
 | `DepthMargin`, `DepthSoftness` | 0.25, 0.1 | how much nearer a thing must be to show in front (as a difference of one over the distance), and over how much more it fades in |
 | `DepthUpsideDown` | false | for troubleshooting: take the scene's depth the other way up |
@@ -402,6 +456,54 @@ into a higher render scale instead.
 | `ShowZones` | false | for setting it up: beyond `Outer` the scene is not shaded at all |
 | `UpsideDown` | false | turn on if the zone moves down when the eyes look up |
 | `OnMonitor` | false | also in monitor mode, around the middle of the window |
+
+## DLSS on a window (experimental, headset at DLAA)
+
+Foveated shading makes the scene's own shading cheaper. With DLSS on -- DLAA above all -- the larger
+cost in a headset is DLSS itself, and that goes by the number of pixels it reconstructs. *DLSS
+window* (Foveation page of the panel, or `[DLSS window]`) has DLSS work on a window around the
+middle of each eye instead of on the whole eye: at a size of 0.5 that is a quarter of the pixels.
+Outside the window the scene is shown as it was rendered.
+
+It is a first version, to see what it buys:
+
+- a headset at DLAA only -- in a DLSS upscaling mode it switches itself off, and the status box
+  says so
+- outside the window nothing is anti-aliased, and the picture trembles there by the fraction of a
+  pixel DLSS has the camera shaken by
+- the window's edge is a hard one
+- a window that follows the gaze moves in steps, and DLSS starts its history anew at each: a moment
+  of rougher picture every time
+
+| `[DLSS window]` setting | Default | |
+|---|---|---|
+| `Enabled` | false | the switch |
+| `Size` | 0.5 | the window's width and height as a share of the eye's |
+| `FollowGaze` | false | put it where the eye looks instead of at the lens centre, when SteamVR has eye tracking |
+
+## Where a frame's time goes
+
+*Profile the main thread (to the log)* on the DLSS page of the panel times a scene for half a
+minute (`[Profile] Seconds`) and writes what it finds to `BepInEx\LogOutput.log`, in lines
+beginning `profile:` -- the frame's phases, every script by name (VaM's own and the scene's
+plugins), and the graphics card's time split by what it was spent on. With `Trials` on it then
+tries the scene with one thing changed for five seconds each -- at most one physics step a frame,
+the physics solver's iterations halved, the menu pointers at rest -- with an unchanged stretch
+before and after each, says what each comes to, and puts everything back. Nothing is measured, and
+nothing costs anything, outside a run.
+
+It is a way of finding out what holds a scene back before changing settings at a guess. In the
+heavy scene it was written for, three quarters of a frame was Unity's physics step, which nothing
+in this plugin or in VaM DLSS changes.
+
+One thing it found has a switch of its own: every frame VaM asks, for each controller and for the
+mouse, what it points at, and goes through every menu of the scene for each -- 1.5 to 3 ms of a
+frame there. *Menu pointers: rest while not on a menu* (DLSS page, `[Menu pointers] RestOffMenus`,
+off) asks a pointer that is not on a menu on one frame in four, and every frame again from the
+moment it is on one; never while it holds something, while a text field has the keyboard or while
+the mouse moves. The pointer's dot may appear up to three frames late as it comes onto a menu. It
+saves that time; in the scene it was measured in, that alone was not enough to reach the headset's
+next step of frame rate.
 
 ## Hand tracking (experimental, PlayStation VR2)
 
@@ -470,11 +572,14 @@ UI**, as VaM's own sliders, toggles and popups, where the controllers' pointer r
 - the [sharpening filter](#sharpening), [headset menu at full size](#headset-menu-at-full-size)
   and [passthrough](#passthrough-playstation-vr2)
 - frame generation on/off, multiplier, pacing (monitor only, as in VaM DLSS)
-- [foveated shading](#foveated-shading), the [flip-model window](#flip-model-window-and-frame-pacing-monitor)
+- [foveated shading](#foveated-shading) and the [DLSS window](#dlss-on-a-window-experimental-headset-at-dlaa),
+  the [flip-model window](#flip-model-window-and-frame-pacing-monitor)
   and [hand tracking](#hand-tracking-experimental-playstation-vr2)
+- [which logs are written to disk](#logs-what-is-written-to-disk), and the
+  [profiler](#where-a-frames-time-goes)'s button
 - a live status box — what is running, at what size, the frame pacing — and reset buttons
 
-The panel is in pages, one for each of these, with tabs along the top; passthrough's own key colour
+The panel is in pages, one for each of these, with tabs along the top (in two rows); passthrough's own key colour
 is picked with VaM's colour picker. Rest the pointer on a control for half a second and the status
 box says what it does; the text stays while you read or scroll it. Options most people leave alone
 are folded away under a button (*Below 100% model resolution: options*). (The picture below is of
@@ -546,6 +651,14 @@ Mercury's keypoint network (`[Hands] Mercury`) is not fetched either: it is
 [hand-tracking-models](https://gitlab.freedesktop.org/monado/utilities/hand-tracking-models), whose states no licence for the model files (Monado's code is BSL-1.0). Put it in
 `native\deps\` as `hand-mercury.onnx` and the build carries it along.
 
+The network that guesses the room's colours (`[Passthrough] Look = 7`) is not fetched either. It
+is DDColor's smallest model (Apache-2.0); the ONNX files of it that are published are for 512x512
+pictures with half-precision weights, which takes over a second a picture on a processor, so the
+plugin uses its own export at 256x256: `python native\export-colour-model.py <DDColor source>
+<pytorch_model.bin> native\deps\colour.onnx` (the script's header names the commit and the
+weights, and checks the weights' SHA-256; it needs PyTorch). The build carries the file along; to
+use it without building, put it in `BepInEx\plugins\VamDlssNrWorkScale\` as `colour.onnx`.
+
 The session script under `vam\` is compiled by VaM itself, with an older compiler; the build compiles
 it too, as C# 3 against VaM's assemblies, so a mistake in it fails the build rather than a session.
 
@@ -566,7 +679,7 @@ Three layers, none of which needs the others:
 
 ## Credits
 
-- [UncleBurrito](https://www.patreon.com/UncleBurrito) — VaM DLSS, which does all the real work.
+- UncleBurrito — VaM DLSS, which does all the real work.
 - [Dagherbou](https://github.com/Dagherbou/OptiScaler_DLSSNR) and hhkbble — the working-scale and
   matched-residual technique this reimplements for Unity/D3D11.
 

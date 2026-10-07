@@ -52,6 +52,8 @@
 #include "vws_vs_overlay.h"
 #include "vws_depth.h"
 #include "vws_hand.h"
+#include "vws_colour.h"
+#include "vws_logs.h"
 
 // NVIDIA's own interface to its driver, for variable rate shading (see "foveated shading" below).
 // Its header is not written for /W4.
@@ -63,10 +65,11 @@
 
 namespace
 {
-const uint32_t kAbi = 32;
+const uint32_t kAbi = 37;
 const int kEventMagic = 0x57530000; // 'WS'
 const int kEventFovea = 0x57460000; // 'WF': low byte 1 = foveated shading on for what is drawn next, 2 = off;
                                     // bits 8-11 which camera (0 the scene's), bit 12 its opaque pass
+const int kEventSpan = 0x57470000;  // 'WG': low byte = which span of the frame times two, plus one where it begins
 const int kEventMask = 0x7FFF0000;
 const int kSlots = 64;
 const uint32_t kSets = 16;
@@ -430,7 +433,7 @@ DXGI_FORMAT ViewFormat(DXGI_FORMAT f, bool* hardwareCodec)
 typedef int(__stdcall* CamFrameFn)(uint64_t handle, int frameType, void* buffer, uint32_t bufferSize, void* header,
                                    uint32_t headerSize);
 
-const uint32_t kCamFloats = 96;
+const uint32_t kCamFloats = 112;
 
 enum CamField : uint32_t
 {
@@ -456,6 +459,14 @@ enum CamField : uint32_t
     kCfgDepth = 80,     // overlay: 1 the room's depth is worked out and set against the scene's
     kCfgDepthMargin = 81, // ...how much nearer the room must be to show in front, in 1/metres
     kCfgDepthSoft = 82, // ...over how much more it fades in
+    kCfgLook = 83,      // what the room is shown in: 0 the camera's grey, 1 a ramp of three colours, 2 a ramp of heat, 3 the colours a network guesses
+    kCfgLookLow = 84,   // 3: the ramp's dark end, sRGB-encoded
+    kCfgLookMid = 87,   // 3: its middle
+    kCfgLookHigh = 90,  // 3: its bright end
+    kCfgGrain = 93,     // how much grain
+    kCfgRim = 94,       // how much darker towards the rim of the view
+    kCfgColour = 95,    // how strong the network's colours are shown
+    kCfgHandOver = 96,  // overlay: how its pictures reach SteamVR -- 0 by their shared handle, 1 as textures SteamVR's library copies
 };
 
 struct PassParams
@@ -469,6 +480,11 @@ struct PassParams
     float tangents[4];
     float row0[4], row1[4], row2[4]; // a point in the eye's space -> the camera's
     float misc[4];   // eye, eyes in the target (1|2), target holds encoded values, first row at the top
+    float low[4];    // the look: the ramp's dark end, which look
+    float mid[4];    // its middle, grain
+    float high[4];   // its bright end, darker towards the rim
+    float more[4];   // changes with every picture, the network's colours' strength
+    float col0[4], col1[4], col2[4]; // a point in the eye's space -> the camera the colours belong to
 };
 
 SRWLOCK g_camLock = SRWLOCK_INIT;
@@ -492,6 +508,12 @@ ID3D11ShaderResourceView* g_camSrv = nullptr;
 float g_camPose[12] {};
 bool g_camPoseValid = false;
 bool g_camHave = false;
+// the room's colours on the game's device (see ColourTexture)
+ID3D11Texture2D* g_colourTex = nullptr;
+ID3D11ShaderResourceView* g_colourSrv = nullptr;
+LONG g_colourTexSerial = 0;
+float g_colourTexHead[12] {};
+bool g_colourTexHeadKnown = false;
 void* g_passRefused = nullptr;
 
 // The game's side of the overlay: the matte, in a texture the overlay's device can open, and the
@@ -513,7 +535,7 @@ void* g_matteRefused = nullptr;
 void* g_depthRefused = nullptr;
 
 // the overlay's own thread
-volatile LONG g_ovState = 0, g_ovFrames = 0, g_ovError = 0;
+volatile LONG g_ovState = 0, g_ovFrames = 0, g_ovError = 0, g_ovLost = 0;
 volatile LONG g_ovDebugWant = 0;
 volatile LONG g_ovDepthRoom = -1, g_ovDepthScene = -1; // straight ahead, 1/metres in thousandths; -1 not read
 uint8_t* g_ovDebug = nullptr;
@@ -536,11 +558,14 @@ void ReleaseCamera()
 {
     SafeRelease(g_camSrv);
     SafeRelease(g_camTex);
+    SafeRelease(g_colourSrv);
+    SafeRelease(g_colourTex);
     g_camHave = false;
     g_passRefused = nullptr;
 }
 
 void FoveaRelease();
+void SpansRelease();
 
 void ReleaseDevice()
 {
@@ -548,6 +573,7 @@ void ReleaseDevice()
         s.Release();
 
     FoveaRelease();
+    SpansRelease();
 
     SafeRelease(g_depth);
     SafeRelease(g_blend);
@@ -785,6 +811,10 @@ volatile LONG g_fovAsked = 0, g_fovNoDevice = 0;
 // for one frame, without [.][1]; and how often each has been counted.
 volatile LONG64 g_fovPs[2][2] = {};
 volatile LONG g_fovPsTimes[2][2] = {};
+// ...and the card's time over the same passes, which is what the saving is worth: microseconds
+// summed since the rate map was last made, and how many passes are in each sum.
+volatile LONG64 g_fovMicros[2][2] = {};
+volatile LONG g_fovMicrosTimes[2][2] = {};
 volatile LONG g_fovNoTarget = 0, g_fovSmall = 0, g_fovByDepth = 0; // asked for and not done: nothing bound, a small target; done by the depth target's size
 
 // The render thread's.
@@ -802,6 +832,7 @@ struct Fovea
     struct Meter
     {
         ID3D11Query* query = nullptr;
+        ID3D11Query* from = nullptr, * to = nullptr, * steady = nullptr; // the card's clock before and after the pass, and whether it ran evenly between
         int stage = 0;        // 0 free, 1 begun, 2 ended and waiting to be read
         bool control = false; // the pass being measured is drawn without the rates
     } meter[2];
@@ -816,6 +847,9 @@ void FoveaRelease()
     for (Fovea::Meter& m : g_fov.meter)
     {
         SafeRelease(m.query);
+        SafeRelease(m.from);
+        SafeRelease(m.to);
+        SafeRelease(m.steady);
         m.stage = 0;
     }
 
@@ -835,6 +869,13 @@ void FoveaOff()
         if (g_ctx != nullptr && m.stage == 1 && m.query != nullptr)
         {
             g_ctx->End(m.query);
+
+            if (m.steady != nullptr)
+            {
+                g_ctx->End(m.to);
+                g_ctx->End(m.steady);
+            }
+
             m.stage = 2;
         }
     }
@@ -1044,6 +1085,16 @@ void FoveaOn(uint32_t camera, bool opaque)
         }
 
         fresh = true;
+
+        // (another size is another cost: the times summed so far are of the old one)
+        for (int pass = 0; pass < 2; ++pass)
+        {
+            for (int without = 0; without < 2; ++without)
+            {
+                InterlockedExchange64(&g_fovMicros[pass][without], 0);
+                InterlockedExchange(&g_fovMicrosTimes[pass][without], 0);
+            }
+        }
     }
 
     g_fov.samples = td.SampleDesc.Count;
@@ -1130,10 +1181,26 @@ void FoveaOn(uint32_t camera, bool opaque)
         {
             D3D11_QUERY_DATA_PIPELINE_STATISTICS counted {};
 
-            if (g_ctx->GetData(meter.query, &counted, sizeof(counted), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
+            // (the clock's last query is the last thing ended: once it can be read, all of them can)
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock {};
+            const bool timed = meter.steady != nullptr;
+
+            if ((!timed || g_ctx->GetData(meter.steady, &clock, sizeof(clock), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) &&
+                g_ctx->GetData(meter.query, &counted, sizeof(counted), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK)
             {
                 InterlockedExchange64(&g_fovPs[opaque ? 0 : 1][meter.control ? 1 : 0], (LONG64) counted.PSInvocations);
                 InterlockedIncrement(&g_fovPsTimes[opaque ? 0 : 1][meter.control ? 1 : 0]);
+
+                UINT64 from = 0, to = 0;
+
+                if (timed && clock.Disjoint == FALSE && clock.Frequency != 0 &&
+                    g_ctx->GetData(meter.from, &from, sizeof(from), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+                    g_ctx->GetData(meter.to, &to, sizeof(to), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK && to >= from)
+                {
+                    InterlockedExchangeAdd64(&g_fovMicros[opaque ? 0 : 1][meter.control ? 1 : 0], (LONG64) ((to - from) * 1000000ull / clock.Frequency));
+                    InterlockedIncrement(&g_fovMicrosTimes[opaque ? 0 : 1][meter.control ? 1 : 0]);
+                }
+
                 meter.stage = 0;
             }
         }
@@ -1153,6 +1220,18 @@ void FoveaOn(uint32_t camera, bool opaque)
                 D3D11_QUERY_DESC qd {};
                 qd.Query = D3D11_QUERY_PIPELINE_STATISTICS;
                 g_device->CreateQuery(&qd, &meter.query);
+
+                // The card's clock as well; without it the runs are still counted.
+                D3D11_QUERY_DESC stamp {}, even {};
+                stamp.Query = D3D11_QUERY_TIMESTAMP;
+                even.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+
+                if (FAILED(g_device->CreateQuery(&stamp, &meter.from)) || FAILED(g_device->CreateQuery(&stamp, &meter.to)) || FAILED(g_device->CreateQuery(&even, &meter.steady)))
+                {
+                    SafeRelease(meter.from);
+                    SafeRelease(meter.to);
+                    SafeRelease(meter.steady);
+                }
             }
 
             measure = meter.query != nullptr;
@@ -1171,6 +1250,13 @@ void FoveaOn(uint32_t camera, bool opaque)
         if (measure)
         {
             meter.control = true;
+
+            if (meter.steady != nullptr)
+            {
+                g_ctx->Begin(meter.steady);
+                g_ctx->End(meter.from);
+            }
+
             g_ctx->Begin(meter.query);
             meter.stage = 1;
         }
@@ -1203,6 +1289,13 @@ void FoveaOn(uint32_t camera, bool opaque)
     if (measure)
     {
         meter.control = false;
+
+        if (meter.steady != nullptr)
+        {
+            g_ctx->Begin(meter.steady);
+            g_ctx->End(meter.from);
+        }
+
         g_ctx->Begin(meter.query);
         meter.stage = 1;
     }
@@ -1984,6 +2077,11 @@ struct OverlayParams
     float matte[4];   // how much of the matte texture's height is matte; the row its pose is in; the depth grid's reach (tangent)
     float depth[4];   // used, margin, softness
     float grid[4];    // cells per side, -, -, the most 1/distance
+    float low[4];     // the look: the ramp's dark end, which look
+    float mid[4];     // its middle, grain
+    float high[4];    // its bright end, darker towards the rim
+    float more[4];    // changes with every picture, the network's colours' strength
+    float col[3][4];  // the head at the camera frame's moment -> the camera the colours belong to
 };
 
 // The room's depth: a grid of lines of sight from the middle of the head (see vws_depth.h).
@@ -2077,6 +2175,260 @@ void DepthStop()
     CloseHandle(g_depthThread);
     CloseHandle(g_depthWake);
     g_depthThread = g_depthWake = nullptr;
+}
+
+// ---- the room's colours (see vws_colour.h) --------------------------------------------------------
+//
+// A thread of its own, as the room's depth has: the camera's thread hands it the first lens's
+// picture whenever it is free, and whoever draws the room takes what it last finished, with the
+// head's pose that picture was taken at -- the colours are a third of a second old by the time
+// they show, and are looked up where the lens pointed then.
+SRWLOCK g_colourLock = SRWLOCK_INIT;
+HANDLE g_colourThread = nullptr, g_colourWake = nullptr;
+// state: 0 not asked for, 1 loading the network, 2 running, -1 it would not load or run
+volatile LONG g_colourQuit = 0, g_colourBusy = 0, g_colourSerial = 0, g_colourMicros = 0, g_colourState = 0, g_colourWanted = 0;
+volatile LONG g_colourHeld = 0; // the offline checks have handed colours in, and the thread is to leave them be
+float g_colourIn[vwscolour::kIn * vwscolour::kIn];
+float g_colourInHead[12] {};
+bool g_colourInHeadKnown = false;
+uint8_t g_colourOut[vwscolour::kOut * vwscolour::kOut * 4];
+float g_colourOutHead[12] {};
+bool g_colourOutHeadKnown = false;
+char g_colourError[256] {};
+
+// The folder this DLL is in, ending in a backslash.
+bool OwnFolder(wchar_t* out, uint32_t capacity)
+{
+    HMODULE me = nullptr;
+
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR) &g_colourLock, &me) ||
+        GetModuleFileNameW(me, out, capacity - 1) == 0)
+        return false;
+
+    wchar_t* slash = wcsrchr(out, L'\\');
+
+    if (slash == nullptr)
+        return false;
+
+    slash[1] = 0;
+    return true;
+}
+
+DWORD WINAPI ColourThread(void*)
+{
+    using namespace vwscolour;
+    Network* net = new Network();
+    float* light = new float[kIn * kIn];
+    float* ab = new float[kIn * kIn * 2];
+    float* fresh = new float[kOut * kOut * 2];
+    float* kept = new float[kOut * kOut * 2]();
+    uint8_t* bytes = new uint8_t[sizeof(g_colourOut)];
+    float head[12] {}, headBefore[12] {};
+    bool headKnown = false, headBeforeKnown = false, have = false;
+    wchar_t folder[MAX_PATH * 2] = {};
+    double said = Seconds(), spent = 0.0;
+    uint32_t runs = 0;
+
+    InterlockedExchange(&g_colourState, 1);
+
+    // Two of the processor's threads: the game's own work comes first, and at two a picture
+    // takes about a third of a second.
+    if (OwnFolder(folder, MAX_PATH * 2) && net->Load(folder, 2))
+    {
+        InterlockedExchange(&g_colourState, 2);
+        Log("room colours: colour.onnx is loaded");
+    }
+    else
+    {
+        AcquireSRWLockExclusive(&g_colourLock);
+        snprintf(g_colourError, sizeof(g_colourError), "%s", net->error[0] != 0 ? net->error : "the plugin's own folder could not be found");
+        ReleaseSRWLockExclusive(&g_colourLock);
+        Log("room colours: %s", g_colourError);
+        InterlockedExchange(&g_colourState, -1);
+    }
+
+    while (WaitForSingleObject(g_colourWake, INFINITE) == WAIT_OBJECT_0 && g_colourQuit == 0)
+    {
+        if (g_colourState != 2)
+        {
+            InterlockedExchange(&g_colourBusy, 0);
+            continue;
+        }
+
+        const double start = Seconds();
+        memcpy(light, g_colourIn, sizeof(g_colourIn));
+        memcpy(head, g_colourInHead, sizeof(head));
+        headKnown = g_colourInHeadKnown;
+
+        if (!net->Run(light, ab))
+        {
+            AcquireSRWLockExclusive(&g_colourLock);
+            snprintf(g_colourError, sizeof(g_colourError), "%s", net->error);
+            ReleaseSRWLockExclusive(&g_colourLock);
+            Log("room colours: %s -- switched off until VaM is started again", g_colourError);
+            InterlockedExchange(&g_colourState, -1);
+            InterlockedExchange(&g_colourBusy, 0);
+            continue;
+        }
+
+        Colours(light, ab, fresh);
+        Blend(kept, fresh, have ? Take(Turned(head, headBefore), headKnown && headBeforeKnown) : 1.0f);
+        Bytes(kept, bytes);
+        memcpy(headBefore, head, sizeof(head));
+        headBeforeKnown = headKnown;
+        have = true;
+
+        AcquireSRWLockExclusive(&g_colourLock);
+        memcpy(g_colourOut, bytes, sizeof(g_colourOut));
+        memcpy(g_colourOutHead, head, sizeof(head));
+        g_colourOutHeadKnown = headKnown;
+        ReleaseSRWLockExclusive(&g_colourLock);
+
+        const double took = Seconds() - start;
+        InterlockedExchange(&g_colourMicros, (LONG) (took * 1e6));
+        InterlockedIncrement(&g_colourSerial);
+        InterlockedExchange(&g_colourBusy, 0);
+        spent += took;
+        ++runs;
+
+        if (Seconds() - said >= 20.0)
+        {
+            Log("room colours: %u pictures coloured in %.0f s (%.0f ms each)", runs, Seconds() - said, spent / runs * 1000.0);
+            said = Seconds();
+            spent = 0.0;
+            runs = 0;
+        }
+    }
+
+    net->Free();
+    delete net;
+    delete[] light;
+    delete[] ab;
+    delete[] fresh;
+    delete[] kept;
+    delete[] bytes;
+    return 0;
+}
+
+// Camera thread: the first lens of this frame to the colour thread, if the look asks for colours
+// and the thread is free. `header` is the frame's own (the pose it was taken at).
+void ColourFeed(const uint8_t* grey, uint32_t w, uint32_t h, const uint8_t* header)
+{
+    if (g_colourWanted == 0 || g_colourHeld != 0 || g_colourState < 0 || w < 2 || h == 0)
+        return;
+
+    if (g_colourThread == nullptr)
+    {
+        InterlockedExchange(&g_colourQuit, 0);
+        InterlockedExchange(&g_colourBusy, 0);
+        g_colourWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        g_colourThread = g_colourWake != nullptr ? CreateThread(nullptr, 0, ColourThread, nullptr, 0, nullptr) : nullptr;
+
+        if (g_colourThread == nullptr)
+            return;
+
+        SetThreadPriority(g_colourThread, THREAD_PRIORITY_BELOW_NORMAL);
+    }
+
+    if (InterlockedCompareExchange(&g_colourBusy, 1, 0) != 0)
+        return;
+
+    float cfg[kCamFloats];
+    AcquireSRWLockExclusive(&g_camLock);
+    memcpy(cfg, g_camConfig, sizeof(cfg));
+    ReleaseSRWLockExclusive(&g_camLock);
+
+    vwscolour::Shrink(grey, w, h, 0, w / 2, cfg[kCfgGain], g_colourIn);
+    g_colourInHeadKnown = header != nullptr && header[96] != 0;
+
+    if (g_colourInHeadKnown)
+    {
+        float framePose[12];
+        memcpy(framePose, header + 20, sizeof(framePose));
+        const Rigid head = HeadAt(framePose, cfg);
+
+        for (int i = 0; i < 12; ++i)
+            g_colourInHead[i] = (float) head.m[i];
+    }
+
+    SetEvent(g_colourWake);
+}
+
+void ColourStop()
+{
+    if (g_colourThread == nullptr)
+        return;
+
+    InterlockedExchange(&g_colourQuit, 1);
+    SetEvent(g_colourWake);
+    // (a run in hand is let finish: it takes a third of a second)
+    WaitForSingleObject(g_colourThread, 5000);
+    CloseHandle(g_colourThread);
+    CloseHandle(g_colourWake);
+    g_colourThread = g_colourWake = nullptr;
+
+    if (g_colourState > 0)
+        InterlockedExchange(&g_colourState, 0);
+}
+
+// The look's numbers for a shader (see Look in vws.hlsl). `colours`: the network's are there.
+uint32_t g_lookTicks = 0;
+
+void LookInto(float* low, float* mid, float* high, float* more, const float* cfg, bool colours)
+{
+    memcpy(low, cfg + kCfgLookLow, 3 * sizeof(float));
+    memcpy(mid, cfg + kCfgLookMid, 3 * sizeof(float));
+    memcpy(high, cfg + kCfgLookHigh, 3 * sizeof(float));
+    low[3] = cfg[kCfgLook];
+    mid[3] = cfg[kCfgGrain];
+    high[3] = cfg[kCfgRim];
+    more[0] = (float) (g_lookTicks++ & 1023u);
+    more[1] = colours ? cfg[kCfgColour] : 0.0f;
+}
+
+// A small texture of the colours on `device`, made when first wanted and filled whenever the
+// colour thread has finished another: 1 when it holds colours. `head`: the head as it stood when
+// they were taken, `headKnown` whether that is known.
+bool ColourTexture(ID3D11Device* device, ID3D11DeviceContext* c, ID3D11Texture2D** tex, ID3D11ShaderResourceView** srv, LONG* serial, float* head, bool* headKnown)
+{
+    const LONG now = g_colourSerial;
+
+    if (now == 0)
+        return false;
+
+    if (*tex == nullptr)
+    {
+        D3D11_TEXTURE2D_DESC td {};
+        td.Width = vwscolour::kOut;
+        td.Height = vwscolour::kOut;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+        if (FAILED(device->CreateTexture2D(&td, nullptr, tex)) || FAILED(device->CreateShaderResourceView(*tex, nullptr, srv)))
+        {
+            SafeRelease(*srv);
+            SafeRelease(*tex);
+            return false;
+        }
+
+        *serial = 0;
+    }
+
+    if (*serial != now)
+    {
+        *serial = now;
+        AcquireSRWLockExclusive(&g_colourLock);
+        c->UpdateSubresource(*tex, 0, nullptr, g_colourOut, vwscolour::kOut * 4, 0);
+        memcpy(head, g_colourOutHead, 12 * sizeof(float));
+        *headKnown = g_colourOutHeadKnown;
+        ReleaseSRWLockExclusive(&g_colourLock);
+    }
+
+    return true;
 }
 
 // ---- the wearer's hands (see vws_hand.h) --------------------------------------------------------
@@ -2260,6 +2612,12 @@ struct OverlayRig
     ID3D11Texture2D* cam = nullptr;
     ID3D11ShaderResourceView* camSrv = nullptr;
     uint32_t camW = 0, camH = 0;
+    // the room's colours, as the colour thread last had them
+    ID3D11Texture2D* colour = nullptr;
+    ID3D11ShaderResourceView* colourSrv = nullptr;
+    LONG colourSerial = 0;
+    float colourHead[12] = {};
+    bool colourHeadKnown = false;
     ID3D11Texture2D* matte = nullptr;
     ID3D11ShaderResourceView* matteSrv = nullptr;
     uint32_t matteSerial = 0xFFFFFFFFu;
@@ -2269,8 +2627,13 @@ struct OverlayRig
     // the hidden one is given its picture and its place, and then the two change over.
     ID3D11Texture2D* out[2] = {};
     ID3D11RenderTargetView* outRtv[2] = {};
+    HANDLE outHandle[2] = {};  // the handles they are shared by
+    bool byCopy = false;       // SteamVR would not take a picture by its handle: it gets the textures
+    int handedOver = -1;       // how the last picture went: 0 by its handle, 1 as a texture (for saying so once)
     uint32_t outW = 0, outH = 0;
     ID3D11Query* done = nullptr;
+    double retryAt = 0.0;      // after a device was lost: when another is made
+    uint32_t sinceLost = 0;    // pictures drawn since
     // the room's depth, as the depth thread last had it
     ID3D11Texture2D* grid = nullptr;
     ID3D11ShaderResourceView* gridSrv = nullptr;
@@ -2334,6 +2697,8 @@ void OverlayClose(OverlayRig& r)
     SafeRelease(r.matte);
     SafeRelease(r.camSrv);
     SafeRelease(r.cam);
+    SafeRelease(r.colourSrv);
+    SafeRelease(r.colour);
     SafeRelease(r.raster);
     SafeRelease(r.sampler);
     SafeRelease(r.cb);
@@ -2344,18 +2709,30 @@ void OverlayClose(OverlayRig& r)
     InterlockedExchange(&g_ovState, 0);
 }
 
+// How long to wait before another device is made, after `lost` in a row.
+double OverlayPause(int lost)
+{
+    const double pause = 0.25 * (double) (1u << (lost < 1 ? 0 : (lost > 6 ? 5 : lost - 1)));
+    return pause > 5.0 ? 5.0 : pause;
+}
+
 // The overlay's device has stopped answering: say why, let go of everything made on it, and have
-// the next camera frame make another. The overlays themselves are SteamVR's and stay.
+// a later camera frame make another. The overlays themselves are SteamVR's and stay.
 void OverlayLost(OverlayRig& r, HRESULT hr, const char* where)
 {
     const HRESULT reason = r.dev != nullptr ? r.dev->GetDeviceRemovedReason() : S_OK;
-    Log("passthrough overlay: its device failed at %s (hr=0x%08X, removed for 0x%08X) -- %s", where, (unsigned) hr, (unsigned) reason,
-        r.lost < 5 ? "making another" : "giving up");
+    // Another is made after a pause that doubles with every loss in a row, up to five seconds:
+    // whatever took this one may take the next at once, and a device made and lost sixty times a
+    // second holds the camera's thread up -- but it is never given up on, since what takes them
+    // (a change of the game's own pictures, as far as has been seen) passes.
+    const double pause = OverlayPause(++r.lost);
+    Log("passthrough overlay: its device failed at %s (hr=0x%08X, removed for 0x%08X) -- making another in %.2f s", where, (unsigned) hr, (unsigned) reason, pause);
 
     for (int i = 0; i < 2; ++i)
     {
         SafeRelease(r.outRtv[i]);
         SafeRelease(r.out[i]);
+        r.outHandle[i] = nullptr;
     }
 
     SafeRelease(r.done);
@@ -2364,6 +2741,8 @@ void OverlayLost(OverlayRig& r, HRESULT hr, const char* where)
     SafeRelease(r.matte);
     SafeRelease(r.camSrv);
     SafeRelease(r.cam);
+    SafeRelease(r.colourSrv);
+    SafeRelease(r.colour);
     SafeRelease(r.raster);
     SafeRelease(r.sampler);
     SafeRelease(r.cb);
@@ -2373,9 +2752,11 @@ void OverlayLost(OverlayRig& r, HRESULT hr, const char* where)
     SafeRelease(r.dev);
     r.camW = r.camH = r.outW = r.outH = 0;
     r.matteSerial = 0xFFFFFFFFu;
-    r.failed = ++r.lost > 5;
+    r.retryAt = Seconds() + pause;
+    r.sinceLost = 0;
     InterlockedExchange(&g_ovError, (LONG) (reason != S_OK ? reason : hr));
     InterlockedExchange(&g_ovState, 2);
+    InterlockedIncrement(&g_ovLost);
 }
 
 bool OverlayDevice(OverlayRig& r, const LUID& luid)
@@ -2383,7 +2764,7 @@ bool OverlayDevice(OverlayRig& r, const LUID& luid)
     if (r.dev != nullptr)
         return true;
 
-    if (r.failed)
+    if (Seconds() < r.retryAt)
         return false;
 
     IDXGIFactory1* factory = nullptr;
@@ -2450,8 +2831,8 @@ bool OverlayDevice(OverlayRig& r, const LUID& luid)
 
     if (FAILED(hr))
     {
-        Log("passthrough overlay: no device of its own (hr=0x%08X) -- the overlay is off", (unsigned) hr);
-        r.failed = true;
+        Log("passthrough overlay: no device of its own (hr=0x%08X) -- trying again in five seconds", (unsigned) hr);
+        r.retryAt = Seconds() + 5.0;
         InterlockedExchange(&g_ovState, 2);
         InterlockedExchange(&g_ovError, (LONG) hr);
         return false;
@@ -2651,6 +3032,21 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
 
         if (SUCCEEDED(hr))
             hr = r.dev->CreateRenderTargetView(r.out[i], nullptr, &r.outRtv[i]);
+
+        r.outHandle[i] = nullptr;
+
+        if (SUCCEEDED(hr))
+        {
+            IDXGIResource* resource = nullptr;
+
+            if (SUCCEEDED(r.out[i]->QueryInterface(__uuidof(IDXGIResource), (void**) &resource)))
+            {
+                if (FAILED(resource->GetSharedHandle(&r.outHandle[i])))
+                    r.outHandle[i] = nullptr;
+
+                resource->Release();
+            }
+        }
     }
 
     r.outW = outW;
@@ -2759,6 +3155,21 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
     op.grid[0] = (float) kGridN;
     op.grid[3] = kGridMost;
 
+    // The look, and where the colours are for a point of the head's space as it stood at this
+    // frame's moment: in the first camera, as the head stood when the colours' frame was taken.
+    const bool colours = cfg[kCfgLook] > 2.5f && ColourTexture(r.dev, r.ctx, &r.colour, &r.colourSrv, &r.colourSerial, r.colourHead, &r.colourHeadKnown);
+    LookInto(op.low, op.mid, op.high, op.more, cfg, colours);
+
+    {
+        Rigid toColours = Inverse(FromFloats(cfg + kCfgCamToHead));
+
+        if (colours && headThenValid && r.colourHeadKnown)
+            toColours = Mul(toColours, Mul(Inverse(FromFloats(r.colourHead)), head));
+
+        for (int i = 0; i < 12; ++i)
+            op.col[i / 4][i % 4] = (float) toColours.m[i];
+    }
+
     SetSize(op.out, outW, outH);
 
     hr = r.ctx->Map(r.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -2794,10 +3205,13 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
     c->PSSetShader(r.ps, nullptr, 0);
 
     ID3D11ShaderResourceView* inputs[3] = { depth ? r.gridSrv : nullptr, r.camSrv, r.matteSrv };
+    ID3D11ShaderResourceView* fifth = colours ? r.colourSrv : nullptr;
     c->PSSetShaderResources(0, 3, inputs);
+    c->PSSetShaderResources(5, 1, &fifth);
     c->VSSetShaderResources(0, 3, inputs);
     c->Draw(3, 0);
     c->PSSetShaderResources(0, 3, none);
+    c->PSSetShaderResources(5, 1, none);
     c->VSSetShaderResources(0, 3, none);
     ID3D11RenderTargetView* noTarget = nullptr;
     c->OMSetRenderTargets(1, &noTarget, nullptr);
@@ -2812,6 +3226,9 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
     }
 
     InterlockedIncrement(&g_ovFrames);
+
+    if (r.lost != 0 && ++r.sinceLost >= 600)
+        r.lost = 0;
 
     // Now and then, how near the room and the scene are taken to be straight ahead: for the
     // status line, which is the only way to see from outside whether either is being read at all.
@@ -2906,8 +3323,29 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
 
     VrFn<int(__stdcall*)(uint64_t, int, float*)>(r.vr, 33)(overlay, (int) cfg[kCfgSpace], place);
 
-    VrTexture texture { r.out[next], 0, 1 };
-    const int e = VrFn<int(__stdcall*)(uint64_t, VrTexture*)>(r.vr, 60)(overlay, &texture);
+    // The picture goes to SteamVR by the handle it is shared by (texture type 5, which is for
+    // overlays), and SteamVR's compositor reads it where it is.
+    //
+    // Handed over as a D3D11 texture instead (type 0), SteamVR's library in this process makes a
+    // shared copy of its own and copies into it at every call -- with the same machinery, and by
+    // what its log shows the same device context, as it copies the game's eye pictures with
+    // when those are not shareable as they come. They are not whenever VaM DLSS reconstructs
+    // (any DLSS mode below DLAA: it hands over eye pictures of its own), and for a moment when
+    // the game's pictures are rebuilt. This device is then removed by the driver, and so is every
+    // one made after it: passthrough stuttered at once in an upscaling mode, and now and then at
+    // DLAA until it was switched off and on.
+    const bool byHandle = cfg[kCfgHandOver] < 0.5f && !r.byCopy && r.outHandle[next] != nullptr;
+    VrTexture texture { byHandle ? (void*) r.outHandle[next] : (void*) r.out[next], byHandle ? 5 : 0, 1 };
+    int e = VrFn<int(__stdcall*)(uint64_t, VrTexture*)>(r.vr, 60)(overlay, &texture);
+
+    if (e != 0 && byHandle)
+    {
+        Log("passthrough overlay: SteamVR would not take a picture by its shared handle (error %d) -- handing it textures to copy, as before", e);
+        r.byCopy = true;
+        texture.handle = r.out[next];
+        texture.type = 0;
+        e = VrFn<int(__stdcall*)(uint64_t, VrTexture*)>(r.vr, 60)(overlay, &texture);
+    }
 
     if (e != 0)
     {
@@ -2916,8 +3354,16 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
         return;
     }
 
-    // SteamVR takes its copy of the picture through this device. Wait until the card has really
-    // done it -- it is busy with the game -- before letting the picture be seen.
+    if (r.handedOver != texture.type)
+    {
+        r.handedOver = texture.type;
+        Log("passthrough overlay: its pictures go to SteamVR %s", texture.type == 5 ? "by their shared handles" :
+            (cfg[kCfgHandOver] >= 0.5f ? "as textures for it to copy ([Passthrough] OverlayHandOver = 1)" : "as textures for it to copy"));
+    }
+
+    // Wait until the card has really drawn the picture -- it is busy with the game -- before
+    // letting it be seen. A device that has just been removed never will have: that is found out
+    // at the next frame, and not waited for here.
     if (r.done != nullptr)
     {
         const double start = Seconds();
@@ -2925,8 +3371,15 @@ void OverlayTick(OverlayRig& r, const uint8_t* grey, const uint8_t* header, doub
         c->Flush();
         BOOL finished = FALSE;
 
-        for (int i = 0; i < 100 && c->GetData(r.done, &finished, sizeof(finished), 0) != S_OK; ++i)
+        for (int i = 0; i < 100; ++i)
+        {
+            const HRESULT got = c->GetData(r.done, &finished, sizeof(finished), 0);
+
+            if (got == S_OK || FAILED(got))
+                break;
+
             Sleep(1);
+        }
 
         if (waited != nullptr)
             *waited = Seconds() - start;
@@ -3080,6 +3533,7 @@ DWORD WINAPI CamThread(void* param)
                 }
 
                 HandFeed(grey, g_camW, g_camH, header);
+                ColourFeed(grey, g_camW, g_camH, header);
 
                 double waited = 0.0;
                 const double tickStart = Seconds();
@@ -3129,6 +3583,11 @@ DWORD WINAPI CamThread(void* param)
     OverlayClose(rig);
     DepthStop();
     HandStop();
+
+    // (the colours' network stays loaded over a restart of the camera while its look is the one
+    // chosen: loading it again is 270 MB read and a second's work every time)
+    if (g_colourWanted == 0)
+        ColourStop();
     delete[] rgba;
     delete[] grey;
     return 0;
@@ -3348,6 +3807,37 @@ void Passthrough(const VwsCmd& cmd)
     pp.misc[2] = target.Encoded() ? 1.0f : 0.0f;
     pp.misc[3] = cmd.topDown != 0 ? 1.0f : 0.0f;
 
+    // The look, and where the colours are for a point of this eye's space: in the first camera,
+    // as the head stood when the colours' frame was taken -- through the room where the eye's
+    // place in it is known, and straight through the head where it is not.
+    const bool colours = cfg[kCfgLook] > 2.5f &&
+                         ColourTexture(g_device, c, &g_colourTex, &g_colourSrv, &g_colourTexSerial, g_colourTexHead, &g_colourTexHeadKnown);
+    LookInto(pp.low, pp.mid, pp.high, pp.more, cfg, colours);
+
+    {
+        const Rigid headToColours = Inverse(FromFloats(cfg + kCfgCamToHead));
+        Rigid eyeToColours;
+
+        if (colours && cmd.moved != 0 && g_colourTexHeadKnown && cfg[kCfgCompensate] > 0.5f)
+        {
+            float eyeToRoom[12];
+            memcpy(eyeToRoom, cmd.window, 8 * sizeof(float));
+            memcpy(eyeToRoom + 8, cmd.prev, 4 * sizeof(float));
+            eyeToColours = Mul(headToColours, Mul(Inverse(FromFloats(g_colourTexHead)), FromFloats(eyeToRoom)));
+        }
+        else
+        {
+            eyeToColours = Mul(headToColours, FromFloats(cfg + kCfgEyeToHead + eye * 12));
+        }
+
+        for (int j = 0; j < 4; ++j)
+        {
+            pp.col0[j] = (float) eyeToColours.m[j];
+            pp.col1[j] = (float) eyeToColours.m[4 + j];
+            pp.col2[j] = (float) eyeToColours.m[8 + j];
+        }
+    }
+
     D3D11_MAPPED_SUBRESOURCE mapped {};
     hr = c->Map(g_cbPass, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
 
@@ -3391,9 +3881,16 @@ void Passthrough(const VwsCmd& cmd)
     c->PSSetSamplers(0, 1, &g_sampler);
 
     ID3D11ShaderResourceView* inputs[3] = { g_scratch.srv, g_camSrv, nullptr };
+    ID3D11ShaderResourceView* fifth = colours ? g_colourSrv : nullptr;
+    ID3D11ShaderResourceView* fifthWas = nullptr;
+    c->PSGetShaderResources(5, 1, &fifthWas);
     c->PSSetShaderResources(0, 3, inputs);
+    c->PSSetShaderResources(5, 1, &fifth);
 
     c->Draw(3, 0);
+
+    c->PSSetShaderResources(5, 1, &fifthWas);
+    SafeRelease(fifthWas);
 
     c->PSSetConstantBuffers(1, 1, &second);
     SafeRelease(second);
@@ -3945,8 +4442,109 @@ void Execute(const VwsCmd& cmd)
     }
 }
 
+// ---- spans of the frame, by the card's own clock ---------------------------------------------------
+//
+// Where in a frame the card's time goes: the game marks the points between the frame's parts (see
+// Profile, managed) and the card's clock is read at each, in the order the card comes to them. A
+// span's time is how long the card took from one mark to the next -- its work, and any waiting for
+// the game to send more. One frame in two is measured: a span is read back when it next begins.
+const uint32_t kSpans = 8;
+
+struct Span
+{
+    ID3D11Query* from = nullptr, * to = nullptr, * steady = nullptr;
+    int stage = 0; // 0 free, 1 begun, 2 ended and waiting to be read
+} g_span[kSpans];
+
+volatile LONG64 g_spanMicros[kSpans] = {};
+volatile LONG g_spanTimes[kSpans] = {};
+
+void SpansRelease()
+{
+    for (Span& s : g_span)
+    {
+        SafeRelease(s.from);
+        SafeRelease(s.to);
+        SafeRelease(s.steady);
+        s.stage = 0;
+    }
+}
+
+void SpanMark(uint32_t i, bool begin)
+{
+    if (i >= kSpans || g_ctx == nullptr || g_device == nullptr)
+        return;
+
+    Span& s = g_span[i];
+
+    if (!begin)
+    {
+        if (s.stage == 1)
+        {
+            g_ctx->End(s.to);
+            g_ctx->End(s.steady);
+            s.stage = 2;
+        }
+
+        return;
+    }
+
+    // (begun and never ended: ended here, and read like any other the next time)
+    if (s.stage == 1)
+    {
+        g_ctx->End(s.to);
+        g_ctx->End(s.steady);
+        s.stage = 2;
+        return;
+    }
+
+    if (s.stage == 2)
+    {
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT clock {};
+
+        if (g_ctx->GetData(s.steady, &clock, sizeof(clock), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK)
+            return;
+
+        UINT64 from = 0, to = 0;
+
+        if (clock.Disjoint == FALSE && clock.Frequency != 0 && g_ctx->GetData(s.from, &from, sizeof(from), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+            g_ctx->GetData(s.to, &to, sizeof(to), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK && to >= from)
+        {
+            InterlockedExchangeAdd64(&g_spanMicros[i], (LONG64) ((to - from) * 1000000ull / clock.Frequency));
+            InterlockedIncrement(&g_spanTimes[i]);
+        }
+
+        s.stage = 0;
+    }
+
+    if (s.steady == nullptr)
+    {
+        D3D11_QUERY_DESC stamp {}, even {};
+        stamp.Query = D3D11_QUERY_TIMESTAMP;
+        even.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+
+        if (FAILED(g_device->CreateQuery(&stamp, &s.from)) || FAILED(g_device->CreateQuery(&stamp, &s.to)) || FAILED(g_device->CreateQuery(&even, &s.steady)))
+        {
+            SafeRelease(s.from);
+            SafeRelease(s.to);
+            SafeRelease(s.steady);
+            return;
+        }
+    }
+
+    g_ctx->Begin(s.steady);
+    g_ctx->End(s.from);
+    s.stage = 1;
+}
+
 void __stdcall OnRenderEvent(int eventId)
 {
+    if ((eventId & kEventMask) == kEventSpan)
+    {
+        SpanMark((uint32_t) (eventId & 0xFF) >> 1, (eventId & 1) != 0);
+        return;
+    }
+
     // The two that a camera raises itself, every frame, with nothing queued for them.
     if ((eventId & kEventMask) == kEventFovea)
     {
@@ -4065,7 +4663,114 @@ VWS_EXPORT void vws_cam_configure(const float* values, uint32_t count)
     AcquireSRWLockExclusive(&g_camLock);
     memcpy(g_camConfig, values, sizeof(float) * (count < kCamFloats ? count : kCamFloats));
     g_camConfigured = true;
+    InterlockedExchange(&g_colourWanted, g_camConfig[kCfgLook] > 2.5f ? 1 : 0);
     ReleaseSRWLockExclusive(&g_camLock);
+}
+
+// The room's colours: `state` 0 not asked for, 1 the network is being loaded, 2 it runs, -1 it
+// would not (vws_colour_error says why); how many pictures it has coloured, and how long the
+// last took.
+VWS_EXPORT void vws_colour_status(int32_t* state, uint32_t* pictures, uint32_t* micros)
+{
+    if (state != nullptr)
+        *state = (int32_t) g_colourState;
+
+    if (pictures != nullptr)
+        *pictures = (uint32_t) g_colourSerial;
+
+    if (micros != nullptr)
+        *micros = (uint32_t) g_colourMicros;
+}
+
+VWS_EXPORT uint32_t vws_colour_error(char* out, uint32_t capacity)
+{
+    if (out == nullptr || capacity == 0)
+        return 0;
+
+    AcquireSRWLockExclusive(&g_colourLock);
+    snprintf(out, capacity, "%s", g_colourError);
+    ReleaseSRWLockExclusive(&g_colourLock);
+    return (uint32_t) strlen(out);
+}
+
+// For the offline checks: colours handed in directly, kOut x kOut texels of four bytes as the
+// texture has them, with the head's pose they belong to (3x4, or null): what the colour thread
+// would have delivered. The thread is given no more frames from then on, so that they stand;
+// null texels let it go on.
+VWS_EXPORT void vws_colour_inject(const uint8_t* texels, const float* head)
+{
+    InterlockedExchange(&g_colourHeld, texels != nullptr ? 1 : 0);
+
+    if (texels == nullptr)
+        return;
+
+    AcquireSRWLockExclusive(&g_colourLock);
+    memcpy(g_colourOut, texels, sizeof(g_colourOut));
+
+    if (head != nullptr)
+        memcpy(g_colourOutHead, head, sizeof(g_colourOutHead));
+
+    g_colourOutHeadKnown = head != nullptr;
+    ReleaseSRWLockExclusive(&g_colourLock);
+    InterlockedIncrement(&g_colourSerial);
+}
+
+// For the offline checks: what the colour thread does to one frame (grey, the two lenses side
+// by side), in one call. `folder` ends in a backslash and holds onnxruntime.dll and colour.onnx,
+// or is null for this DLL's own. `out`: kOut x kOut texels of four bytes, as the texture has
+// them. 1 when done; 0 with vws_colour_error saying why not.
+VWS_EXPORT int vws_colour_solve(const uint8_t* grey, uint32_t width, uint32_t height, float gain, const wchar_t* folder, uint8_t* out, uint32_t capacity,
+                                uint32_t* micros)
+{
+    using namespace vwscolour;
+    static Network net;
+    wchar_t own[MAX_PATH * 2] = {};
+
+    if (grey == nullptr || out == nullptr || width < 2 || height == 0 || capacity < (uint32_t) (kOut * kOut * 4))
+        return 0;
+
+    if (folder == nullptr)
+    {
+        if (!OwnFolder(own, MAX_PATH * 2))
+            return 0;
+
+        folder = own;
+    }
+
+    if (!net.Load(folder, 2))
+    {
+        AcquireSRWLockExclusive(&g_colourLock);
+        snprintf(g_colourError, sizeof(g_colourError), "%s", net.error);
+        ReleaseSRWLockExclusive(&g_colourLock);
+        return 0;
+    }
+
+    float* light = new float[kIn * kIn];
+    float* ab = new float[kIn * kIn * 2];
+    float* kept = new float[kOut * kOut * 2];
+    Shrink(grey, width, height, 0, width / 2, gain, light);
+    const double start = Seconds();
+    const bool ok = net.Run(light, ab);
+
+    if (micros != nullptr)
+        *micros = (uint32_t) ((Seconds() - start) * 1e6);
+
+    if (ok)
+    {
+        Colours(light, ab, kept);
+        Bytes(kept, out);
+    }
+    else
+    {
+        AcquireSRWLockExclusive(&g_colourLock);
+        snprintf(g_colourError, sizeof(g_colourError), "%s", net.error);
+        ReleaseSRWLockExclusive(&g_colourLock);
+    }
+
+    delete[] light;
+    delete[] ab;
+    delete[] kept;
+    return ok ? 1 : 0;
 }
 
 // Starts taking the camera's frames: `getFrameBuffer` is IVRTrackedCamera's GetVideoStreamFrameBuffer
@@ -4183,6 +4888,42 @@ VWS_EXPORT int vws_push_matte(void* source, uint32_t eyes, uint32_t eye, uint32_
 
 // How the overlay stands: 0 not wanted, 1 waiting for the game's first frame, 2 no device of its
 // own, 3 no SteamVR overlay interface, 4 SteamVR refused it (`error`), 5 running.
+// Which log files of VaM DLSS's native half (bit 0 of `off`) and of NVIDIA's DLSS (bit 1) are kept
+// off the disk: see vws_logs.h. Called every second, so that a library loaded since is seen.
+// Gives the writes not made since the DLL was loaded and their size, and returns how many imports
+// are led through here -- none as long as no log has ever been switched off.
+VWS_EXPORT uint32_t vws_logs(uint32_t off, uint32_t* writes, uint32_t* kilobytes)
+{
+    InterlockedExchange(&vwslogs::g_off, (LONG) (off & 3u));
+
+    if ((off & 3u) != 0)
+        vwslogs::HookKnown();
+
+    if (writes != nullptr)
+        *writes = (uint32_t) vwslogs::g_writes;
+
+    if (kilobytes != nullptr)
+        *kilobytes = (uint32_t) (InterlockedCompareExchange64(&vwslogs::g_bytes, 0, 0) / 1024);
+
+    return (uint32_t) vwslogs::g_slots;
+}
+
+// The same treatment for one module, whatever its name: for the checks.
+VWS_EXPORT uint32_t vws_logs_hook(void* module)
+{
+    return vwslogs::Hook((HMODULE) module);
+}
+
+// How many times the overlay's device has been lost since the DLL was loaded, and the pause
+// before another is made after `inARow` losses in a row (seconds).
+VWS_EXPORT uint32_t vws_overlay_lost(uint32_t inARow, float* pause)
+{
+    if (pause != nullptr)
+        *pause = (float) OverlayPause((int) inARow);
+
+    return (uint32_t) g_ovLost;
+}
+
 VWS_EXPORT void vws_overlay_status(int32_t* state, uint32_t* frames, int32_t* error)
 {
     if (state != nullptr)
@@ -4258,6 +4999,32 @@ VWS_EXPORT int vws_fovea_event(uint32_t on)
     return kEventFovea | (on != 0 ? 1 : 2);
 }
 
+// The event that marks where span `index` of the frame begins (or ends) for the card's clock.
+VWS_EXPORT int vws_span_event(uint32_t index, uint32_t begin)
+{
+    return kEventSpan | (int) ((index & 0x7F) << 1) | (begin != 0 ? 1 : 0);
+}
+
+// The card's time in each span, microseconds summed, and how many frames are in each sum; `reset`
+// starts the sums anew.
+VWS_EXPORT void vws_spans(uint64_t* micros, uint32_t* times, uint32_t reset)
+{
+    for (uint32_t i = 0; i < kSpans; ++i)
+    {
+        if (micros != nullptr)
+            micros[i] = (uint64_t) g_spanMicros[i];
+
+        if (times != nullptr)
+            times[i] = (uint32_t) g_spanTimes[i];
+
+        if (reset != 0)
+        {
+            InterlockedExchange64(&g_spanMicros[i], 0);
+            InterlockedExchange(&g_spanTimes[i], 0);
+        }
+    }
+}
+
 // "On" for a camera by number (0: the one the scene is seen through) and for which of its passes.
 VWS_EXPORT int vws_fovea_event_for(uint32_t camera, uint32_t opaque)
 {
@@ -4267,6 +5034,23 @@ VWS_EXPORT int vws_fovea_event_for(uint32_t camera, uint32_t opaque)
 // The pixel shader's runs as last counted over the scene camera's passes, four numbers: the opaque
 // pass with the rates in force and without, then the transparent pass with and without; and how
 // many times each has been counted.
+// The card's time over the same four, in microseconds summed since the rate map was last made,
+// and how many passes are in each sum (0: the card's clock could not be read).
+VWS_EXPORT void vws_fovea_timed(uint64_t* micros, uint32_t* times)
+{
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        for (int without = 0; without < 2; ++without)
+        {
+            if (micros != nullptr)
+                micros[pass * 2 + without] = (uint64_t) g_fovMicros[pass][without];
+
+            if (times != nullptr)
+                times[pass * 2 + without] = (uint32_t) g_fovMicrosTimes[pass][without];
+        }
+    }
+}
+
 VWS_EXPORT void vws_fovea_measured(uint64_t* runs, uint32_t* times)
 {
     for (int pass = 0; pass < 2; ++pass)
