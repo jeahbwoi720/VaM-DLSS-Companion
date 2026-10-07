@@ -321,7 +321,12 @@ small by a DLSS quality mode, enlarged, and reworked by Neural Rendering with ev
 
 With *Scene UI atoms: after DLSS / NR* on, they are left out of the scene's frame and drawn
 afterwards onto the finished picture, at its full resolution — in a headset and on the monitor,
-while VaM DLSS is at work. Off by default. New, and so far tried only by its own checks.
+while VaM DLSS is at work. Off by default.
+
+In a headset where a plugin draws VaM's menu with a camera of its own after the scene's (PostMagic
+does), the atoms stay in the scene: taken out and drawn at the frame's end, they were not in the
+picture the headset is given. There they go through DLSS and Neural Rendering as without this
+option, and the status box says so.
 
 Unlike the menu, a button on a wall has to stay behind a person standing in front of it. The
 scene's depth is kept and laid under the atoms before they are drawn, so they are hidden as in
